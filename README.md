@@ -26,6 +26,8 @@ git submodule update --init
 - Keep extensions focused; handle unrelated upstream issues separately.
 - Keep documentation in English and Simplified Chinese, with extension-specific details under the corresponding extension.
 
+See [RAGFlow extension points](docs/extension-points.md) for the shared integration rules and upstream seams.
+
 ## CI principles
 
 The intended CI pipeline builds the enhanced RAGFlow distribution first, then runs the upstream RAGFlow tests, except Infinity-specific coverage, and our extension tests against it. The upstream baseline on its own is not a substitute for testing the enhanced build.
