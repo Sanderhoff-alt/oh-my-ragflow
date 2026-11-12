@@ -1,0 +1,20 @@
+{
+  "upstreamCommit": "db1cd5929a7885a3074547791f5ecc4d2f891739",
+  "upstreamVersion": "v1.0.0",
+  "excludedTests": [
+    { "path": "src/pages/dataset/dataset/change-parser-dialog.test.tsx", "reason": "Saved parser configuration and version prefill differ from the test expectation." },
+    { "path": "src/pages/dataset/components/metedata/hooks/__tests__/use-manage-values-modal.test.ts", "reason": "Jest transformer fails on an imported type in a mocked test." },
+    { "path": "src/pages/dataset/setting/index.test.tsx", "reason": "Dialog interactions and rendered controls differ from test expectations." },
+    { "path": "src/pages/agent/version-dialog/index.test.tsx", "reason": "The react-router mock does not provide useSearchParams." },
+    { "path": "src/utils/__tests__/chat.test.ts", "reason": "LaTeX formatting differs from test expectations." },
+    { "path": "src/pages/agent/utils/pipeline-connection.test.ts", "reason": "Operator classification differs from test expectations." },
+    { "path": "src/utils/__tests__/file-util.test.ts", "reason": "The jsdom Blob lacks arrayBuffer and the test's Blob substitute differs from the current function input." },
+    { "path": "src/components/highlight-markdown/__tests__/index.test.tsx", "reason": "Jest cannot parse an ESM dependency." },
+    { "path": "src/pages/user-setting/setting-model/provider-schema/field-config/local-llm-configs.test.ts", "reason": "The FunASR default URL differs from the test expectation." },
+    { "path": "src/components/__tests__/switch-fom-field.test.tsx", "reason": "Clicking the label does not produce the expected switch state in the test." },
+    { "path": "src/components/pipeline-operator-tabs/parser-config-validation.test.ts", "reason": "Jest cannot parse an ESM dependency." },
+    { "path": "src/pages/agent/form-sheet/title-input.test.tsx", "reason": "The test renders a tooltip without TooltipProvider." },
+    { "path": "src/pages/user-setting/compilation-templates/edit-next/utils.test.ts", "reason": "The test imports sortSectionNames, which the source does not export." },
+    { "path": "src/utils/__tests__/source-locate.test.ts", "reason": "The DOCX source-location result differs from the test expectation." }
+  ]
+}
