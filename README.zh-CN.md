@@ -26,6 +26,8 @@ git submodule update --init
 - 保持扩展范围聚焦，无关的上游问题单独处理。
 - 文档保持英文和简体中文双语；扩展专属内容放在对应扩展目录中。
 
+共同的集成规范与上游接缝见 [RAGFlow 扩展点](docs/extension-points.zh-CN.md)。
+
 ## CI 原则
 
 计划中的 CI 流水线先构建增强后的 RAGFlow，再针对增强版运行上游 RAGFlow 测试（不包含 Infinity 专项覆盖）和我们的扩展测试。仅测试未增强的上游基线，不能替代对增强版的测试。
