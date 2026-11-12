@@ -26,6 +26,28 @@ git submodule update --init
 - Keep extensions focused; handle unrelated upstream issues separately.
 - Keep documentation in English and Simplified Chinese, with extension-specific details under the corresponding extension.
 
+## CI principles
+
+The intended CI pipeline builds the enhanced RAGFlow distribution first, then runs the upstream RAGFlow tests, except Infinity-specific coverage, and our extension tests against it. The upstream baseline on its own is not a substitute for testing the enhanced build.
+
+```mermaid
+flowchart LR
+    A[Check out project and upstream] --> B[Build enhanced RAGFlow]
+    B --> C[Run upstream tests]
+    B --> D[Run extension tests]
+    C --> E[Report results]
+    D --> E
+```
+
+The goal is complete coverage on free standard GitHub-hosted runners. Test jobs may be split to fit their resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing. Until extensions are implemented, the CI workflow builds and tests the pinned upstream source. It currently targets the Go build and unit tier plus the web build and tests; integration, API, SDK and model-backed tests remain to be added.
+
+The upstream web test baseline excludes the known failing files listed in
+[`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json).
+CI reports each exclusion and requires all other discovered tests to pass. The
+list is pinned to the upstream commit and must be reviewed when it changes.
+These exclusions do not apply to extension tests; a passing baseline does not
+mean the excluded upstream tests passed.
+
 ## Layout
 
 ```text

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-build-and-unit:
+    name: Go build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-go@v6
+        id: go
+        with:
+          go-version-file: upstream/ragflow/go.mod
+          cache: false
+      # Go's build cache does not track changes to external C libraries. Scope
+      # it to the upstream revision and extension/build configuration.
+      - name: Identify upstream revision
+        id: upstream
+        run: echo "sha=$(git -C upstream/ragflow rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py') }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Create isolated upstream build tree
+        run: |
+          mkdir -p build/ragflow
+          git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 lld-20 libpcre2-dev
+          sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
+      - name: Download native libraries and runtime resources
+        working-directory: build/ragflow
+        run: uv run tools/scripts/download_dev_deps.py
+      - name: Build tokenizer library
+        working-directory: build/ragflow
+        run: |
+          docker run --rm \
+            -v "$PWD:/ragflow" \
+            -w /ragflow \
+            --entrypoint bash \
+            infiniflow/infinity_builder:ubuntu22_clang20 \
+            -c 'git config --global --add safe.directory /ragflow && ./build.sh --cpp'
+          sudo chown -R "$(id -u):$(id -g)" internal/binding/cpp
+      - name: Remove empty tokenizer linker-option sections
+        working-directory: build/ragflow
+        run: |
+          python3 "$GITHUB_WORKSPACE/ci/clean-tokenizer-archive.py" \
+            internal/binding/cpp/cmake-build-release/librag_tokenizer_c_api.a
+      - name: Build Go server
+        working-directory: build/ragflow
+        run: ./build.sh --go
+      - name: Run upstream Go unit tests
+        working-directory: build/ragflow
+        run: ./build.sh --test
+      - name: Report scope
+        if: always()
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Upstream Go build and default unit tier; upstream integration, API, SDK and model-backed tests are not yet configured.' >> "$GITHUB_STEP_SUMMARY"
+
+  web:
+    name: Web build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: upstream/ragflow/web/package-lock.json
+      - name: Create isolated upstream build tree
+        run: |
+          mkdir -p build/ragflow
+          git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Install frontend dependencies
+        working-directory: build/ragflow/web
+        run: npm ci --no-audit --no-fund
+      - name: Build frontend
+        working-directory: build/ragflow/web
+        run: npm run build
+      - name: Run frontend tests
+        run: node ci/run-upstream-web-tests.cjs
