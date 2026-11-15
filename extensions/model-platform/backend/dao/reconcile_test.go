@@ -296,3 +296,60 @@ func TestMigration_Idempotency(t *testing.T) {
 		t.Errorf("expected ErrNilDB when passing nil DB, got: %v", err)
 	}
 }
+
+func TestClaimDueForProvisioning_AtomicallyEnforcesDeadline(t *testing.T) {
+	db := setupReconcileTestDB(t)
+	ctx := context.Background()
+	dao := NewReconcileDAO()
+
+	tenantID := "tenant-claim-due-test"
+	future := time.Now().Add(5 * time.Minute)
+	past := time.Now().Add(-5 * time.Minute)
+
+	// 1. Record with future deadline should fail to claim via atomic SQL predicate
+	futureRec := &entity.TenantReconcileRecord{
+		TenantID:    tenantID,
+		Status:      entity.StatusDegraded,
+		RetryCount:  1,
+		MaxRetries:  50,
+		NextRetryAt: &future,
+		Version:     1,
+	}
+	db.Create(futureRec)
+
+	_, err := dao.ClaimDueForProvisioning(ctx, db, tenantID, 1, time.Now())
+	if !errors.Is(err, entity.ErrOptimisticLockConflict) {
+		t.Fatalf("expected ErrOptimisticLockConflict for future deadline, got %v", err)
+	}
+
+	// 2. Simulate concurrent race: record had past deadline, but replica pushed next_retry_at into future
+	// while version remains unchanged. The atomic SQL predicate must reject the claim.
+	db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{
+		"next_retry_at": past,
+		"version":       2,
+	})
+	// Concurrent worker pushes deadline to future without bumping version:
+	db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", tenantID).Update("next_retry_at", future)
+
+	_, err = dao.ClaimDueForProvisioning(ctx, db, tenantID, 2, time.Now())
+	if !errors.Is(err, entity.ErrOptimisticLockConflict) {
+		t.Fatalf("expected ErrOptimisticLockConflict when next_retry_at rescheduled to future concurrently, got %v", err)
+	}
+
+	// 3. Update to past deadline -> atomic SQL predicate matches and claim succeeds
+	db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{
+		"next_retry_at": past,
+		"version":       2,
+	})
+
+	claimed, err := dao.ClaimDueForProvisioning(ctx, db, tenantID, 2, time.Now())
+	if err != nil {
+		t.Fatalf("expected successful claim for past deadline, got %v", err)
+	}
+	if claimed.Status != entity.StatusProvisioning {
+		t.Errorf("expected status provisioning, got %s", claimed.Status)
+	}
+	if claimed.Version != 3 {
+		t.Errorf("expected version 3, got %d", claimed.Version)
+	}
+}

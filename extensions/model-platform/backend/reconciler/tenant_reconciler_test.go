@@ -25,6 +25,7 @@ type mockGatewayClient struct {
 	generated   map[string]*gateway.GenerateKeyRequest
 	deletedKeys []string
 	generateErr error
+	deleteErr   error
 	onGenerate  func()
 	keyCounter  int32
 }
@@ -64,6 +65,10 @@ func (m *mockGatewayClient) DeleteKey(ctx context.Context, keys []string) (*gate
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.deleteErr != nil {
+		return nil, m.deleteErr
+	}
+
 	m.deletedKeys = append(m.deletedKeys, keys...)
 	for _, k := range keys {
 		delete(m.generated, k)
@@ -91,6 +96,8 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 	// Migrate upstream entity tables
 	err = db.AutoMigrate(
+		&rentity.Tenant{},
+		&rentity.UserTenant{},
 		&rentity.TenantModelProvider{},
 		&rentity.TenantModelInstance{},
 		&rentity.TenantModel{},
@@ -372,5 +379,73 @@ func TestTenantReconciler_ContextTimeout_MarksDegraded(t *testing.T) {
 	}
 	if state.Status != entity.StatusDegraded {
 		t.Errorf("expected status degraded after timeout, got %s", state.Status)
+	}
+}
+
+func TestTenantReconciler_OptimisticLockConflict_DeleteKeyFailureReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := newMockGatewayClient()
+	mockClient.deleteErr = errors.New("gateway unreachable on delete")
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+
+	ctx := context.Background()
+	tenantID := "tenant-conflict-delerr"
+
+	initialRec := entity.TenantReconcileRecord{
+		TenantID:   tenantID,
+		Status:     entity.StatusPending,
+		RetryCount: 0,
+		MaxRetries: 50,
+		Version:    1,
+	}
+	db.Create(&initialRec)
+
+	mockClient.onGenerate = func() {
+		_ = db.Model(&entity.TenantReconcileRecord{}).
+			Where("tenant_id = ?", tenantID).
+			Updates(map[string]interface{}{
+				"version": initialRec.Version + 10,
+				"status":  entity.StatusReady,
+			}).Error
+	}
+
+	err := rec.Reconcile(ctx, db, tenantID)
+	if err == nil {
+		t.Fatal("expected error when DeleteKey fails on conflict, got nil")
+	}
+	if !strings.Contains(err.Error(), "compensating rollback incomplete") {
+		t.Errorf("expected error to mention 'compensating rollback incomplete', got: %v", err)
+	}
+}
+
+func TestTenantReconciler_OptimisticLockConflict_DeleteKeySuccessReturnsNil(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := newMockGatewayClient()
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+
+	ctx := context.Background()
+	tenantID := "tenant-conflict-ok"
+
+	initialRec := entity.TenantReconcileRecord{
+		TenantID:   tenantID,
+		Status:     entity.StatusPending,
+		RetryCount: 0,
+		MaxRetries: 50,
+		Version:    1,
+	}
+	db.Create(&initialRec)
+
+	mockClient.onGenerate = func() {
+		_ = db.Model(&entity.TenantReconcileRecord{}).
+			Where("tenant_id = ?", tenantID).
+			Updates(map[string]interface{}{
+				"version": initialRec.Version + 10,
+				"status":  entity.StatusReady,
+			}).Error
+	}
+
+	err := rec.Reconcile(ctx, db, tenantID)
+	if err != nil {
+		t.Fatalf("expected nil on successful compensation during conflict, got: %v", err)
 	}
 }
