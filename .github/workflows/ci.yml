@@ -52,10 +52,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - uses: astral-sh/setup-uv@v7
-      - name: Create isolated upstream build tree
-        run: |
-          mkdir -p build/ragflow
-          git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Prepare isolated build workspace with model-platform overlay
+        run: bash extensions/model-platform/scripts/apply-overlay.sh
       - name: Cache native static libraries and archives
         uses: actions/cache@v4
         with:
@@ -65,8 +63,19 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-native-libs-${{ steps.upstream.outputs.sha }}
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lld-20 libpcre2-dev
+          installed=false
+          for i in 1 2 3 4 5; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends lld-20 libpcre2-dev; then
+              installed=true
+              break
+            fi
+            echo "apt-get failed (attempt $i/5), retrying in 10s..."
+            sleep 10
+          done
+          if [ "$installed" != "true" ]; then
+            echo "Failed to install dependencies after 5 attempts" >&2
+            exit 1
+          fi
           sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
       - name: Download native libraries and runtime resources
         working-directory: build/ragflow
@@ -94,17 +103,24 @@ jobs:
         run: |
           python3 "$GITHUB_WORKSPACE/ci/clean-tokenizer-archive.py" \
             internal/binding/cpp/cmake-build-release/librag_tokenizer_c_api.a
-      - name: Build Go server
+      - name: Build Go server (Enterprise)
         working-directory: build/ragflow
+        env:
+          RAGFLOW_GO_TAGS: ee
         run: ./build.sh --go
-      - name: Run upstream Go unit tests
+      - name: Run upstream Go unit tests (Enterprise)
         working-directory: build/ragflow
+        env:
+          RAGFLOW_GO_TAGS: ee
         run: ./build.sh --test
+      - name: Run model-platform extension unit tests
+        working-directory: build/ragflow
+        run: CGO_ENABLED=0 go test -v -count=1 -tags ee ./extensions/model-platform/...
       - name: Report scope
         if: always()
         run: |
           echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Upstream Go build and default unit tier; upstream integration, API, SDK and model-backed tests are not yet configured.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Enterprise Go build (RAGFLOW_GO_TAGS=ee) with model-platform overlay and unit tier; upstream integration, API, SDK and model-backed tests are not yet configured.' >> "$GITHUB_STEP_SUMMARY"
 
   web:
     name: Web build and tests
@@ -119,10 +135,8 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: upstream/ragflow/web/package-lock.json
-      - name: Create isolated upstream build tree
-        run: |
-          mkdir -p build/ragflow
-          git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Prepare isolated build workspace with model-platform overlay
+        run: bash extensions/model-platform/scripts/apply-overlay.sh
       - name: Install frontend dependencies
         working-directory: build/ragflow/web
         run: npm ci --no-audit --no-fund

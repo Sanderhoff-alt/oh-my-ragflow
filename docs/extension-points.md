@@ -19,7 +19,7 @@ This document describes the extension mechanisms observed in the pinned RAGFlow 
 
 Upstream uses Go build constraints such as `//go:build !ee` for community implementations and `//go:build ee` for enterprise-side implementations. [`build.sh`](../upstream/ragflow/build.sh) appends `RAGFLOW_GO_TAGS` to build and test tags. Setting `RAGFLOW_GO_TAGS=ee` is a global build choice: it excludes all matching `!ee` files in selected packages, not just the one function the extension needs. The community checkout does not contain the full enterprise implementation.
 
-Consequently, an `ee` integration must provide the required symbols excluded by the tag. Preserve the original community behavior for unrelated functions, types, and methods; implement only the intended differences. Avoid duplicate definitions. How to produce and maintain this baseline adaptation is not yet decided or implemented. Verify its coverage against the pinned sources, including `!ee` files that are not named `stub.go` and test-only definitions.
+Consequently, an `ee` integration must provide the required symbols excluded by the tag. Preserve the original community behavior for unrelated functions, types, and methods; implement only the intended differences. Avoid duplicate definitions. This baseline adaptation is implemented via the 19-package affirmative `ee-baseline` overlay (`overlay/ee-baseline/`) and verified automatically by `apply-overlay.sh` during the build process. Verify its coverage against the pinned sources, including `!ee` files that are not named `stub.go` and test-only definitions.
 
 Representative seams in the pinned source include:
 
