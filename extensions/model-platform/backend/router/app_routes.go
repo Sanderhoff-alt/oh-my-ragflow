@@ -23,6 +23,9 @@ func RegisterModelPlatformProtectedRoutes(protected *gin.RouterGroup) {
 	// Inject the managed provider guard to protect platform models against unauthorized deletion or alteration.
 	// Attached to the protected router group so c.GetString("tenant_id") is already populated by AuthMiddleware.
 	protected.Use(guard.ManagedProviderGuardMiddleware())
+
+	// Inject the dataset immutability guard to protect existing dataset vector spaces against corrupting model mutations.
+	protected.Use(guard.DatasetImmutabilityGuardMiddleware())
 }
 
 // RegisterModelPlatformAuthRoutes registers authenticated enterprise routes.
