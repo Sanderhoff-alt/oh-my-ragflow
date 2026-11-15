@@ -39,11 +39,15 @@ type DefaultsInitResult struct {
 // DefaultsManager handles atomic and safe initialization of tenant default models.
 // It uses conditional atomic SQL to guarantee that user-explicit custom selections
 // are 100% protected against accidental overwrites by background reconcilers.
-type DefaultsManager struct{}
+type DefaultsManager struct {
+	stickyGuard *StickyGuard
+}
 
 // NewDefaultsManager creates a new DefaultsManager.
 func NewDefaultsManager() *DefaultsManager {
-	return &DefaultsManager{}
+	return &DefaultsManager{
+		stickyGuard: NewStickyGuard(),
+	}
 }
 
 // InitializeTenantDefaults conditionally initializes default models for all users in a tenant.
@@ -113,6 +117,33 @@ func (m *DefaultsManager) InitializeMemberFromOwner(
 	return m.InitializeUserDefaults(ctx, db, userID, tenantID, cfg)
 }
 
+func (m *DefaultsManager) recordModelDefaults(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	userID string,
+	modelType int,
+	modelID string,
+	colName string,
+) error {
+	if m.stickyGuard == nil || modelID == "" {
+		return nil
+	}
+	if userID != "" {
+		return m.stickyGuard.RecordPlatformDefault(ctx, db, tenantID, userID, modelType, modelID)
+	}
+	var members []rentity.UserTenant
+	if err := db.Where(fmt.Sprintf("tenant_id = ? AND %s = ?", colName), tenantID, modelID).Find(&members).Error; err != nil {
+		return fmt.Errorf("failed to query members for %s provenance: %w", colName, err)
+	}
+	for _, mem := range members {
+		if err := m.stickyGuard.RecordPlatformDefault(ctx, db, tenantID, mem.UserID, modelType, modelID); err != nil {
+			return fmt.Errorf("failed to record default preference for user %s: %w", mem.UserID, err)
+		}
+	}
+	return nil
+}
+
 // InitializeUserDefaults conditionally initializes default models for a specific user (or all users if userID is empty)
 // in a tenant. It protects existing user choices with atomic conditional SQL.
 func (m *DefaultsManager) InitializeUserDefaults(
@@ -166,6 +197,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 			return nil, fmt.Errorf("failed to atomically initialize chat default model: %w", res.Error)
 		}
 		result.ChatUpdated = res.RowsAffected
+
+		if res.RowsAffected > 0 {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeChat), cfg.ChatModelID, "llm_id"); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// 2. Conditionally initialize Embedding Model (embd_id, tenant_embd_id)
@@ -186,6 +223,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 			return nil, fmt.Errorf("failed to atomically initialize embedding default model: %w", res.Error)
 		}
 		result.EmbeddingUpdated = res.RowsAffected
+
+		if res.RowsAffected > 0 {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeEmbedding), cfg.EmbeddingModelID, "embd_id"); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// 3. Conditionally initialize Rerank Model (rerank_id, tenant_rerank_id)
@@ -206,6 +249,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 			return nil, fmt.Errorf("failed to atomically initialize rerank default model: %w", res.Error)
 		}
 		result.RerankUpdated = res.RowsAffected
+
+		if res.RowsAffected > 0 {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeRerank), cfg.RerankModelID, "rerank_id"); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// 4. Conditionally initialize ASR Model (asr_id, tenant_asr_id)
@@ -226,6 +275,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 			return nil, fmt.Errorf("failed to atomically initialize asr default model: %w", res.Error)
 		}
 		result.ASRUpdated = res.RowsAffected
+
+		if res.RowsAffected > 0 {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeSpeech2Text), cfg.ASRModelID, "asr_id"); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// 5. Conditionally initialize Image2Text Model (img2txt_id, tenant_img2txt_id)
@@ -246,6 +301,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 			return nil, fmt.Errorf("failed to atomically initialize image2text default model: %w", res.Error)
 		}
 		result.Image2TextUpdated = res.RowsAffected
+
+		if res.RowsAffected > 0 {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeImage2Text), cfg.Image2TextModelID, "img2txt_id"); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return result, nil

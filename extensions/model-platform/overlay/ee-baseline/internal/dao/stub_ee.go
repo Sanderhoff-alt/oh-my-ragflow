@@ -15,7 +15,10 @@ import (
 
 // tenantDAOTestExtraModels registers platform_tenant_reconcile in test migrations.
 func tenantDAOTestExtraModels() []interface{} {
-	return []interface{}{&mpentity.TenantReconcileRecord{}}
+	return []interface{}{
+		&mpentity.TenantReconcileRecord{},
+		&mpentity.UserDefaultPreference{},
+	}
 }
 
 // permissionDataModelsEE returns no additional entities in the community
@@ -27,7 +30,10 @@ func billingDataModelsEE() []interface{} { return nil }
 
 // migrateBillingSchemaEE applies model platform schema migrations.
 func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error {
-	return mpmigration.MigrateReconcileSchema(ctx, db)
+	if err := mpmigration.MigrateReconcileSchema(ctx, db); err != nil {
+		return err
+	}
+	return mpmigration.MigratePreferenceSchema(ctx, db)
 }
 
 // migratePermissionDataEE is a no-op in the community edition.

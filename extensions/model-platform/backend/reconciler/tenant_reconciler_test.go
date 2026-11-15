@@ -94,6 +94,11 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("failed to migrate reconcile schema: %v", err)
 	}
 
+	// Migrate preference schema
+	if err := migration.MigratePreferenceSchema(context.Background(), db); err != nil {
+		t.Fatalf("failed to migrate preference schema: %v", err)
+	}
+
 	// Migrate upstream entity tables
 	err = db.AutoMigrate(
 		&rentity.Tenant{},
