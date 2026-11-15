@@ -25,6 +25,7 @@ type mockGatewayClient struct {
 	generated   map[string]*gateway.GenerateKeyRequest
 	deletedKeys []string
 	generateErr error
+	updateErr   error
 	deleteErr   error
 	onGenerate  func()
 	keyCounter  int32
@@ -58,6 +59,26 @@ func (m *mockGatewayClient) GenerateKey(ctx context.Context, req *gateway.Genera
 		Models:    req.Models,
 		Expires:   req.Duration,
 		MaxBudget: req.MaxBudget,
+	}, nil
+}
+
+func (m *mockGatewayClient) UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.updateErr != nil {
+		return nil, m.updateErr
+	}
+
+	if gen, ok := m.generated[req.Key]; ok {
+		if len(req.Models) > 0 {
+			gen.Models = req.Models
+		}
+	}
+
+	return &gateway.UpdateKeyResponse{
+		Key:    req.Key,
+		Models: req.Models,
 	}, nil
 }
 
@@ -106,6 +127,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		&rentity.TenantModelProvider{},
 		&rentity.TenantModelInstance{},
 		&rentity.TenantModel{},
+		&rentity.Knowledgebase{},
 	)
 	if err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
