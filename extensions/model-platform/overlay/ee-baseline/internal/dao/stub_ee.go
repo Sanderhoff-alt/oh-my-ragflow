@@ -7,6 +7,7 @@ import (
 
 	mpdao "ragflow/extensions/model-platform/backend/dao"
 	mpentity "ragflow/extensions/model-platform/backend/entity"
+	mpmigration "ragflow/extensions/model-platform/backend/migration"
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
@@ -24,8 +25,10 @@ func permissionDataModelsEE() []interface{} { return nil }
 // billingDataModelsEE returns no billing tables in the community edition.
 func billingDataModelsEE() []interface{} { return nil }
 
-// migrateBillingSchemaEE is a no-op in the community edition.
-func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error { return nil }
+// migrateBillingSchemaEE applies model platform schema migrations.
+func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error {
+	return mpmigration.MigrateReconcileSchema(ctx, db)
+}
 
 // migratePermissionDataEE is a no-op in the community edition.
 func migratePermissionDataEE(ctx context.Context, db *gorm.DB) error { return nil }
