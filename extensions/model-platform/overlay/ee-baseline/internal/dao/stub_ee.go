@@ -1,0 +1,64 @@
+//go:build ee
+
+package dao
+
+import (
+	"context"
+
+	"ragflow/internal/entity"
+
+	"gorm.io/gorm"
+)
+
+// tenantDAOTestExtraModels adds no tables beyond the community schema.
+func tenantDAOTestExtraModels() []interface{} { return nil }
+
+// permissionDataModelsEE returns no additional entities in the community
+// edition.
+func permissionDataModelsEE() []interface{} { return nil }
+
+// billingDataModelsEE returns no billing tables in the community edition.
+func billingDataModelsEE() []interface{} { return nil }
+
+// migrateBillingSchemaEE is a no-op in the community edition.
+func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error { return nil }
+
+// migratePermissionDataEE is a no-op in the community edition.
+func migratePermissionDataEE(ctx context.Context, db *gorm.DB) error { return nil }
+
+// initializeTenantDefaultRoleEE is a no-op in the community edition.
+func initializeTenantDefaultRoleEE(ctx context.Context, db *gorm.DB, tenant *entity.Tenant) error {
+	return nil
+}
+
+// ApplyDefaultTenantInviteEnabled is a no-op in the community edition.
+func ApplyDefaultTenantInviteEnabled(ctx context.Context, db *gorm.DB, tenant *entity.Tenant) error {
+	return nil
+}
+
+// TenantModelGroupDAO owns the enterprise model groups. The community edition
+// has none.
+type TenantModelGroupDAO struct{}
+
+// NewTenantModelGroupDAO creates the model group DAO.
+func NewTenantModelGroupDAO() *TenantModelGroupDAO { return &TenantModelGroupDAO{} }
+
+// TenantModelGroupMapDAO owns the model-to-group mappings.
+type TenantModelGroupMapDAO struct{}
+
+// NewTenantModelGroupMapDAO creates the model group mapping DAO.
+func NewTenantModelGroupMapDAO() *TenantModelGroupMapDAO { return &TenantModelGroupMapDAO{} }
+
+// BillingProductDAO owns the billing product catalogue, which the community
+// edition does not have.
+type BillingProductDAO struct{}
+
+// NewBillingProductDAO creates the billing product DAO.
+func NewBillingProductDAO() *BillingProductDAO { return &BillingProductDAO{} }
+
+// BillingSubscriptionDAO owns tenant subscriptions, which the community
+// edition does not have.
+type BillingSubscriptionDAO struct{}
+
+// NewBillingSubscriptionDAO creates the billing subscription DAO.
+func NewBillingSubscriptionDAO() *BillingSubscriptionDAO { return &BillingSubscriptionDAO{} }
