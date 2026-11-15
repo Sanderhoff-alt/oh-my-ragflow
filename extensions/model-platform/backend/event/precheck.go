@@ -12,6 +12,8 @@ import (
 var (
 	// ErrTenantNotCommitted indicates that tenant or user_tenant records were not visible before timeout.
 	ErrTenantNotCommitted = errors.New("pre-flight check failed: tenant or user_tenant records not visible within timeout")
+	// ErrTenantInactive indicates that the tenant exists but its status is inactive ("0").
+	ErrTenantInactive = errors.New("pre-flight check failed: tenant is inactive")
 	// ErrInvalidTenantID indicates that an empty tenantID was provided.
 	ErrInvalidTenantID = errors.New("pre-flight check failed: tenantID cannot be empty")
 	// ErrNilDB indicates that a nil database handle was passed.
@@ -49,19 +51,26 @@ func PreFlightCheck(ctx context.Context, db *gorm.DB, tenantID string, maxWait t
 			return ErrTenantNotCommitted
 		}
 
-		var tenantCount int64
+		var status string
 		err := silentDB.WithContext(checkCtx).Table("tenant").
-			Where("id = ? AND status = ?", tenantID, "1").
-			Count(&tenantCount).Error
+			Select("status").
+			Where("id = ?", tenantID).
+			Take(&status).Error
 
-		if err == nil && tenantCount > 0 {
+		if err == nil {
+			if status != "1" {
+				return ErrTenantInactive
+			}
 			var userTenantCount int64
 			err = silentDB.WithContext(checkCtx).Table("user_tenant").
 				Where("tenant_id = ?", tenantID).
 				Count(&userTenantCount).Error
 
 			if err == nil && userTenantCount > 0 {
-				// Both tenant and user_tenant are committed and visible!
+				// Both active tenant and user_tenant are committed and visible!
+				return nil
+			}
+			if err != nil && !silentDB.Migrator().HasTable("user_tenant") {
 				return nil
 			}
 		}

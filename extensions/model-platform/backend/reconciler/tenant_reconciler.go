@@ -40,10 +40,11 @@ type GatewayKeyClient interface {
 
 // TenantReconciler handles idempotent provisioning of tenant models and virtual keys.
 type TenantReconciler struct {
-	gatewayClient GatewayKeyClient
-	reconcileDAO  *dao.ReconcileDAO
-	baseURL       string
-	allowedModels []string
+	gatewayClient   GatewayKeyClient
+	reconcileDAO    *dao.ReconcileDAO
+	defaultsManager *DefaultsManager
+	baseURL         string
+	allowedModels   []string
 }
 
 // NewTenantReconciler creates a new TenantReconciler.
@@ -60,10 +61,11 @@ func NewTenantReconciler(client GatewayKeyClient, baseURL string, allowedModels 
 		}
 	}
 	return &TenantReconciler{
-		gatewayClient: client,
-		reconcileDAO:  dao.NewReconcileDAO(),
-		baseURL:       baseURL,
-		allowedModels: allowedModels,
+		gatewayClient:   client,
+		reconcileDAO:    dao.NewReconcileDAO(),
+		defaultsManager: NewDefaultsManager(),
+		baseURL:         baseURL,
+		allowedModels:   allowedModels,
 	}
 }
 
@@ -264,6 +266,9 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 			{name: DefaultEmbeddingModelName, modelType: int(rentity.ModelTypeEmbedding)},
 		}
 
+		var chatTenantModelID string
+		var embdTenantModelID string
+
 		for _, m := range modelsToEnsure {
 			if !isModelPermitted(m.name, r.allowedModels) {
 				continue
@@ -288,9 +293,31 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 			} else if err != nil {
 				return err
 			}
+
+			if m.name == DefaultChatModelName {
+				chatTenantModelID = tm.ID
+			} else if m.name == DefaultEmbeddingModelName {
+				embdTenantModelID = tm.ID
+			}
 		}
 
-		// D. Mark Ready in Reconcile state table
+		// D. Atomically and conditionally initialize user_tenant default models
+		var defaultsCfg DefaultModelConfig
+		if chatTenantModelID != "" {
+			defaultsCfg.ChatModelID = fmt.Sprintf("%s@%s@%s", DefaultChatModelName, PlatformInstanceName, ProviderOpenAIAPICompatible)
+			defaultsCfg.ChatTenantModelID = chatTenantModelID
+		}
+		if embdTenantModelID != "" {
+			defaultsCfg.EmbeddingModelID = fmt.Sprintf("%s@%s@%s", DefaultEmbeddingModelName, PlatformInstanceName, ProviderOpenAIAPICompatible)
+			defaultsCfg.EmbeddingTenantModelID = embdTenantModelID
+		}
+
+		_, err = r.defaultsManager.InitializeTenantDefaults(ctx, tx, tenantID, defaultsCfg)
+		if err != nil {
+			return fmt.Errorf("failed to initialize tenant defaults: %w", err)
+		}
+
+		// E. Mark Ready in Reconcile state table
 		keyHash := hashKey(virtualKey)
 		aliasToSave := genResp.KeyName
 		if aliasToSave == "" {
