@@ -314,6 +314,92 @@ func TestClient_URLSanitization(t *testing.T) {
 	}
 }
 
+func TestClient_GetSpendLogs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if !strings.HasPrefix(r.URL.Path, "/spend/logs/v2") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+
+		// Verify query parameters
+		if r.URL.Query().Get("start_date") != "2026-11-15 00:00:00" {
+			t.Errorf("unexpected start_date: %s", r.URL.Query().Get("start_date"))
+		}
+		if r.URL.Query().Get("end_date") != "2026-11-16 00:00:00" {
+			t.Errorf("unexpected end_date: %s", r.URL.Query().Get("end_date"))
+		}
+		if r.URL.Query().Get("page") != "1" {
+			t.Errorf("unexpected page: %s", r.URL.Query().Get("page"))
+		}
+		if r.URL.Query().Get("page_size") != "100" {
+			t.Errorf("unexpected page_size: %s", r.URL.Query().Get("page_size"))
+		}
+
+		resp := []SpendLogEntry{
+			{
+				RequestID:        "req-1",
+				SpendID:          "spend-1",
+				Model:            "gpt-4o",
+				TotalTokens:      150,
+				PromptTokens:     100,
+				CompletionTokens: 50,
+				Spend:            0.0025,
+				StartTime:        "2026-11-15 10:00:00",
+				Metadata: map[string]interface{}{
+					"user_api_key_alias": "tenant_t1",
+				},
+			},
+			{
+				RequestID:        "req-2",
+				SpendID:          "spend-2",
+				Model:            "text-embedding-3-small",
+				TotalTokens:      50,
+				PromptTokens:     50,
+				CompletionTokens: 0,
+				Spend:            0.0001,
+				StartTime:        "2026-11-15 11:00:00",
+				Metadata: map[string]interface{}{
+					"user_api_key_alias": "tenant_t2",
+				},
+			},
+		}
+		// Wrap in pinned LiteLLM v1.110.0 response envelope
+		envelope := map[string]interface{}{
+			"data":      resp,
+			"total":     len(resp),
+			"page":      1,
+			"page_size": 100,
+		}
+		json.NewEncoder(w).Encode(envelope)
+	}))
+	defer server.Close()
+
+	cfg := GatewayConfig{BaseURL: server.URL}
+	client := NewClient(cfg)
+
+	logs, err := client.GetSpendLogs(context.Background(), SpendLogQueryParams{
+		StartDate: "2026-11-15 00:00:00",
+		EndDate:   "2026-11-16 00:00:00",
+		Page:      1,
+		PageSize:  100,
+	})
+	if err != nil {
+		t.Fatalf("failed to get spend logs: %v", err)
+	}
+
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 spend logs, got %d", len(logs))
+	}
+	if logs[0].SpendID != "spend-1" || logs[0].TotalTokens != 150 {
+		t.Errorf("unexpected spend log 0: %+v", logs[0])
+	}
+	if logs[1].SpendID != "spend-2" || logs[1].TotalTokens != 50 {
+		t.Errorf("unexpected spend log 1: %+v", logs[1])
+	}
+}
+
 func TestMaskKey(t *testing.T) {
 	tests := []struct {
 		input    string

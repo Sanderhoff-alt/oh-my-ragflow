@@ -91,3 +91,48 @@ type KeyInfo struct {
 	TeamID    string                 `json:"team_id,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
+
+// SpendLogQueryParams defines filter and pagination parameters for querying LiteLLM spend logs.
+type SpendLogQueryParams struct {
+	StartDate string `json:"start_date,omitempty"` // Format: YYYY-MM-DD or RFC3339
+	EndDate   string `json:"end_date,omitempty"`   // Format: YYYY-MM-DD or RFC3339
+	APIKey    string `json:"api_key,omitempty"`
+	UserID    string `json:"user_id,omitempty"`
+	Page      int    `json:"page,omitempty"`
+	PageSize  int    `json:"page_size,omitempty"`
+}
+
+// PromptTokensDetails holds normalized prompt cache metrics adhering to OpenAI standard.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// CompletionTokensDetails holds normalized reasoning metrics adhering to OpenAI standard.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// SpendLogEntry represents an individual raw invocation record returned by LiteLLM /spend/logs/v2.
+type SpendLogEntry struct {
+	RequestID               string                   `json:"request_id,omitempty"`
+	SpendID                 string                   `json:"spend_id,omitempty"`
+	APIKey                  string                   `json:"api_key,omitempty"`
+	User                    string                   `json:"user,omitempty"`
+	TeamID                  string                   `json:"team_id,omitempty"`
+	Model                   string                   `json:"model,omitempty"`
+	CallType                string                   `json:"call_type,omitempty"`
+	Spend                   float64                  `json:"spend,omitempty"`
+	PromptSpend             float64                  `json:"prompt_spend,omitempty"`
+	CompletionSpend         float64                  `json:"completion_spend,omitempty"`
+	CacheSavings            float64                  `json:"cache_savings,omitempty"`
+	TotalTokens             int                      `json:"total_tokens,omitempty"`
+	PromptTokens            int                      `json:"prompt_tokens,omitempty"`
+	CompletionTokens        int                      `json:"completion_tokens,omitempty"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	CacheCreationTokens     int                      `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadTokens         int                      `json:"cache_read_input_tokens,omitempty"`
+	StartTime               string                   `json:"startTime,omitempty"`
+	EndTime                 string                   `json:"endTime,omitempty"`
+	Metadata                map[string]interface{}   `json:"metadata,omitempty"`
+}
