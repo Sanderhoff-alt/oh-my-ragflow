@@ -5,13 +5,17 @@ package dao
 import (
 	"context"
 
+	mpdao "ragflow/extensions/model-platform/backend/dao"
+	mpentity "ragflow/extensions/model-platform/backend/entity"
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
 )
 
-// tenantDAOTestExtraModels adds no tables beyond the community schema.
-func tenantDAOTestExtraModels() []interface{} { return nil }
+// tenantDAOTestExtraModels registers platform_tenant_reconcile in test migrations.
+func tenantDAOTestExtraModels() []interface{} {
+	return []interface{}{&mpentity.TenantReconcileRecord{}}
+}
 
 // permissionDataModelsEE returns no additional entities in the community
 // edition.
@@ -26,9 +30,12 @@ func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error { return nil
 // migratePermissionDataEE is a no-op in the community edition.
 func migratePermissionDataEE(ctx context.Context, db *gorm.DB) error { return nil }
 
-// initializeTenantDefaultRoleEE is a no-op in the community edition.
+// initializeTenantDefaultRoleEE initializes platform reconcile record inside the transaction.
 func initializeTenantDefaultRoleEE(ctx context.Context, db *gorm.DB, tenant *entity.Tenant) error {
-	return nil
+	if tenant == nil || tenant.ID == "" {
+		return nil
+	}
+	return mpdao.OnTenantCreateHook(ctx, db, tenant.ID)
 }
 
 // ApplyDefaultTenantInviteEnabled is a no-op in the community edition.
