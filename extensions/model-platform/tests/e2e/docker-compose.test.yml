@@ -1,0 +1,62 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: e2e-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm_test
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: test_secure_password
+    volumes:
+      - e2e-postgres-data:/var/lib/postgresql/data
+    networks:
+      - e2e-isolated-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  litellm-proxy-test:
+    image: ghcr.io/berriai/litellm:main-v1.110.0
+    container_name: e2e-litellm-test-proxy
+    restart: unless-stopped
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    command:
+      - "--config"
+      - "/app/config/litellm-config.yaml"
+      - "--port"
+      - "4000"
+      - "--num_workers"
+      - "2"
+    volumes:
+      - ../../gateway/litellm-config.yaml:/app/config/litellm-config.yaml:ro
+    environment:
+      DATABASE_URL: postgresql://litellm:test_secure_password@postgres-test:5432/litellm_test
+      LITELLM_MASTER_KEY: sk-master-e2e-platform-test-key
+      LITELLM_SALT_KEY: sk-salt-e2e-platform-test-key
+      STORE_MODEL_IN_DB: "True"
+      PLATFORM_UPSTREAM_OPENAI_KEY: mock-openai-key-e2e
+      PLATFORM_UPSTREAM_OPENAI_BASE: http://127.0.0.1:4000/mock
+    ports:
+      # STRICT PHYSICAL ISOLATION: Bind exclusively to 127.0.0.1.
+      # Public exposure (0.0.0.0 or raw port 4000) is strictly forbidden.
+      - "127.0.0.1:4000:4000"
+    networks:
+      - e2e-isolated-net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:4000/health/liveliness\")' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+networks:
+  e2e-isolated-net:
+    name: e2e-isolated-net
+    driver: bridge
+
+volumes:
+  e2e-postgres-data:
+    name: e2e-postgres-data
