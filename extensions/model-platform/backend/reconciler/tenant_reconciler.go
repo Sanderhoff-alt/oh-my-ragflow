@@ -35,6 +35,7 @@ const (
 // GatewayKeyClient defines the contract for LiteLLM virtual key management.
 type GatewayKeyClient interface {
 	GenerateKey(ctx context.Context, req *gateway.GenerateKeyRequest) (*gateway.GenerateKeyResponse, error)
+	UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error)
 	DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error)
 }
 
