@@ -1,20 +1,20 @@
-# LiteLLM Proxy Baseline Configuration for oh-my-ragflow Model Platform
+# LiteLLM Proxy Security & Secret Isolation Configuration
 # Pinned version target: v1.110.0+ (Latest Stable)
 
 model_list:
-  # Platform-managed Chat Model
+  # Standard Chat Model (Matches RAGFlow conf/all_models.json catalog metadata)
   # Note: Per-tenant rate limits and token budgets are enforced dynamically
   # via LiteLLM Virtual Keys (/key/generate) rather than static model-level router limits.
-  - model_name: platform/chat
+  - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
       api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
 
-  # Platform-managed Embedding Model
-  - model_name: platform/embedding
+  # Standard Embedding Model (Matches RAGFlow conf/all_models.json catalog metadata)
+  - model_name: text-embedding-3-small
     litellm_params:
-      model: text-embedding-3-small
+      model: openai/text-embedding-3-small
       api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
       api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
 
@@ -25,8 +25,12 @@ general_settings:
   disable_spend_logs: false
 
 litellm_settings:
-  # Credential masking & log desensitization: hide real upstream secrets in all logs and errors
+  # Credential masking & log desensitization:
+  # 1. Redact all user and master API key information from console outputs and logs
   redact_user_api_key_info: true
+  # 2. Prevent arbitrary unvalidated parameters from propagating upstream
   drop_params: true
+  # 3. Disable verbose stack traces to prevent sensitive environment variable dumps
   set_verbose: false
+  # 4. Enforce structured JSON logging for secure log ingestion
   json_logs: true

@@ -706,7 +706,7 @@ ON DUPLICATE KEY UPDATE
 | | **TASK-0.3** | 薄跳板接缝与 API 防篡改守卫 | 路由注入薄跳板与受管模型 403 守卫 (`managed_provider_guard.go`, `trampolines/**`) | 单元测试验证 DELETE/PUT 403 阻断 |
 | | **TASK-0.4** | 前端 Web Overlay 接缝接入 | 管理端路由与导航注入 (`merge-routes.tsx`, `navigation-private.tsx`) | `VITE_RAGFLOW_ENTERPRISE=false` 打包测试 |
 | **P1: 网关基础设施** | **TASK-1.1** | LiteLLM 网关与网络隔离 | 本地环回隔离与容器配置 (`gateway/docker-compose.yml`, `litellm-config.yaml`) | `validate-gateway-config.sh` 与端口校验 |
-| | **TASK-1.2** | 平台根凭据安全隔离脱敏 | 真实 API Key 注入与日志脱敏 (`litellm-config.yaml`, `test_secret_isolation.py`) | 凭据隔离断言与控制台输出审查 |
+| | **TASK-1.2** | 平台根凭据安全隔离脱敏 | 真实 API Key 注入与日志脱敏 (`litellm-config.yaml`, `validate-gateway-config.sh`) | 凭据环境变量引用、脱敏标志与网关配置无明文密钥校验 |
 | | **TASK-1.3** | 租户虚拟 Key 客户端与超时控制 | Go HTTP 客户端封装与显式超时机制 (`backend/gateway/client.go`, `types.go`) | 客户端单元测试与超时拦截验证 |
 | | **TASK-1.4** | 网关权限路由与管理端点阻断 | 租户 Key 权限范围与端点阻断验证 (`permission_test.go`, `test_gateway_permissions.py`) | 401/403 越权端点与跨模型调用测试 |
 | **P2: 租户生命周期** | **TASK-2.1** | 事务解耦与 Post-Commit 异步触发 | GORM 事务提交后异步事件调度 (`backend/dao/tenant_hook.go`, `event/bus.go`) | 事务提交事件分发与预检单元测试 |

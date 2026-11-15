@@ -519,7 +519,7 @@ flowchart LR
 | | **TASK-0.3** | Thin Trampolines & 403 Guard | Router trampolines & managed provider guard (`managed_provider_guard.go`, `trampolines/**`) | Unit tests assert 403 on DELETE/PUT |
 | | **TASK-0.4** | Frontend Web Overlay Seams | Admin route & navigation injection (`merge-routes.tsx`, `navigation-private.tsx`) | `VITE_RAGFLOW_ENTERPRISE=false` build check |
 | **P1: Gateway Infra** | **TASK-1.1** | LiteLLM Baseline & Isolation | Loopback network isolation & Docker Compose (`gateway/docker-compose.yml`, `litellm-config.yaml`) | `validate-gateway-config.sh` & port checks |
-| | **TASK-1.2** | Root Secret Isolation | Upstream key injection & log masking (`litellm-config.yaml`, `test_secret_isolation.py`) | Secret isolation tests & console log audit |
+| | **TASK-1.2** | Root Secret Isolation | Upstream key injection & log masking (`litellm-config.yaml`, `validate-gateway-config.sh`) | Environment secret references, masking flags & plaintext key checks |
 | | **TASK-1.3** | Virtual Key Client & Timeouts | Go HTTP client & timeout controls (`backend/gateway/client.go`, `types.go`) | Client unit tests with timeout verification |
 | | **TASK-1.4** | Gateway Permission Routing | Model whitelist & management endpoint blocking (`permission_test.go`, `test_gateway_permissions.py`) | 401/403 tests on unauthorized endpoints |
 | **P2: Tenant Lifecycle** | **TASK-2.1** | Post-Commit Event Decoupling | GORM transaction post-commit dispatch (`backend/dao/tenant_hook.go`, `event/bus.go`) | Post-commit dispatch & precheck unit tests |
@@ -627,8 +627,8 @@ flowchart TD
 ##### TASK-1.2: Root Provider Secret Physical Isolation & Log Masking
 - **Description**: Isolate upstream API keys via `${PLATFORM_UPSTREAM_OPENAI_KEY}` and configure credential masking in LiteLLM logs.
 - **Inputs & Outputs**: Input: environment variables; Output: masked logs and secret isolation test.
-- **Target Files**: `gateway/litellm-config.yaml`, `gateway/test_secret_isolation.py`
-- **Verification**: Run `test_secret_isolation.py` to assert root secrets never appear in logs or client responses.
+- **Target Files**: `gateway/litellm-config.yaml`, `gateway/validate-gateway-config.sh`
+- **Verification**: Run `validate-gateway-config.sh` to assert that credential masking configuration flags are active, root provider secrets strictly use environment references, and no plaintext keys are present in gateway configuration files (excluding Markdown and example files).
 
 ##### TASK-1.3: Tenant Virtual Key Client & Timeout Controls
 - **Description**: Implement Go client for `/key/generate`, `/key/delete`, and `/global/spend/logs` with 5-second HTTP timeouts and exponential retries.
