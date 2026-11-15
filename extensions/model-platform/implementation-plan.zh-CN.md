@@ -708,7 +708,7 @@ ON DUPLICATE KEY UPDATE
 | **P1: 网关基础设施** | **TASK-1.1** | LiteLLM 网关与网络隔离 | 本地环回隔离与容器配置 (`gateway/docker-compose.yml`, `litellm-config.yaml`) | `validate-gateway-config.sh` 与端口校验 |
 | | **TASK-1.2** | 平台根凭据安全隔离脱敏 | 真实 API Key 注入与日志脱敏 (`litellm-config.yaml`, `validate-gateway-config.sh`) | 凭据环境变量引用、脱敏标志与网关配置无明文密钥校验 |
 | | **TASK-1.3** | 租户虚拟 Key 客户端与超时控制 | Go HTTP 客户端封装与显式超时机制 (`backend/gateway/client.go`, `types.go`) | 客户端单元测试与超时拦截验证 |
-| | **TASK-1.4** | 网关权限路由与管理端点阻断 | 租户 Key 权限范围与端点阻断验证 (`permission_test.go`, `test_gateway_permissions.py`) | 401/403 越权端点与跨模型调用测试 |
+| | **TASK-1.4** | 网关权限路由与管理端点阻断 | 租户 Key 权限范围与端点阻断验证 (`permission_test.go`) | 401/403 越权端点与跨模型调用测试 |
 | **P2: 租户生命周期** | **TASK-2.1** | 事务解耦与 Post-Commit 异步触发 | GORM 事务提交后异步事件调度 (`backend/dao/tenant_hook.go`, `event/bus.go`) | 事务提交事件分发与预检单元测试 |
 | | **TASK-2.2** | 租户协调状态机与数据迁移 | Reconciler 状态表迁移与乐观锁 (`entity/reconcile.go`, `dao/reconcile.go`) | 状态机合法跃迁与乐观锁冲突测试 |
 | | **TASK-2.3** | 原生驱动解析与补偿回滚 | `OpenAI-API-Compatible@platform` 同步与失败回滚 (`tenant_reconciler.go`) | 原生驱动匹配与回滚撤销 Key 验证 |
@@ -896,16 +896,17 @@ flowchart TD
 - **完成标准**：
   - 单元测试覆盖各方法，包含对网络超时的精准熔断断言。
 
-#### TASK-1.4: 网关权限路由与管理端点物理阻断验证
-- **任务描述**：配置并验证 LiteLLM 路由鉴权策略，阻断租户虚拟 Key 访问管理端点与未授权模型。
+#### TASK-1.4: 网关权限路由与管理端点阻断（Mock 契约验证）
+- **任务描述**：基于进程内 Mock LiteLLM 代理验证管理端点防越权阻断、模型白名单路由以及配额过期拦截契约。
 - **前置依赖**：TASK-1.3。
 - **涉及接缝文件 / 模块**：
-  - `extensions/model-platform/backend/gateway/security_test.go`
+  - `extensions/model-platform/backend/gateway/permission_test.go`
 - **核心技术要点**：
-  1. 验证使用租户虚拟 Key 请求 `POST /key/generate` 等管理端点时被网关物理拦截（返回 401/403）。
+  1. 验证使用租户虚拟 Key 请求 `POST /key/generate` 等管理端点时被网关拦截拒绝（返回 401/403）。
   2. 验证使用租户虚拟 Key 调用未授权模型时，网关返回 `403 Forbidden` (`ModelNotAllowedError`)。
+  3. 验证超出预算限额与凭证过期时的拦截阻断（返回 403/401 状态码）。
 - **完成标准**：
-  - 安全测试用例全部执行通过，阻断率 100%。
+  - 进程内契约安全测试用例全部执行通过。
 
 ---
 
