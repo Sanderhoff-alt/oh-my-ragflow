@@ -178,3 +178,36 @@ jobs:
         run: npm run build
       - name: Run frontend tests
         run: node ci/run-upstream-web-tests.cjs
+
+  model-platform:
+    name: Model Platform Non-Invasive Audit & Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: upstream/ragflow/go.mod
+          cache: false
+      - name: "Gate Check: Non-invasive compliance audit"
+        run: bash extensions/model-platform/scripts/audit-non-invasive.sh
+      - name: Start LiteLLM and PostgreSQL live test cluster
+        run: bash extensions/model-platform/tests/e2e/setup_env.sh --start
+      - name: Run model-platform backend unit and integration tests
+        working-directory: build/ragflow
+        env:
+          REQUIRE_LIVE_GATEWAY: "true"
+        run: CGO_ENABLED=0 go test -v -count=1 ./extensions/model-platform/...
+      - name: Teardown live test cluster
+        if: always()
+        run: docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml down -v
+      - name: "Post-run assertion: Verify upstream submodule remains 100% pristine"
+        run: |
+          git -C upstream/ragflow diff --quiet
+          test -z "$(git -C upstream/ragflow status --porcelain)"
+          echo "Upstream submodule verified 100% clean and non-invasive after build and test execution."

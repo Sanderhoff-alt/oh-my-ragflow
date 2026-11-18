@@ -61,7 +61,7 @@ fi
 
 # Assert LiteLLM version is pinned to >= 1.50 / latest stable (v1.110.0+)
 if ! grep -qE 'ghcr\.io/berriai/litellm:(main-)?v1\.(5[0-9]|[6-9][0-9]|[0-9]{3,})' "${COMPOSE_TEST}"; then
-    echo "FAIL: LiteLLM version in docker-compose.test.yml must be pinned to ghcr.io/berriai/litellm:main-v1.110.0+ (or v1.50+)" >&2
+    echo "FAIL: LiteLLM version in docker-compose.test.yml must be pinned to ghcr.io/berriai/litellm:v1.110.0+ (or v1.50+)" >&2
     exit 1
 fi
 echo "[PASS] E2E test compose network isolation verified."
@@ -98,7 +98,7 @@ if [[ "${DOCKER_AVAILABLE}" == "true" ]]; then
         docker compose -f "${COMPOSE_TEST}" up -d
         echo "Waiting for services to become healthy..."
         HEALTHY=false
-        for i in {1..30}; do
+        for i in {1..45}; do
             if curl -s -f http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1; then
                 echo "[PASS] LiteLLM test proxy is healthy at http://127.0.0.1:4000"
                 HEALTHY=true
@@ -111,6 +111,7 @@ if [[ "${DOCKER_AVAILABLE}" == "true" ]]; then
             docker compose -f "${COMPOSE_TEST}" logs >&2
             exit 1
         fi
+        echo "REQUIRE_LIVE_GATEWAY=\"true\"" >> "${ENV_TEST}"
     else
         echo "[INFO] Containers ready to be launched with: docker compose -f ${COMPOSE_TEST} up -d"
     fi

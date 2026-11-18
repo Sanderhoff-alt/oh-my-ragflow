@@ -191,7 +191,7 @@ Go 语言严格禁止同一包内出现重复符号声明。`model-platform` 扩
 ## 3. 维度二：LiteLLM 网关选型与凭证隔离 (LiteLLM Gateway Selection & Credential Isolation)
 
 ### 3.1 网关选型验证与容器网络拓扑隔离
-选择 **LiteLLM Proxy**（固定最新稳定生产版本 `v1.110.0`，镜像 `ghcr.io/berriai/litellm:main-v1.110.0`，Apache 2.0 / MIT 开源许可）：
+选择 **LiteLLM Proxy**（固定最新稳定生产版本 `v1.110.0`，镜像 `ghcr.io/berriai/litellm:v1.110.0`，Apache 2.0 / MIT 开源许可）：
 - **网络拓扑物理隔离**：
   LiteLLM 容器仅加入 Docker 内部网络（如 `ragflow-internal-net`），服务端口绑定至容器内 `4000`，或仅绑定至本地回环接口 `127.0.0.1:4000:4000`。**严禁将 4000 端口映射暴露至公网**。租户无法绕过 RAGFlow 直接向网关发起未受控网络请求。
 - **协议兼容性**：提供原生兼容 OpenAI 的 `/v1/chat/completions`、`/v1/embeddings`、`/v1/models`，天然适配 RAGFlow 的 `OpenAI-API-Compatible` 驱动。
@@ -854,7 +854,7 @@ flowchart TD
 ### Phase 1: 网关基础设施与凭据隔离 (Gateway & Credential Isolation)
 
 #### TASK-1.1: LiteLLM 网关选型验证、容器化基线配置与内部网络拓扑隔离
-- **任务描述**：搭建并固化生产级 LiteLLM Proxy（固定最新稳定版本 `v1.110.0`，镜像 `ghcr.io/berriai/litellm:main-v1.110.0`），定义基于 PostgreSQL 的元数据存储，并严格实施网络拓扑物理隔离。
+- **任务描述**：搭建并固化生产级 LiteLLM Proxy（固定最新稳定版本 `v1.110.0`，镜像 `ghcr.io/berriai/litellm:v1.110.0`），定义基于 PostgreSQL 的元数据存储，并严格实施网络拓扑物理隔离。
 - **前置依赖**：Phase 0 完成。
 - **涉及接缝文件 / 模块**：
   - `extensions/model-platform/gateway/docker-compose.yml`

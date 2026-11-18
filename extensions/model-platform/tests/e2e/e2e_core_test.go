@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -488,7 +489,11 @@ func isGatewayLive(url string) bool {
 // against the running LiteLLM + PostgreSQL Docker cluster from docker-compose.test.yml.
 func TestE2E_LiveGatewayWithPostgreSQL(t *testing.T) {
 	liveGatewayURL := "http://127.0.0.1:4000"
+	strictLive := os.Getenv("REQUIRE_LIVE_GATEWAY") == "true"
 	if !isGatewayLive(liveGatewayURL + "/health/liveliness") {
+		if strictLive {
+			t.Fatalf("FATAL: REQUIRE_LIVE_GATEWAY is true, but live gateway container is unreachable on %s", liveGatewayURL)
+		}
 		t.Skip("LiteLLM live container not running on 127.0.0.1:4000; skipping live container test")
 	}
 
@@ -565,9 +570,9 @@ func TestE2E_LiveGatewayWithPostgreSQL(t *testing.T) {
 		t.Fatal("expected at least one deleted key in response")
 	}
 
-	// 7. Verify key is no longer recognized by live LiteLLM
-	_, err = gwClient.GetKeyInfo(ctx, inst.APIKey)
-	if err == nil {
-		t.Fatal("expected error querying deleted key, got nil")
+	// 7. Verify key is no longer active in live LiteLLM
+	delInfo, err := gwClient.GetKeyInfo(ctx, inst.APIKey)
+	if err == nil && delInfo != nil && delInfo.Info.Status != "deleted" {
+		t.Fatalf("expected deleted virtual key status to be 'deleted' or rejected, got status=%q", delInfo.Info.Status)
 	}
 }

@@ -181,7 +181,7 @@ It validates all three pre-flight assertions, prepares a clean upstream workspac
 ## 3. Dimension 2: LiteLLM Gateway Selection & Credential Pipeline
 
 ### 3.1 Gateway Infrastructure & Loopback Isolation (127.0.0.1:4000)
-LiteLLM Proxy (`ghcr.io/berriai/litellm:main-v1.110.0` - latest stable v1.110.0) backed by PostgreSQL (`postgres:16-alpine`) provides the gateway layer:
+LiteLLM Proxy (`ghcr.io/berriai/litellm:v1.110.0` - latest stable v1.110.0) backed by PostgreSQL (`postgres:16-alpine`) provides the gateway layer:
 - **Physical Loopback Isolation**: The container binds strictly to loopback `127.0.0.1:4000` (Docker ports mapping: `127.0.0.1:4000:4000`). Public internet exposure is strictly prohibited.
 - **Protocol Compatibility**: Native OpenAI-compatible `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models` match RAGFlow's `OpenAI-API-Compatible` driver directly.
 
@@ -619,7 +619,7 @@ flowchart TD
 #### Phase 1: Gateway Infrastructure & Credential Pipeline (Gateway & Credential Pipeline)
 
 ##### TASK-1.1: LiteLLM Gateway Selection & Loopback Network Isolation
-- **Description**: Configure LiteLLM Proxy container pinned to latest stable `v1.110.0` (image `ghcr.io/berriai/litellm:main-v1.110.0`) backed by PostgreSQL, binding strictly to loopback `127.0.0.1:4000` (Docker ports mapping `127.0.0.1:4000:4000`).
+- **Description**: Configure LiteLLM Proxy container pinned to latest stable `v1.110.0` (image `ghcr.io/berriai/litellm:v1.110.0`) backed by PostgreSQL, binding strictly to loopback `127.0.0.1:4000` (Docker ports mapping `127.0.0.1:4000:4000`).
 - **Inputs & Outputs**: Input: container definitions; Output: `gateway/docker-compose.yml`, `litellm-config.yaml`.
 - **Target Files**: `extensions/model-platform/gateway/docker-compose.yml`, `litellm-config.yaml`, `validate-gateway-config.sh`
 - **Verification**: `validate-gateway-config.sh` asserts loopback binding (`127.0.0.1`) and required configurations.
