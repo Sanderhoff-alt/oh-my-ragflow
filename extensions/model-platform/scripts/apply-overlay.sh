@@ -183,6 +183,14 @@ if [[ -d "${BACKEND_DIR}" && "$(ls -A "${BACKEND_DIR}" 2>/dev/null)" ]]; then
     cp -R "${BACKEND_DIR}/." "${BUILD_DIR}/extensions/model-platform/backend/"
 fi
 
+# Layer 3.5: Integration tests (if present)
+TESTS_DIR="${ROOT_DIR}/extensions/model-platform/tests"
+if [[ -d "${TESTS_DIR}" && "$(ls -A "${TESTS_DIR}" 2>/dev/null)" ]]; then
+    echo "--> Applying Layer 3.5: Integration tests..."
+    mkdir -p "${BUILD_DIR}/extensions/model-platform/tests"
+    cp -R "${TESTS_DIR}/." "${BUILD_DIR}/extensions/model-platform/tests/"
+fi
+
 # Layer 4: Web frontend overlay (if present)
 if [[ -d "${OVERLAY_DIR}/web" && "$(ls -A "${OVERLAY_DIR}/web" 2>/dev/null)" ]]; then
     echo "--> Applying Layer 4: Web frontend overlays..."
