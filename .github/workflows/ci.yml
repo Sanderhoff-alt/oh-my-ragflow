@@ -36,26 +36,49 @@ jobs:
       - name: Identify upstream revision
         id: upstream
         run: echo "sha=$(git -C upstream/ragflow rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - name: Cache Go modules
+        uses: actions/cache@v4
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py') }}
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-${{ hashFiles('upstream/ragflow/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py', 'upstream/ragflow/internal/binding/cpp/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - uses: astral-sh/setup-uv@v7
       - name: Create isolated upstream build tree
         run: |
           mkdir -p build/ragflow
           git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Cache native static libraries and archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/ragflow-native-libs
+            build/ragflow/deps
+          key: ${{ runner.os }}-${{ runner.arch }}-native-libs-${{ steps.upstream.outputs.sha }}
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-20 lld-20 libpcre2-dev
+          sudo apt-get install -y --no-install-recommends lld-20 libpcre2-dev
           sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
       - name: Download native libraries and runtime resources
         working-directory: build/ragflow
         run: uv run tools/scripts/download_dev_deps.py
+      - name: Cache C++ tokenizer library
+        id: cache-tokenizer
+        uses: actions/cache@v4
+        with:
+          path: build/ragflow/internal/binding/cpp/cmake-build-release/librag_tokenizer_c_api.a
+          key: ${{ runner.os }}-${{ runner.arch }}-tokenizer-ubuntu22_clang20-${{ hashFiles('upstream/ragflow/internal/binding/cpp/**', 'upstream/ragflow/build.sh', 'ci/clean-tokenizer-archive.py', '.github/workflows/ci.yml') }}
       - name: Build tokenizer library
+        if: steps.cache-tokenizer.outputs.cache-hit != 'true'
         working-directory: build/ragflow
         run: |
           docker run --rm \
@@ -66,6 +89,7 @@ jobs:
             -c 'git config --global --add safe.directory /ragflow && ./build.sh --cpp'
           sudo chown -R "$(id -u):$(id -g)" internal/binding/cpp
       - name: Remove empty tokenizer linker-option sections
+        if: steps.cache-tokenizer.outputs.cache-hit != 'true'
         working-directory: build/ragflow
         run: |
           python3 "$GITHUB_WORKSPACE/ci/clean-tokenizer-archive.py" \
@@ -104,6 +128,9 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Build frontend
         working-directory: build/ragflow/web
+        env:
+          VITE_MINIFY: esbuild
+          VITE_BUILD_SOURCEMAP: 'false'
         run: npm run build
       - name: Run frontend tests
         run: node ci/run-upstream-web-tests.cjs

@@ -31,7 +31,7 @@ const summary = [
 ].join('\n');
 console.log(summary);
 if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`);
-const result = spawnSync('npm', ['test', '--', '--runInBand', `--testPathIgnorePatterns=${patterns.join('|')}`], {
+const result = spawnSync('npm', ['test', '--', '--maxWorkers=2', '--coverage=false', `--testPathIgnorePatterns=${patterns.join('|')}`], {
   cwd: web,
   stdio: 'inherit',
 });
