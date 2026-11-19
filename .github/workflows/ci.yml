@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/go-build
-          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py', 'upstream/ragflow/internal/binding/cpp/**') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - uses: astral-sh/setup-uv@v7
@@ -71,7 +71,14 @@ jobs:
       - name: Download native libraries and runtime resources
         working-directory: build/ragflow
         run: uv run tools/scripts/download_dev_deps.py
+      - name: Cache C++ tokenizer library
+        id: cache-tokenizer
+        uses: actions/cache@v4
+        with:
+          path: build/ragflow/internal/binding/cpp/cmake-build-release/librag_tokenizer_c_api.a
+          key: ${{ runner.os }}-${{ runner.arch }}-tokenizer-ubuntu22_clang20-${{ hashFiles('upstream/ragflow/internal/binding/cpp/**', 'upstream/ragflow/build.sh', 'ci/clean-tokenizer-archive.py', '.github/workflows/ci.yml') }}
       - name: Build tokenizer library
+        if: steps.cache-tokenizer.outputs.cache-hit != 'true'
         working-directory: build/ragflow
         run: |
           docker run --rm \
@@ -82,6 +89,7 @@ jobs:
             -c 'git config --global --add safe.directory /ragflow && ./build.sh --cpp'
           sudo chown -R "$(id -u):$(id -g)" internal/binding/cpp
       - name: Remove empty tokenizer linker-option sections
+        if: steps.cache-tokenizer.outputs.cache-hit != 'true'
         working-directory: build/ragflow
         run: |
           python3 "$GITHUB_WORKSPACE/ci/clean-tokenizer-archive.py" \
