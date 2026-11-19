@@ -41,7 +41,7 @@ flowchart LR
     D --> E
 ```
 
-The goal is complete coverage on free standard GitHub-hosted runners. Test jobs may be split to fit their resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing. Until extensions are implemented, the CI workflow builds and tests the pinned upstream source. It currently targets the Go build and unit tier plus the web build and tests; integration, API, SDK and model-backed tests remain to be added.
+The goal is complete coverage on free standard GitHub-hosted runners. Test jobs may be split to fit their resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing. The CI workflow builds and tests the enterprise distribution assembled by `apply-overlay.sh` with `RAGFLOW_GO_TAGS=ee`. It currently targets the enterprise Go build and unit tier (including extension unit tests) plus the web build and tests; integration, API, SDK and model-backed tests remain to be added.
 
 The upstream web test baseline excludes the known failing files listed in
 [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json).
@@ -58,4 +58,4 @@ upstream/ragflow/  Official RAGFlow submodule at the pinned commit
 build/             Generated build workspace (ignored by Git)
 ```
 
-Build scripts are not yet implemented. Builds should apply overlays in the generated workspace, keeping the upstream submodule unchanged.
+Build workspace assembly is automated via `extensions/model-platform/scripts/apply-overlay.sh`. Builds apply overlays into an isolated generated workspace (`build/ragflow`), keeping the upstream submodule 100% clean and pristine.

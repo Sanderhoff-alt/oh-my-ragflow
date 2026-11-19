@@ -41,7 +41,7 @@ flowchart LR
     D --> E
 ```
 
-目标是在免费的 GitHub 标准托管 runner 上完整覆盖测试。可以拆分测试任务以适应资源限制；无法运行或被跳过的检查必须明确披露，不能计为通过。在扩展实现之前，CI 流水线构建并测试固定版本的上游源码。目前计划覆盖 Go 构建与单元测试、前端构建与测试；集成、API、SDK 和模型测试仍待加入。
+目标是在免费的 GitHub 标准托管 runner 上完整覆盖测试。可以拆分测试任务以适应资源限制；无法运行或被跳过的检查必须明确披露，不能计为通过。CI 流水线构建并测试由 `apply-overlay.sh` 组装并启用 `RAGFLOW_GO_TAGS=ee` 的企业级扩展分发版本。目前覆盖企业版 Go 构建与单元测试（包含扩展模块自身单元测试）、前端构建与测试；集成、API、SDK 和模型测试仍待加入。
 
 上游前端测试基线会排除 [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json)
 中记录的已知失败文件。CI 会逐项报告排除内容，并要求其余发现的测试全部通过。
@@ -56,4 +56,4 @@ upstream/ragflow/  指向固定提交的官方 RAGFlow submodule
 build/             构建时生成的工作区（Git 忽略）
 ```
 
-构建脚本尚未实现。构建时应在生成的工作区应用覆盖文件，保持上游 submodule 不变。
+构建工作区组装已通过 `extensions/model-platform/scripts/apply-overlay.sh` 脚本自动化实现。构建时在生成的隔离工作区（`build/ragflow`）应用覆盖层，保持上游 submodule 100% 纯净未修改。

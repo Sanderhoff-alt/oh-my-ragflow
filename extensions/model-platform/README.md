@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Provide platform models to RAGFlow tenants while allowing them to use their own models. Platform model usage can be attributed and metered for future billing; tenant-owned model usage is not charged as platform usage.
 
-**Status:** Design and implementation planning.
+**Status:** Active Implementation (TASK-0.3 Enterprise Trampolines, Baseline Stubs, and Security Guard Merged).
 
 ## Documentation
 
