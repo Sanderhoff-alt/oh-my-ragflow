@@ -1,0 +1,62 @@
+services:
+  litellm-postgres:
+    image: postgres:16-alpine
+    container_name: model-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    volumes:
+      - litellm-db-data:/var/lib/postgresql/data
+    networks:
+      - ragflow-model-platform-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-litellm} -d ${POSTGRES_DB:-litellm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  litellm-proxy:
+    image: ghcr.io/berriai/litellm:v1.110.0
+    container_name: model-platform-litellm-proxy
+    restart: unless-stopped
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+    command:
+      - "--config"
+      - "/app/config/litellm-config.yaml"
+      - "--port"
+      - "4000"
+      - "--num_workers"
+      - "1"
+    volumes:
+      - ./litellm-config.yaml:/app/config/litellm-config.yaml:ro
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@litellm-postgres:5432/${POSTGRES_DB:-litellm}}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in .env}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY must be set in .env}
+      STORE_MODEL_IN_DB: "True"
+      PLATFORM_UPSTREAM_OPENAI_KEY: ${PLATFORM_UPSTREAM_OPENAI_KEY:-sk-mock-upstream-root-key}
+      PLATFORM_UPSTREAM_OPENAI_BASE: ${PLATFORM_UPSTREAM_OPENAI_BASE:-https://api.openai.com/v1}
+    ports:
+      # STRICT PHYSICAL ISOLATION: Bind exclusively to 127.0.0.1.
+      # Public exposure (0.0.0.0 or raw port 4000) is strictly forbidden.
+      - "127.0.0.1:4000:4000"
+    networks:
+      - ragflow-model-platform-net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:4000/health/liveliness\")' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  ragflow-model-platform-net:
+    name: ragflow-model-platform-net
+    driver: bridge
+
+volumes:
+  litellm-db-data:
+    name: model-platform-litellm-db-data

@@ -1,0 +1,32 @@
+# LiteLLM Proxy Baseline Configuration for oh-my-ragflow Model Platform
+# Pinned version target: v1.110.0+ (Latest Stable)
+
+model_list:
+  # Platform-managed Chat Model
+  # Note: Per-tenant rate limits and token budgets are enforced dynamically
+  # via LiteLLM Virtual Keys (/key/generate) rather than static model-level router limits.
+  - model_name: platform/chat
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
+      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
+
+  # Platform-managed Embedding Model
+  - model_name: platform/embedding
+    litellm_params:
+      model: text-embedding-3-small
+      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
+      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  disable_spend_logs: false
+
+litellm_settings:
+  # Credential masking & log desensitization: hide real upstream secrets in all logs and errors
+  redact_user_api_key_info: true
+  drop_params: true
+  set_verbose: false
+  json_logs: true
