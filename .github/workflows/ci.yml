@@ -36,26 +36,33 @@ jobs:
       - name: Identify upstream revision
         id: upstream
         run: echo "sha=$(git -C upstream/ragflow rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Cache Go build and modules
+      - name: Cache Go modules
         uses: actions/cache@v4
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py') }}
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-${{ hashFiles('upstream/ragflow/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-go-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
-            ${{ runner.os }}-${{ runner.arch }}-go-${{ steps.go.outputs.go-version }}-
-      - name: Cache native static libraries
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-
+      - name: Cache Go build
         uses: actions/cache@v4
         with:
-          path: ~/ragflow-native-libs
-          key: ${{ runner.os }}-${{ runner.arch }}-native-libs-${{ steps.upstream.outputs.sha }}
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml', 'ci/clean-tokenizer-archive.py') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - uses: astral-sh/setup-uv@v7
       - name: Create isolated upstream build tree
         run: |
           mkdir -p build/ragflow
           git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
+      - name: Cache native static libraries and archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/ragflow-native-libs
+            build/ragflow/deps
+          key: ${{ runner.os }}-${{ runner.arch }}-native-libs-${{ steps.upstream.outputs.sha }}
       - name: Install build dependencies
         run: |
           sudo apt-get update
