@@ -59,15 +59,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lld libpcre2-dev
-          if ! command -v ld.lld >/dev/null 2>&1; then
-            for bin in /usr/bin/ld.lld-[0-9]*; do
-              if [ -x "$bin" ]; then
-                sudo ln -sf "$bin" /usr/bin/ld.lld
-                break
-              fi
-            done
-          fi
+          sudo apt-get install -y --no-install-recommends lld-20 libpcre2-dev
+          sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
       - name: Download native libraries and runtime resources
         working-directory: build/ragflow
         run: uv run tools/scripts/download_dev_deps.py
@@ -120,6 +113,9 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Build frontend
         working-directory: build/ragflow/web
+        env:
+          VITE_MINIFY: esbuild
+          VITE_BUILD_SOURCEMAP: 'false'
         run: npm run build
       - name: Run frontend tests
         run: node ci/run-upstream-web-tests.cjs
