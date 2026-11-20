@@ -408,8 +408,6 @@ func extractBatchTargets(c *gin.Context, rawMap map[string]interface{}) ([]strin
 	return targets, true
 }
 
-
-
 // extractParamOrQuery retrieves the first non-empty value matching parameter or query keys.
 func extractParamOrQuery(c *gin.Context, paramKeys []string, queryKeys []string) string {
 	for _, k := range paramKeys {

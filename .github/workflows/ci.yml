@@ -31,6 +31,19 @@ jobs:
         with:
           go-version-file: upstream/ragflow/go.mod
           cache: false
+      - name: Check extension Go formatting
+        run: |
+          files=()
+          while IFS= read -r -d '' file; do
+            files+=("$file")
+          done < <(git ls-files -z -- 'extensions/**/*.go')
+          if (( ${#files[@]} )); then
+            unformatted=$(gofmt -l "${files[@]}")
+            if [[ -n "$unformatted" ]]; then
+              printf 'Go files requiring gofmt:\n%s\n' "$unformatted"
+              exit 1
+            fi
+          fi
       # Go's build cache does not track changes to external C libraries. Scope
       # it to the upstream revision and extension/build configuration.
       - name: Identify upstream revision
@@ -140,6 +153,23 @@ jobs:
       - name: Install frontend dependencies
         working-directory: build/ragflow/web
         run: npm ci --no-audit --no-fund
+      - name: Lint and check formatting of frontend overlay
+        working-directory: build/ragflow/web
+        run: |
+          prefix=extensions/model-platform/overlay/web/
+          files=()
+          while IFS= read -r -d '' file; do
+            target=${file#"$prefix"}
+            if [[ ! -f "$target" ]]; then
+              echo "Missing assembled overlay file: $target" >&2
+              exit 1
+            fi
+            files+=("$target")
+          done < <(git -C "$GITHUB_WORKSPACE" ls-files -z -- "${prefix}*.ts" "${prefix}*.tsx" "${prefix}*.js" "${prefix}*.jsx")
+          if (( ${#files[@]} )); then
+            ./node_modules/.bin/oxlint --max-warnings 0 "${files[@]}"
+            ./node_modules/.bin/oxfmt --check "${files[@]}"
+          fi
       - name: Build frontend
         working-directory: build/ragflow/web
         env:
