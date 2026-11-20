@@ -32,7 +32,11 @@ function injectPrivateRoutes(routes: RouteObject[]): void {
             // navigation-layout has children with /admin/services
             if (subChild.children?.some((c) => c.path === '/admin/services')) {
               for (const pr of privateRoutes) {
-                if (pr.path && pr.Component && !subChild.children.some((c) => c.path === pr.path)) {
+                if (
+                  pr.path &&
+                  pr.Component &&
+                  !subChild.children.some((c) => c.path === pr.path)
+                ) {
                   subChild.children.push({
                     path: pr.path,
                     Component: withLazyRoute(pr.Component),
