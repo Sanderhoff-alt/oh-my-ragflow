@@ -2,7 +2,7 @@
 
 ## Constitution
 
-- **First principles:** Start from the essence of the problem.
+- **First principles:** Understand the essence of a problem and reason from fundamental truths.
 - **Occam's razor:** Do not multiply entities beyond necessity.
 
 ## Documentation
