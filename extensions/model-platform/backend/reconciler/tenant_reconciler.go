@@ -67,10 +67,30 @@ func NewTenantReconciler(client GatewayKeyClient, baseURL string, allowedModels 
 	}
 }
 
+// ReconcileOption configures options for Reconcile.
+type ReconcileOption func(*reconcileOptions)
+
+type reconcileOptions struct {
+	enforceDeadline bool
+}
+
+// WithEnforceDeadline requires that a degraded record's next_retry_at is due (<= now)
+// when claiming for reconciliation, rejecting future deadlines atomically.
+func WithEnforceDeadline() ReconcileOption {
+	return func(o *reconcileOptions) {
+		o.enforceDeadline = true
+	}
+}
+
 // Reconcile provisions or updates a tenant's model platform access idempotently.
 // If virtual key generation succeeds but database persistence fails, it executes
 // a compensating rollback to revoke the key and prevent orphaned credentials.
-func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID string) error {
+func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID string, opts ...ReconcileOption) error {
+	var optCfg reconcileOptions
+	for _, opt := range opts {
+		opt(&optCfg)
+	}
+
 	if db == nil {
 		return dao.ErrNilTransaction
 	}
@@ -106,12 +126,28 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 	}
 
 	// 2. Terminal, in-flight, or already converged state guard
-	if rec.Status == entity.StatusDeleted || rec.Status == entity.StatusProvisioning || rec.Status == entity.StatusReady {
+	if rec.Status == entity.StatusDeleted || rec.Status == entity.StatusProvisioning || rec.Status == entity.StatusReady || rec.Status == entity.StatusFailed {
+		return nil
+	}
+
+	// 2.1 Enforce retry deadline if requested by caller (Tier-2 poller)
+	if optCfg.enforceDeadline && rec.Status == entity.StatusDegraded && rec.NextRetryAt != nil && rec.NextRetryAt.After(time.Now()) {
+		return nil
+	}
+
+	// 2.2 Enforce maximum retry threshold
+	if rec.MaxRetries > 0 && rec.RetryCount >= rec.MaxRetries {
+		_, _ = r.reconcileDAO.MarkFailed(ctx, silentDB, tenantID, rec.Version, "maximum self-healing retries exceeded")
 		return nil
 	}
 
 	// 3. Claim for provisioning using optimistic lock
-	claimedRec, err := r.reconcileDAO.ClaimForProvisioning(ctx, silentDB, tenantID, rec.Version)
+	var claimedRec *entity.TenantReconcileRecord
+	if optCfg.enforceDeadline {
+		claimedRec, err = r.reconcileDAO.ClaimDueForProvisioning(ctx, silentDB, tenantID, rec.Version, time.Now())
+	} else {
+		claimedRec, err = r.reconcileDAO.ClaimForProvisioning(ctx, silentDB, tenantID, rec.Version)
+	}
 	if err != nil {
 		if errors.Is(err, entity.ErrOptimisticLockConflict) || errors.Is(err, entity.ErrInvalidStateTransition) {
 			// Another concurrent worker claimed or transitioned this record
@@ -136,7 +172,17 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		nextRetry := time.Now().Add(r.calculateBackoff(rec.RetryCount))
-		_, _ = r.reconcileDAO.MarkDegraded(recoveryCtx, silentDB, tenantID, rec.Version, err.Error(), nextRetry)
+		var markErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			_, markErr = r.reconcileDAO.MarkDegraded(recoveryCtx, silentDB, tenantID, rec.Version, err.Error(), nextRetry)
+			if markErr == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if markErr != nil {
+			return fmt.Errorf("failed to generate virtual key from gateway: %w (recovery mark degraded error: %v)", err, markErr)
+		}
 		return fmt.Errorf("failed to generate virtual key from gateway: %w", err)
 	}
 
@@ -266,6 +312,14 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 
 		// Immediately revoke the issued virtual key to prevent orphaned credentials
 		_, delErr := r.gatewayClient.DeleteKey(rollbackCtx, []string{virtualKey})
+
+		if errors.Is(persistErr, entity.ErrOptimisticLockConflict) {
+			if delErr != nil {
+				return fmt.Errorf("compensating rollback incomplete: %w", delErr)
+			}
+			// A concurrent worker successfully reconciled this tenant; return nil cleanly
+			return nil
+		}
 
 		// Mark degraded and schedule retry using bounded rollbackCtx
 		errMsg := persistErr.Error()

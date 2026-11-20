@@ -75,6 +75,42 @@ func (d *ReconcileDAO) ClaimForProvisioning(ctx context.Context, db *gorm.DB, te
 	return d.GetByTenantID(ctx, db, tenantID)
 }
 
+// ClaimDueForProvisioning transitions a record from 'pending' or 'degraded' to 'provisioning'
+// using optimistic locking, but atomically requires next_retry_at to be NULL or <= now.
+// If another worker pushed next_retry_at into the future, the claim fails with ErrOptimisticLockConflict.
+func (d *ReconcileDAO) ClaimDueForProvisioning(ctx context.Context, db *gorm.DB, tenantID string, currentVersion int64, now time.Time) (*entity.TenantReconcileRecord, error) {
+	current, err := d.GetByTenantID(ctx, db, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	if current.Version != currentVersion {
+		return nil, entity.ErrOptimisticLockConflict
+	}
+
+	if err := entity.ValidateTransition(current.Status, entity.StatusProvisioning); err != nil {
+		return nil, err
+	}
+
+	res := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
+		Where("tenant_id = ? AND version = ? AND status != ? AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+			tenantID, currentVersion, entity.StatusProvisioning, now).
+		Updates(map[string]interface{}{
+			"status":     entity.StatusProvisioning,
+			"version":    currentVersion + 1,
+			"updated_at": time.Now(),
+		})
+
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, entity.ErrOptimisticLockConflict
+	}
+
+	return d.GetByTenantID(ctx, db, tenantID)
+}
+
 // MarkReady transitions a record to 'ready', storing the generated gateway virtual key alias
 // and key hash, and resetting the retry counter.
 func (d *ReconcileDAO) MarkReady(ctx context.Context, db *gorm.DB, tenantID string, currentVersion int64, gatewayKeyAlias, keyHash string) (*entity.TenantReconcileRecord, error) {
@@ -211,7 +247,8 @@ func (d *ReconcileDAO) MarkDeleted(ctx context.Context, db *gorm.DB, tenantID st
 	return d.GetByTenantID(ctx, db, tenantID)
 }
 
-// FindDueRetries queries records in 'pending' or 'degraded' status that are due for processing.
+// FindDueRetries queries records in 'pending' or 'degraded' status that are due for processing,
+// as well as stale 'provisioning' records whose lease has expired (> 2 minutes).
 func (d *ReconcileDAO) FindDueRetries(ctx context.Context, db *gorm.DB, now time.Time, limit int) ([]*entity.TenantReconcileRecord, error) {
 	if db == nil {
 		return nil, ErrNilTransaction
@@ -220,10 +257,12 @@ func (d *ReconcileDAO) FindDueRetries(ctx context.Context, db *gorm.DB, now time
 		limit = 50
 	}
 
+	staleCutoff := now.Add(-2 * time.Minute)
+
 	var records []*entity.TenantReconcileRecord
 	err := db.WithContext(ctx).
-		Where("status IN (?, ?) AND (next_retry_at IS NULL OR next_retry_at <= ?)",
-			entity.StatusPending, entity.StatusDegraded, now).
+		Where("(status IN (?, ?) AND (next_retry_at IS NULL OR next_retry_at <= ?)) OR (status = ? AND updated_at <= ?)",
+			entity.StatusPending, entity.StatusDegraded, now, entity.StatusProvisioning, staleCutoff).
 		Order("created_at ASC").
 		Limit(limit).
 		Find(&records).Error
