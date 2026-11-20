@@ -296,7 +296,7 @@ if err = db.Transaction(func(tx *gorm.DB) error {
 ```mermaid
 flowchart TD
     CommitSuccess["租户事务 Commit 成功"] --> FastQueue["一级快速重试队列: Event Bus"]
-    
+
     subgraph Tier1 ["一级: 快速抖动恢复 (Fast Queue)"]
         FastQueue --> Worker["并发 Worker 处理"]
         Worker --> CheckCommit{"已提交检查 & 幂等开通"}
@@ -409,21 +409,21 @@ provider.ModelDriver, err = modelFactory.CreateModelDriver(provider.Name, provid
   Reconciler 在初始化租户默认值时，必须执行严格的原子条件 SQL：
   ```sql
   -- 初始化默认对话模型 (仅当当前为空时更新)
-  UPDATE user_tenant 
-  SET llm_id = ?, 
-      tenant_llm_id = ?, 
-      updated_at = NOW() 
-  WHERE user_id = ? 
-    AND tenant_id = ? 
+  UPDATE user_tenant
+  SET llm_id = ?,
+      tenant_llm_id = ?,
+      updated_at = NOW()
+  WHERE user_id = ?
+    AND tenant_id = ?
     AND (llm_id IS NULL OR llm_id = '');
 
   -- 初始化默认向量模型 (仅当当前为空时更新)
-  UPDATE user_tenant 
-  SET embd_id = ?, 
-      tenant_embd_id = ?, 
-      updated_at = NOW() 
-  WHERE user_id = ? 
-    AND tenant_id = ? 
+  UPDATE user_tenant
+  SET embd_id = ?,
+      tenant_embd_id = ?,
+      updated_at = NOW()
+  WHERE user_id = ?
+    AND tenant_id = ?
     AND (embd_id IS NULL OR embd_id = '');
   ```
 - **并发安全保证**：
@@ -470,7 +470,7 @@ stateDiagram-v2
     [*] --> Active: 管理员上架模型
     Active --> DeprecatedReadOnly: 管理员下架模型 (但存量 KB 引用 > 0)
     Active --> Tombstoned: 管理员下架模型 (且存量 KB 引用 == 0)
-    
+
     state DeprecatedReadOnly {
         [*] --> PreservedInGateway: 保持 LiteLLM 虚拟 Key 白名单有效
         PreservedInGateway --> ActiveInDB: tenant_model.status 保持 active
@@ -483,7 +483,7 @@ stateDiagram-v2
         [*] --> EvictFromGateway: LiteLLM POST /key/update 剔除白名单
         EvictFromGateway --> DisableInDB: tenant_model.status = disabled
     }
-    
+
     Tombstoned --> [*]
 ```
 
@@ -566,7 +566,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"定时拉取窗口日志: 支持回溯 48h"| Collector["对账采集器 Collector"]
-    
+
     subgraph Tier1_Staging ["第一层: 原始日志暂存去重"]
         Collector -->|"INSERT IGNORE INTO spend_id"| SpendLogTable[("platform_gateway_spend_log<br>唯一键: spend_id")]
     end
@@ -647,15 +647,15 @@ INSERT INTO platform_tenant_usage_daily (
     total_spend, prompt_spend, completion_spend, cache_savings,
     created_at, updated_at
 )
-SELECT 
+SELECT
     tenant_id, model_name, DATE_FORMAT(request_time, '%Y-%m-%d'),
-    COUNT(*), 
-    SUM(prompt_tokens), 
-    SUM(completion_tokens), 
+    COUNT(*),
+    SUM(prompt_tokens),
+    SUM(completion_tokens),
     SUM(total_tokens),
     SUM(cached_tokens),
     SUM(cache_write_tokens),
-    SUM(reasoning_tokens), 
+    SUM(reasoning_tokens),
     SUM(spend),
     SUM(prompt_spend),
     SUM(completion_spend),
@@ -994,8 +994,8 @@ flowchart TD
 - **核心技术要点**：
   1. **原子条件 SQL**：
      ```sql
-     UPDATE user_tenant 
-     SET llm_id = ?, tenant_llm_id = ?, updated_at = NOW() 
+     UPDATE user_tenant
+     SET llm_id = ?, tenant_llm_id = ?, updated_at = NOW()
      WHERE user_id = ? AND tenant_id = ? AND (llm_id IS NULL OR llm_id = '');
      ```
   2. 废除应用层内存读写，若用户并发设置了自定义模型，SQL 更新 0 行，用户的选择得到 100% 保护。

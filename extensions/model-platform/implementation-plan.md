@@ -249,7 +249,7 @@ To avoid long-lived database locks and transaction rollbacks during network call
 ```mermaid
 flowchart TD
     CommitEvent[Tenant Created Event] --> Tier1Queue[Tier 1: Fast In-Memory Queue]
-    
+
     subgraph Tier1 [Tier 1: Transient Jitter Recovery]
         Tier1Queue --> Worker[Worker Process]
         Worker --> TryReconcile{Reconcile Gateway & DB}
@@ -351,7 +351,7 @@ stateDiagram-v2
     [*] --> Active: Admin publishes model
     Active --> DeprecatedReadOnly: Admin disables model (Active KB references > 0)
     Active --> Tombstoned: Admin disables model (Active KB references == 0)
-    
+
     state DeprecatedReadOnly {
         [*] --> PreservedInGateway: Retain LiteLLM virtual key whitelist
         PreservedInGateway --> ActiveInDB: tenant_model.status stays "active"
@@ -364,7 +364,7 @@ stateDiagram-v2
         [*] --> EvictFromGateway: LiteLLM POST /key/update evicts from whitelist
         EvictFromGateway --> DisableInDB: tenant_model.status = "disabled"
     }
-    
+
     Tombstoned --> [*]
 ```
 
@@ -459,7 +459,7 @@ Overwriting instead of accumulating ensures mathematical idempotence across mult
 ```mermaid
 flowchart TD
     LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"Periodic Window Pull (48h Lookback)"| Collector["Spend Log Collector"]
-    
+
     subgraph Tier1_Staging ["Tier 1: Raw Staging & Deduplication"]
         Collector -->|"INSERT IGNORE INTO spend_id"| SpendLogTable[("platform_gateway_spend_log<br>Primary Key: spend_id")]
     end
