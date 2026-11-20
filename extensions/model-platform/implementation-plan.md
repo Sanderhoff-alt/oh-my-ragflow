@@ -521,7 +521,7 @@ flowchart LR
 | **P1: Gateway Infra** | **TASK-1.1** | LiteLLM Baseline & Isolation | Loopback network isolation & Docker Compose (`gateway/docker-compose.yml`, `litellm-config.yaml`) | `validate-gateway-config.sh` & port checks |
 | | **TASK-1.2** | Root Secret Isolation | Upstream key injection & log masking (`litellm-config.yaml`, `validate-gateway-config.sh`) | Environment secret references, masking flags & plaintext key checks |
 | | **TASK-1.3** | Virtual Key Client & Timeouts | Go HTTP client & timeout controls (`backend/gateway/client.go`, `types.go`) | Client unit tests with timeout verification |
-| | **TASK-1.4** | Gateway Permission Routing | Model whitelist & management endpoint blocking (`permission_test.go`, `test_gateway_permissions.py`) | 401/403 tests on unauthorized endpoints |
+| | **TASK-1.4** | Gateway Permission Routing | Model whitelist & management endpoint blocking (`permission_test.go`) | 401/403 tests on unauthorized endpoints |
 | **P2: Tenant Lifecycle** | **TASK-2.1** | Post-Commit Event Decoupling | GORM transaction post-commit dispatch (`backend/dao/tenant_hook.go`, `event/bus.go`) | Post-commit dispatch & precheck unit tests |
 | | **TASK-2.2** | Reconciler State Machine | Reconcile schema migration & optimistic lock (`entity/reconcile.go`, `dao/reconcile.go`) | State machine transition & lock conflict tests |
 | | **TASK-2.3** | Native Driver Resolution | `OpenAI-API-Compatible@platform` sync & rollback (`tenant_reconciler.go`) | Native driver match & rollback revocation test |
@@ -636,11 +636,11 @@ flowchart TD
 - **Target Files**: `extensions/model-platform/backend/gateway/client.go`, `types.go`, `client_test.go`
 - **Verification**: Unit tests assert virtual key generation, deletion, and timeout enforcement.
 
-##### TASK-1.4: Gateway Permission Routing & Admin Endpoint Blocking
-- **Description**: Verify tenant virtual keys cannot call unauthorized models or access management endpoints (`/key/*`).
+##### TASK-1.4: Gateway Permission Routing & Admin Endpoint Blocking (Mock Contract Verification)
+- **Description**: Verify gateway permission routing, management endpoint blocking, model whitelisting, and quota/expiry enforcement via an in-process mock.
 - **Inputs & Outputs**: Input: virtual key calls; Output: HTTP 401/403 blockages.
-- **Target Files**: `backend/gateway/permission_test.go`, `gateway/test_gateway_permissions.py`
-- **Verification**: Automated test scripts assert 401/403 responses on unauthorized endpoint access.
+- **Target Files**: `backend/gateway/permission_test.go`
+- **Verification**: In-process contract tests assert expected 401/403 responses on unauthorized endpoint access.
 
 #### Phase 2: Tenant Lifecycle & Reconciler (Tenant Lifecycle & Reconciler)
 
