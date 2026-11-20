@@ -24,7 +24,7 @@ git submodule update --init
 - Do not modify the upstream kernel. Prefer existing extension points, overlays, public APIs, and independent services.
 - Before implementing a major feature, evaluate whether a widely adopted and actively maintained open-source project can serve as a core building block. Consider functional fit, licensing, maintenance cost, and architectural compatibility; validate compatibility against pinned versions. Implement it in-house when no suitable option exists.
 - Keep extensions focused; handle unrelated upstream issues separately.
-- Evaluate review feedback against the code, the change's objective, and its intended scope. Fix valid issues introduced by the change; avoid adding unrelated features or expanding a PR merely to address every suggestion, and document valid out-of-scope issues for separate follow-up.
+- Evaluate review feedback against the code, the change's objective, and its intended scope. Contributors are encouraged to respectfully challenge feedback with evidence rather than accept it uncritically. Fix valid issues introduced by the change; avoid adding unrelated features or expanding a PR merely to address every suggestion, and document valid out-of-scope issues for separate follow-up.
 - Keep documentation in English and Simplified Chinese, with extension-specific details under the corresponding extension.
 
 See [RAGFlow extension points](docs/extension-points.md) for the shared integration rules and upstream seams.
