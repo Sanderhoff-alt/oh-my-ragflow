@@ -43,12 +43,7 @@ flowchart LR
 
 The goal is complete coverage on free standard GitHub-hosted runners. Test jobs may be split to fit their resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing. The CI workflow builds and tests the enterprise distribution assembled by `apply-overlay.sh` with `RAGFLOW_GO_TAGS=ee`. It currently targets the enterprise Go build and unit tier (including extension unit tests) plus the web build and tests; integration, API, SDK and model-backed tests remain to be added.
 
-The upstream web test baseline excludes the known failing files listed in
-[`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json).
-CI reports each exclusion and requires all other discovered tests to pass. The
-list is pinned to the upstream commit and must be reviewed when it changes.
-These exclusions do not apply to extension tests; a passing baseline does not
-mean the excluded upstream tests passed.
+The upstream web test baseline excludes the known failing files listed in [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json). CI reports each exclusion and requires all other discovered tests to pass. The list is pinned to the upstream commit and must be reviewed when it changes. These exclusions do not apply to extension tests; a passing baseline does not mean the excluded upstream tests passed.
 
 ## Layout
 
