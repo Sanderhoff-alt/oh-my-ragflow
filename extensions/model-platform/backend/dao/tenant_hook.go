@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ragflow/extensions/model-platform/backend/entity"
@@ -54,9 +55,11 @@ func OnTenantCreateHook(ctx context.Context, tx *gorm.DB, tenantID string) error
 	}
 
 	// 2. Dispatch event to EventBus strictly after transaction commits
+	var committed atomic.Bool
 	var dispatchOnce sync.Once
 	dispatch := func() {
 		dispatchOnce.Do(func() {
+			committed.Store(true)
 			event.GetDefaultBus().Publish(event.NewTenantCreatedEvent(tenantID))
 		})
 	}
@@ -81,6 +84,11 @@ func OnTenantCreateHook(ctx context.Context, tx *gorm.DB, tenantID string) error
 		Clauses:  map[string]clause.Clause{},
 	}
 	go func() {
+		// Allow synchronous post-commit hook on flat transactions to dispatch first
+		time.Sleep(10 * time.Millisecond)
+		if committed.Load() {
+			return
+		}
 		if err := event.PreFlightCheck(context.Background(), rootDB, tenantID, 3*time.Second); err == nil {
 			dispatch()
 		}

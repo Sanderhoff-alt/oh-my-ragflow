@@ -184,3 +184,25 @@ func TestPreFlightCheck_Validations(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestPreFlightCheck_FailsFastOnInactiveTenant(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	db.Exec("CREATE TABLE tenant (id VARCHAR(32) PRIMARY KEY, status VARCHAR(1));")
+	db.Exec("CREATE TABLE user_tenant (id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32));")
+
+	db.Exec("INSERT INTO tenant (id, status) VALUES ('tenant-inactive', '0');")
+	db.Exec("INSERT INTO user_tenant (id, tenant_id) VALUES ('ut-inactive', 'tenant-inactive');")
+
+	start := time.Now()
+	err = PreFlightCheck(context.Background(), db, "tenant-inactive", 2*time.Second)
+	if err != ErrTenantInactive {
+		t.Fatalf("expected ErrTenantInactive, got: %v", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Errorf("expected fast failure on inactive tenant, took %v", time.Since(start))
+	}
+}

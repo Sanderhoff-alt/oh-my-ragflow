@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 
+	mpreconciler "ragflow/extensions/model-platform/backend/reconciler"
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	"ragflow/internal/permission"
@@ -34,9 +35,12 @@ func tenantMemberPermissionEE(ctx context.Context, db *gorm.DB, tenantID string,
 	return nil, 0, false, nil
 }
 
-// recordTenantPermissionChangeEE records nothing: the community edition has no
-// permission audit trail.
+// recordTenantPermissionChangeEE handles permission audit events and tenant member lifecycle hooks.
 func recordTenantPermissionChangeEE(ctx context.Context, tx *gorm.DB, tenantID, eventType, targetType, targetID, resourceType, resourceID, actionType string, beforePermission, afterPermission int32, beforeData, afterData interface{}) error {
+	if eventType == "tenant.member.joined" && targetType == "user" && targetID != "" && tenantID != "" {
+		_, err := mpreconciler.NewDefaultsManager().InitializeMemberFromOwner(ctx, tx, tenantID, targetID)
+		return err
+	}
 	return nil
 }
 
