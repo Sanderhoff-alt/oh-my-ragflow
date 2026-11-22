@@ -18,6 +18,7 @@ func tenantDAOTestExtraModels() []interface{} {
 	return []interface{}{
 		&mpentity.TenantReconcileRecord{},
 		&mpentity.UserDefaultPreference{},
+		&mpentity.GatewaySpendLog{},
 	}
 }
 
@@ -33,7 +34,10 @@ func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error {
 	if err := mpmigration.MigrateReconcileSchema(ctx, db); err != nil {
 		return err
 	}
-	return mpmigration.MigratePreferenceSchema(ctx, db)
+	if err := mpmigration.MigratePreferenceSchema(ctx, db); err != nil {
+		return err
+	}
+	return mpmigration.MigrateSpendLogSchema(ctx, db)
 }
 
 // migratePermissionDataEE is a no-op in the community edition.

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +20,7 @@ type Client interface {
 	UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*UpdateKeyResponse, error)
 	DeleteKey(ctx context.Context, keys []string) (*DeleteKeyResponse, error)
 	GetKeyInfo(ctx context.Context, key string) (*KeyInfoResponse, error)
+	GetSpendLogs(ctx context.Context, params SpendLogQueryParams) ([]SpendLogEntry, error)
 	HealthCheck(ctx context.Context) error
 }
 
@@ -141,6 +143,68 @@ func (c *litellmClient) GetKeyInfo(ctx context.Context, key string) (*KeyInfoRes
 	}
 
 	return &resp, nil
+}
+
+// GetSpendLogs retrieves raw invocation spend logs from the LiteLLM proxy within a given date range or filter.
+// Queries the paginated individual-record endpoint /spend/logs/v2 available in LiteLLM v1.110.0+.
+func (c *litellmClient) GetSpendLogs(ctx context.Context, params SpendLogQueryParams) ([]SpendLogEntry, error) {
+	endpoint := "/spend/logs/v2"
+	queryVals := url.Values{}
+	if params.StartDate != "" {
+		queryVals.Set("start_date", params.StartDate)
+	}
+	if params.EndDate != "" {
+		queryVals.Set("end_date", params.EndDate)
+	}
+	if params.APIKey != "" {
+		queryVals.Set("api_key", params.APIKey)
+	}
+	if params.UserID != "" {
+		queryVals.Set("user_id", params.UserID)
+	}
+	if params.Page > 0 {
+		queryVals.Set("page", strconv.Itoa(params.Page))
+	}
+	if params.PageSize > 0 {
+		queryVals.Set("page_size", strconv.Itoa(params.PageSize))
+	}
+	if len(queryVals) > 0 {
+		endpoint += "?" + queryVals.Encode()
+	}
+
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, endpoint, nil, &raw); err != nil {
+		return nil, fmt.Errorf("failed to get spend logs: %w", err)
+	}
+
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return []SpendLogEntry{}, nil
+	}
+
+	if trimmed[0] == '[' {
+		var list []SpendLogEntry
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal spend logs array: %w", err)
+		}
+		return list, nil
+	}
+
+	// Support wrapper object {"data": [...]} or {"spend_logs": [...]}
+	var wrapper struct {
+		Data      []SpendLogEntry `json:"data"`
+		SpendLogs []SpendLogEntry `json:"spend_logs"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal spend logs wrapper: %w", err)
+	}
+	if len(wrapper.Data) > 0 {
+		return wrapper.Data, nil
+	}
+	if len(wrapper.SpendLogs) > 0 {
+		return wrapper.SpendLogs, nil
+	}
+	return []SpendLogEntry{}, nil
 }
 
 // HealthCheck verifies connectivity and liveliness of the LiteLLM Proxy.
