@@ -6,7 +6,7 @@ An independent extension project for RAGFlow. It adds capabilities around RAGFlo
 
 ## Status
 
-The project is in the design stage. See each extension's README for its scope and implementation status.
+The project is under active development and may undergo aggressive, breaking refactoring; backward compatibility with earlier versions is not a goal at this stage. See each extension's README for its scope and implementation status.
 
 ## Baseline
 
