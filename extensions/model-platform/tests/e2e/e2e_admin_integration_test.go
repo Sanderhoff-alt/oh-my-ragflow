@@ -142,6 +142,17 @@ func TestE2E_Admin_FullBillingAndAuditClosedLoop(t *testing.T) {
 	if instance.APIKey == "" {
 		t.Fatal("expected non-empty virtual key for managed instance")
 	}
+	if instance.Extra == "" {
+		t.Fatal("expected non-empty Extra in provisioned instance")
+	}
+	var extraData map[string]interface{}
+	if err := json.Unmarshal([]byte(instance.Extra), &extraData); err != nil {
+		t.Fatalf("failed to unmarshal instance Extra: %v", err)
+	}
+	provisionedBaseURL, _ := extraData["base_url"].(string)
+	if provisionedBaseURL == "" {
+		t.Fatal("expected non-empty base_url in provisioned instance Extra")
+	}
 
 	// 3. Execute inference with native driver against gateway using virtual key
 	urlSuffix := models.URLSuffix{
@@ -152,7 +163,7 @@ func TestE2E_Admin_FullBillingAndAuditClosedLoop(t *testing.T) {
 
 	apiConfig := &models.APIConfig{
 		ApiKey:  &instance.APIKey,
-		BaseURL: &server.URL,
+		BaseURL: &provisionedBaseURL,
 	}
 
 	var chatUsage common.ModelUsage
@@ -167,12 +178,30 @@ func TestE2E_Admin_FullBillingAndAuditClosedLoop(t *testing.T) {
 		t.Fatal("expected non-nil chat response")
 	}
 
-	// Verify gateway recorded the spend log entry
+	// Verify gateway recorded the spend log entry and received valid bearer auth
 	state.mu.Lock()
 	recordedLogs := len(state.spendLogs)
+	lastAuth := state.lastChatAuth
+	isKeyIssued := state.virtualKeys[instance.APIKey]
+	var fixtureDate string
+	if recordedLogs > 0 {
+		startTimeStr := state.spendLogs[0].StartTime
+		if tParsed, err := time.Parse(time.RFC3339, startTimeStr); err == nil {
+			fixtureDate = tParsed.UTC().Format("2006-01-02")
+		} else if len(startTimeStr) >= 10 {
+			fixtureDate = startTimeStr[:10]
+		}
+	}
 	state.mu.Unlock()
 	if recordedLogs == 0 {
 		t.Fatal("expected mock gateway to record spend log entry")
+	}
+	if !isKeyIssued {
+		t.Fatalf("expected instance.APIKey %q to have been issued in gateway state", instance.APIKey)
+	}
+	expectedAuth := "Bearer " + instance.APIKey
+	if lastAuth != expectedAuth {
+		t.Fatalf("expected Authorization header %q, got %q", expectedAuth, lastAuth)
 	}
 
 	// 4. Ingest and aggregate spend logs via MeteringDaemon
@@ -228,9 +257,16 @@ func TestE2E_Admin_FullBillingAndAuditClosedLoop(t *testing.T) {
 		if payload.Data.Total != 1 || len(payload.Data.Items) != 1 {
 			t.Fatalf("expected 1 daily usage item, got total=%d items=%d", payload.Data.Total, len(payload.Data.Items))
 		}
+		expectedDate := fixtureDate
+		if expectedDate == "" {
+			expectedDate = time.Now().UTC().Format("2006-01-02")
+		}
 		item := payload.Data.Items[0]
 		if item.TenantID != tenantID || item.ModelName != "gpt-4o-mini" {
 			t.Errorf("unexpected daily usage item: %+v", item)
+		}
+		if item.UsageDate != expectedDate {
+			t.Errorf("expected daily usage date %s, got %s", expectedDate, item.UsageDate)
 		}
 		if item.TotalTokens != 23 {
 			t.Errorf("expected 23 total tokens in daily usage, got %d", item.TotalTokens)
@@ -310,20 +346,26 @@ func TestE2E_Admin_AuditViolationDetection(t *testing.T) {
 		TenantID:     tenantID,
 		ProviderName: "OpenAI-API-Compatible",
 	}
-	db.Create(&prov)
+	if err := db.Create(&prov).Error; err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
 	inst := rentity.TenantModelInstance{
 		ID:           "inst-viol-1",
 		ProviderID:   prov.ID,
 		InstanceName: "platform",
 	}
-	db.Create(&inst)
-	db.Create(&rentity.TenantModel{
+	if err := db.Create(&inst).Error; err != nil {
+		t.Fatalf("create instance: %v", err)
+	}
+	if err := db.Create(&rentity.TenantModel{
 		ID:         "tm-viol-1",
 		ProviderID: prov.ID,
 		InstanceID: inst.ID,
 		ModelName:  "gpt-4o-mini",
 		Status:     "active",
-	})
+	}).Error; err != nil {
+		t.Fatalf("create managed model: %v", err)
+	}
 
 	// 2. Inject an unauthorized model directly into platform_gateway_spend_log
 	now := time.Now().UTC()
@@ -391,9 +433,9 @@ func TestE2E_Admin_LiveGatewayCluster(t *testing.T) {
 	requireLiveGateway := os.Getenv("REQUIRE_LIVE_GATEWAY") == "true"
 
 	// Check if live LiteLLM container is active
-	client := &http.Client{Timeout: 1 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(liveGatewayURL + "/health/liveliness")
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
 		if requireLiveGateway {
 			t.Fatalf("FATAL: REQUIRE_LIVE_GATEWAY is true, but live gateway container is unreachable on %s: %v", liveGatewayURL, err)
 		}
@@ -402,11 +444,33 @@ func TestE2E_Admin_LiveGatewayCluster(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		if requireLiveGateway {
+			t.Fatalf("FATAL: REQUIRE_LIVE_GATEWAY is true, but live gateway returned status %d", resp.StatusCode)
+		}
+		t.Skipf("Live LiteLLM gateway on %s returned status %d; skipping live Admin test.", liveGatewayURL, resp.StatusCode)
+		return
+	}
+
 	db := setupE2ETestDB(t)
 	liveClient := gateway.NewClient(gateway.GatewayConfig{
 		BaseURL:   liveGatewayURL,
 		MasterKey: "sk-master-e2e-platform-test-key",
 	})
+
+	// Seed a known daily usage entry to verify SQLite-backed query paths
+	seedDate := time.Now().UTC().Format("2006-01-02")
+	liveTenantID := "tenant-live-cluster"
+	if err := db.Create(&mpentity.TenantUsageDaily{
+		TenantID:    liveTenantID,
+		UsageDate:   seedDate,
+		ModelName:   "gpt-4o-mini",
+		CallCount:   5,
+		TotalTokens: 100,
+		TotalSpend:  0.005,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed tenant usage daily: %v", err)
+	}
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -428,8 +492,8 @@ func TestE2E_Admin_LiveGatewayCluster(t *testing.T) {
 		t.Errorf("expected live gateway status to be 'healthy', got: %v", healthPayload["gateway"])
 	}
 
-	// 2. Assert Admin usage and summary endpoints respond correctly
-	reqDaily, _ := http.NewRequest(http.MethodGet, "/admin/model-platform/usage/daily", nil)
+	// 2. Assert Admin usage and summary endpoints respond correctly and return seeded data
+	reqDaily, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("/admin/model-platform/usage/daily?tenant_id=%s", liveTenantID), nil)
 	dailyResp := httptest.NewRecorder()
 	r.ServeHTTP(dailyResp, reqDaily)
 
@@ -437,11 +501,39 @@ func TestE2E_Admin_LiveGatewayCluster(t *testing.T) {
 		t.Fatalf("expected 200 OK for daily usage query, got %d", dailyResp.Code)
 	}
 
-	reqSummary, _ := http.NewRequest(http.MethodGet, "/admin/model-platform/usage/summary", nil)
+	var dailyPayload struct {
+		Code int `json:"code"`
+		Data struct {
+			Total int64                       `json:"total"`
+			Items []mpentity.TenantUsageDaily `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(dailyResp.Body.Bytes(), &dailyPayload); err != nil {
+		t.Fatalf("failed to decode daily usage payload: %v", err)
+	}
+	if dailyPayload.Data.Total != 1 || len(dailyPayload.Data.Items) != 1 {
+		t.Fatalf("expected 1 daily item, got total=%d items=%d", dailyPayload.Data.Total, len(dailyPayload.Data.Items))
+	}
+	if dailyPayload.Data.Items[0].TotalTokens != 100 {
+		t.Errorf("expected 100 total tokens, got %d", dailyPayload.Data.Items[0].TotalTokens)
+	}
+
+	reqSummary, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("/admin/model-platform/usage/summary?tenant_id=%s", liveTenantID), nil)
 	summaryResp := httptest.NewRecorder()
 	r.ServeHTTP(summaryResp, reqSummary)
 
 	if summaryResp.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for summary query, got %d", summaryResp.Code)
+	}
+
+	var summaryPayload struct {
+		Code int                     `json:"code"`
+		Data mpmetering.UsageSummary `json:"data"`
+	}
+	if err := json.Unmarshal(summaryResp.Body.Bytes(), &summaryPayload); err != nil {
+		t.Fatalf("failed to decode summary payload: %v", err)
+	}
+	if summaryPayload.Data.TotalTokens != 100 || summaryPayload.Data.TotalCalls != 5 {
+		t.Errorf("unexpected summary payload data: %+v", summaryPayload.Data)
 	}
 }

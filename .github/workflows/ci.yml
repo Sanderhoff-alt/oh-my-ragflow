@@ -126,9 +126,6 @@ jobs:
         env:
           RAGFLOW_GO_TAGS: ee
         run: ./build.sh --test
-      - name: Run model-platform extension unit tests
-        working-directory: build/ragflow
-        run: CGO_ENABLED=0 go test -v -count=1 -tags ee ./extensions/model-platform/...
       - name: Report scope
         if: always()
         run: |
@@ -191,9 +188,28 @@ jobs:
         with:
           submodules: true
       - uses: actions/setup-go@v6
+        id: go
         with:
           go-version-file: upstream/ragflow/go.mod
           cache: false
+      - name: Identify upstream revision
+        id: upstream
+        run: echo "sha=$(git -C upstream/ragflow rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-${{ hashFiles('upstream/ragflow/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - name: "Gate Check: Non-invasive compliance audit"
         run: bash extensions/model-platform/scripts/audit-non-invasive.sh
       - name: Start LiteLLM and PostgreSQL live test cluster
@@ -202,7 +218,7 @@ jobs:
         working-directory: build/ragflow
         env:
           REQUIRE_LIVE_GATEWAY: "true"
-        run: CGO_ENABLED=0 go test -v -count=1 ./extensions/model-platform/...
+        run: CGO_ENABLED=0 go test -v -count=1 -tags ee ./extensions/model-platform/...
       - name: Teardown live test cluster
         if: always()
         run: docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml down -v
