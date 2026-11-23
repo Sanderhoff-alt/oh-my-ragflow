@@ -29,6 +29,10 @@ git submodule update --init
 
 See [RAGFlow extension points](docs/extension-points.md) for the shared integration rules and upstream seams.
 
+## Contributing
+
+Please write issue and pull request titles and descriptions in English.
+
 ## CI principles
 
 The intended CI pipeline builds the enhanced RAGFlow distribution first, then runs the upstream RAGFlow tests, except Infinity-specific coverage, and our extension tests against it. The upstream baseline on its own is not a substitute for testing the enhanced build.
