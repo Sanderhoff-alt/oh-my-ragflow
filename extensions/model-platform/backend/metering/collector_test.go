@@ -647,3 +647,119 @@ func TestSpendLogCollector_Pagination(t *testing.T) {
 		t.Fatalf("expected 5 records in database, found %d", count)
 	}
 }
+
+func TestSpendLogCollector_GetLatestRequestTime(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := &mockSpendLogClient{}
+	collector := NewSpendLogCollector(db, mockClient)
+
+	// Case 1: Empty table returns nil
+	latest, err := collector.GetLatestRequestTime(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error on empty table: %v", err)
+	}
+	if latest != nil {
+		t.Fatalf("expected nil for empty table, got %v", latest)
+	}
+
+	// Case 2: Insert two records
+	t1 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 22, 15, 30, 0, 0, time.UTC)
+
+	db.Create(&entity.GatewaySpendLog{
+		SpendID:     "s1",
+		TenantID:    "t1",
+		RequestTime: t1,
+	})
+	db.Create(&entity.GatewaySpendLog{
+		SpendID:     "s2",
+		TenantID:    "t1",
+		RequestTime: t2,
+	})
+
+	latest, err = collector.GetLatestRequestTime(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error querying latest time: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected non-nil latest time")
+	}
+	if !latest.Equal(t2) {
+		t.Fatalf("expected latest time %v, got %v", t2, *latest)
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := &mockSpendLogClient{}
+	collector := NewSpendLogCollector(db, mockClient)
+
+	// 1. Cold start: empty table -> pulls from ~48h ago
+	beforeCold := time.Now().UTC().Add(-49 * time.Hour)
+	afterCold := time.Now().UTC().Add(-47 * time.Hour)
+	_, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error during cold-start collection: %v", err)
+	}
+
+	parsedStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
+	if err != nil {
+		t.Fatalf("failed to parse start date: %v", err)
+	}
+	if parsedStart.Before(beforeCold) || parsedStart.After(afterCold) {
+		t.Fatalf("expected cold start around 48h ago, got %v", parsedStart)
+	}
+
+	// 1b. Cold start with small maxLookback (e.g. 6 hours) -> capped by maxLookback
+	beforeSmall := time.Now().UTC().Add(-7 * time.Hour)
+	afterSmall := time.Now().UTC().Add(-5 * time.Hour)
+	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 6*time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error during small lookback cold-start: %v", err)
+	}
+	parsedSmallStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
+	if err != nil {
+		t.Fatalf("failed to parse small lookback start date: %v", err)
+	}
+	if parsedSmallStart.Before(beforeSmall) || parsedSmallStart.After(afterSmall) {
+		t.Fatalf("expected cold start capped to 6h ago, got %v", parsedSmallStart)
+	}
+
+	// 2. Insert a record as watermark 2 hours ago
+	watermark := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	db.Create(&entity.GatewaySpendLog{
+		SpendID:     "watermark-1",
+		TenantID:    "t-wm",
+		RequestTime: watermark,
+	})
+
+	// Incremental pull with 5-minute overlap window
+	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error during incremental collection: %v", err)
+	}
+
+	expectedStart := watermark.Add(-5 * time.Minute).Format("2006-01-02 15:04:05")
+	if mockClient.lastReq.StartDate != expectedStart {
+		t.Fatalf("expected start date %s with 5m overlap window, got %s", expectedStart, mockClient.lastReq.StartDate)
+	}
+
+	// 3. Ancient watermark (e.g. 60 days ago) -> capped by maxLookback (30 days)
+	ancientTime := time.Now().UTC().Add(-60 * 24 * time.Hour)
+	db.Model(&entity.GatewaySpendLog{}).Where("spend_id = ?", "watermark-1").Update("request_time", ancientTime)
+
+	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error during capped collection: %v", err)
+	}
+
+	parsedCappedStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
+	if err != nil {
+		t.Fatalf("failed to parse capped start date: %v", err)
+	}
+	earliestExpected := time.Now().UTC().Add(-31 * 24 * time.Hour)
+	latestExpected := time.Now().UTC().Add(-29 * 24 * time.Hour)
+	if parsedCappedStart.Before(earliestExpected) || parsedCappedStart.After(latestExpected) {
+		t.Fatalf("expected start date to be capped within ~30 days, got %v", parsedCappedStart)
+	}
+}

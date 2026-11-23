@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -53,11 +54,19 @@ func WithBatchSize(size int) CollectorOption {
 }
 
 // NewSpendLogCollector creates a new collector instance.
+// Environment variable METERING_COLLECTOR_BATCH_SIZE serves as default, overridden by explicit CollectorOption.
 func NewSpendLogCollector(db *gorm.DB, client SpendLogGatewayClient, opts ...CollectorOption) *SpendLogCollector {
+	batchSize := 100
+	if v := os.Getenv("METERING_COLLECTOR_BATCH_SIZE"); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			batchSize = s
+		}
+	}
+
 	c := &SpendLogCollector{
 		db:            db,
 		gatewayClient: client,
-		batchSize:     100,
+		batchSize:     batchSize,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -403,4 +412,110 @@ func QueryRawSpendLogs(ctx context.Context, db *gorm.DB, tenantID string, startT
 	}
 
 	return logs, total, nil
+}
+
+// parseScannedTime normalizes scanned database time across SQLite (string/bytes), MySQL, and PostgreSQL.
+func parseScannedTime(val interface{}) (*time.Time, error) {
+	if val == nil {
+		return nil, nil
+	}
+	switch v := val.(type) {
+	case time.Time:
+		if v.IsZero() {
+			return nil, nil
+		}
+		t := v.UTC()
+		return &t, nil
+	case *time.Time:
+		if v == nil || v.IsZero() {
+			return nil, nil
+		}
+		t := v.UTC()
+		return &t, nil
+	case string:
+		if v == "" {
+			return nil, nil
+		}
+		layouts := []string{
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05.999999999",
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		}
+		for _, layout := range layouts {
+			if parsed, err := time.Parse(layout, v); err == nil {
+				t := parsed.UTC()
+				return &t, nil
+			}
+		}
+		return nil, fmt.Errorf("unrecognized time format from database: %s", v)
+	case []byte:
+		return parseScannedTime(string(v))
+	default:
+		return nil, fmt.Errorf("unexpected database type for time: %T", val)
+	}
+}
+
+// GetLatestRequestTime queries the maximum request_time currently recorded in platform_gateway_spend_log.
+// Returns nil if the table contains zero records (cold start).
+func (c *SpendLogCollector) GetLatestRequestTime(ctx context.Context) (*time.Time, error) {
+	if c.db == nil {
+		return nil, errors.New("database handle cannot be nil")
+	}
+
+	row := c.db.WithContext(ctx).
+		Model(&entity.GatewaySpendLog{}).
+		Select("MAX(request_time)").
+		Row()
+	if row.Err() != nil {
+		return nil, fmt.Errorf("failed to query latest request time: %w", row.Err())
+	}
+
+	var raw interface{}
+	if err := row.Scan(&raw); err != nil {
+		return nil, fmt.Errorf("failed to scan latest request time: %w", err)
+	}
+	return parseScannedTime(raw)
+}
+
+// CollectIncremental performs watermark-driven incremental spend log pulling.
+// It derives the start time from MAX(request_time) minus an overlapWindow (default 5m)
+// to prevent edge dropping, capped by maxLookback (default 30d).
+// If the table is empty (cold start), it pulls from Now() - 48h.
+func (c *SpendLogCollector) CollectIncremental(ctx context.Context, overlapWindow, maxLookback time.Duration) (*CollectResult, error) {
+	if overlapWindow <= 0 {
+		overlapWindow = 5 * time.Minute
+	}
+	if maxLookback <= 0 {
+		maxLookback = 30 * 24 * time.Hour
+	}
+
+	latestTime, err := c.GetLatestRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	var startTime time.Time
+
+	earliestAllowed := now.Add(-maxLookback)
+	if latestTime == nil {
+		// Cold start: table is completely empty, initialize baseline (48h)
+		startTime = now.Add(-48 * time.Hour)
+	} else {
+		// Incremental: resume from watermark minus safety overlap window
+		startTime = latestTime.UTC().Add(-overlapWindow)
+	}
+
+	if startTime.Before(earliestAllowed) {
+		startTime = earliestAllowed
+	}
+
+	if startTime.After(now) {
+		startTime = now
+	}
+
+	return c.CollectSpendLogs(ctx, startTime, now)
 }
