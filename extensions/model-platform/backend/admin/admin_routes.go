@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // SetupModelPlatformAdminMiddleware configures model-platform specific middleware for the admin engine.
@@ -12,7 +13,7 @@ func SetupModelPlatformAdminMiddleware(engine *gin.Engine) {
 }
 
 // RegisterModelPlatformAdminRoutes mounts model-platform admin management routes under the protected admin group.
-func RegisterModelPlatformAdminRoutes(protected *gin.RouterGroup) {
+func RegisterModelPlatformAdminRoutes(protected *gin.RouterGroup, customDB ...*gorm.DB) {
 	if protected == nil {
 		return
 	}
@@ -25,5 +26,10 @@ func RegisterModelPlatformAdminRoutes(protected *gin.RouterGroup) {
 				"service": "model-platform-admin",
 			})
 		})
+
+		// Metering and billing management endpoints
+		modelPlatform.GET("/usage/daily", GetDailyUsageHandler(customDB...))
+		modelPlatform.GET("/usage/summary", GetUsageSummaryHandler(customDB...))
+		modelPlatform.GET("/usage/audit", AuditUsageHandler(nil, customDB...))
 	}
 }
