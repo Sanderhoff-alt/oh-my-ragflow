@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ragflow/extensions/model-platform/backend/entity"
+	"ragflow/extensions/model-platform/backend/gateway"
 	"ragflow/extensions/model-platform/backend/migration"
 	rentity "ragflow/internal/entity"
 
@@ -98,6 +99,69 @@ func TestAdmin_HealthCheck(t *testing.T) {
 	json.Unmarshal(resp.Body.Bytes(), &res)
 	if res["status"] != "ok" {
 		t.Errorf("unexpected health status: %v", res)
+	}
+}
+
+type mockAdminGatewayClient struct {
+	healthErr error
+}
+
+func (m *mockAdminGatewayClient) GenerateKey(ctx context.Context, req *gateway.GenerateKeyRequest) (*gateway.GenerateKeyResponse, error) {
+	return nil, nil
+}
+func (m *mockAdminGatewayClient) UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error) {
+	return nil, nil
+}
+func (m *mockAdminGatewayClient) DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error) {
+	return nil, nil
+}
+func (m *mockAdminGatewayClient) GetKeyInfo(ctx context.Context, key string) (*gateway.KeyInfoResponse, error) {
+	return nil, nil
+}
+func (m *mockAdminGatewayClient) GetSpendLogs(ctx context.Context, params gateway.SpendLogQueryParams) ([]gateway.SpendLogEntry, error) {
+	return nil, nil
+}
+func (m *mockAdminGatewayClient) HealthCheck(ctx context.Context) error {
+	return m.healthErr
+}
+
+func TestAdmin_HealthCheck_DeepGatewayProbing(t *testing.T) {
+	db := setupTestDB(t)
+
+	// 1. Healthy gateway
+	gin.SetMode(gin.TestMode)
+	rHealthy := gin.New()
+	adminHealthy := rHealthy.Group("/admin")
+	RegisterModelPlatformAdminRoutesWithGateway(adminHealthy, &mockAdminGatewayClient{healthErr: nil}, db)
+
+	req, _ := http.NewRequest(http.MethodGet, "/admin/model-platform/health", nil)
+	respHealthy := httptest.NewRecorder()
+	rHealthy.ServeHTTP(respHealthy, req)
+
+	if respHealthy.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for healthy gateway, got %d", respHealthy.Code)
+	}
+	var resHealthy map[string]interface{}
+	json.Unmarshal(respHealthy.Body.Bytes(), &resHealthy)
+	if resHealthy["status"] != "ok" || resHealthy["gateway"] != "healthy" {
+		t.Errorf("unexpected healthy payload: %+v", resHealthy)
+	}
+
+	// 2. Unhealthy gateway
+	rUnhealthy := gin.New()
+	adminUnhealthy := rUnhealthy.Group("/admin")
+	RegisterModelPlatformAdminRoutesWithGateway(adminUnhealthy, &mockAdminGatewayClient{healthErr: fmt.Errorf("connection refused: 127.0.0.1:4000")}, db)
+
+	respUnhealthy := httptest.NewRecorder()
+	rUnhealthy.ServeHTTP(respUnhealthy, req)
+
+	if respUnhealthy.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable for dead gateway, got %d", respUnhealthy.Code)
+	}
+	var resUnhealthy map[string]interface{}
+	json.Unmarshal(respUnhealthy.Body.Bytes(), &resUnhealthy)
+	if resUnhealthy["status"] != "degraded" || resUnhealthy["gateway"] != "unreachable" {
+		t.Errorf("unexpected unhealthy payload: %+v", resUnhealthy)
 	}
 }
 

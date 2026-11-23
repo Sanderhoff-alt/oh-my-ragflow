@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,7 @@ type mockGatewayState struct {
 	embedCalls   int
 	lastChatAuth string
 	lastEmbAuth  string
+	spendLogs    []gateway.SpendLogEntry
 }
 
 func setupE2ETestDB(t *testing.T) *gorm.DB {
@@ -112,16 +114,68 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 			return
 		}
 
-		// Key info / update / delete
+		// Key delete
+		if path == "/key/delete" && r.Method == http.MethodPost {
+			var delReq gateway.DeleteKeyRequest
+			_ = json.NewDecoder(r.Body).Decode(&delReq)
+			state.mu.Lock()
+			for _, k := range delReq.Keys {
+				delete(state.virtualKeys, k)
+			}
+			state.mu.Unlock()
+			json.NewEncoder(w).Encode(gateway.DeleteKeyResponse{
+				DeletedKeys: delReq.Keys,
+			})
+			return
+		}
+
+		// Key info
 		if path == "/key/info" {
 			key := r.URL.Query().Get("key")
+			state.mu.Lock()
+			isActive := state.virtualKeys[key]
+			state.mu.Unlock()
+			status := "active"
+			if !isActive {
+				status = "deleted"
+			}
 			json.NewEncoder(w).Encode(gateway.KeyInfoResponse{
 				Key: key,
 				Info: gateway.KeyInfo{
 					KeyName: "test-key",
+					Status:  status,
 					Models:  []string{"gpt-4o-mini", "text-embedding-3-small"},
 				},
 			})
+			return
+		}
+
+		// Spend logs endpoint (/spend/logs/v2) with pagination support
+		if strings.HasPrefix(path, "/spend/logs") {
+			state.mu.Lock()
+			logsCopy := append([]gateway.SpendLogEntry(nil), state.spendLogs...)
+			state.mu.Unlock()
+
+			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+			pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+			if page <= 0 {
+				page = 1
+			}
+			if pageSize <= 0 {
+				pageSize = 100
+			}
+
+			start := (page - 1) * pageSize
+			if start >= len(logsCopy) {
+				json.NewEncoder(w).Encode([]gateway.SpendLogEntry{})
+				return
+			}
+			end := start + pageSize
+			if end > len(logsCopy) {
+				end = len(logsCopy)
+			}
+
+			json.NewEncoder(w).Encode(logsCopy[start:end])
 			return
 		}
 
@@ -191,6 +245,27 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 					"total_tokens":      23,
 				},
 			}
+			teamID := ""
+			if strings.HasPrefix(expectedKey, "sk-litellm-e2e-") {
+				teamID = strings.TrimPrefix(expectedKey, "sk-litellm-e2e-")
+			}
+			state.mu.Lock()
+			state.spendLogs = append(state.spendLogs, gateway.SpendLogEntry{
+				RequestID:        fmt.Sprintf("req-chat-%d", time.Now().UnixNano()),
+				SpendID:          fmt.Sprintf("spend-chat-%d", time.Now().UnixNano()),
+				APIKey:           expectedKey,
+				TeamID:           teamID,
+				Model:            fmt.Sprintf("%v", req["model"]),
+				CallType:         "chat",
+				Spend:            0.0002,
+				TotalTokens:      23,
+				PromptTokens:     15,
+				CompletionTokens: 8,
+				StartTime:        time.Now().UTC().Add(-1 * time.Second).Format("2006-01-02 15:04:05"),
+				EndTime:          time.Now().UTC().Format("2006-01-02 15:04:05"),
+			})
+			state.mu.Unlock()
+
 			json.NewEncoder(w).Encode(resp)
 			return
 		}
@@ -227,6 +302,27 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 					"total_tokens":  5,
 				},
 			}
+			teamID := ""
+			if strings.HasPrefix(expectedKey, "sk-litellm-e2e-") {
+				teamID = strings.TrimPrefix(expectedKey, "sk-litellm-e2e-")
+			}
+			state.mu.Lock()
+			state.spendLogs = append(state.spendLogs, gateway.SpendLogEntry{
+				RequestID:        fmt.Sprintf("req-emb-%d", time.Now().UnixNano()),
+				SpendID:          fmt.Sprintf("spend-emb-%d", time.Now().UnixNano()),
+				APIKey:           expectedKey,
+				TeamID:           teamID,
+				Model:            fmt.Sprintf("%v", req["model"]),
+				CallType:         "embeddings",
+				Spend:            0.00005,
+				TotalTokens:      5,
+				PromptTokens:     5,
+				CompletionTokens: 0,
+				StartTime:        time.Now().UTC().Add(-1 * time.Second).Format("2006-01-02 15:04:05"),
+				EndTime:          time.Now().UTC().Format("2006-01-02 15:04:05"),
+			})
+			state.mu.Unlock()
+
 			json.NewEncoder(w).Encode(resp)
 			return
 		}
