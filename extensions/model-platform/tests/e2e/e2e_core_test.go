@@ -131,17 +131,19 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 			return
 		}
 
-		// Key delete
+		// Key delete, addressed by the sha256 digest of the key like the real gateway token
 		if path == "/key/delete" && r.Method == http.MethodPost {
 			var delReq gateway.DeleteKeyRequest
 			_ = json.NewDecoder(r.Body).Decode(&delReq)
 			state.mu.Lock()
-			deleted := make([]string, 0, len(delReq.KeyAliases))
-			for _, alias := range delReq.KeyAliases {
-				if k, ok := state.keyAliases[alias]; ok {
-					delete(state.virtualKeys, k)
-					delete(state.keyAliases, alias)
-					deleted = append(deleted, alias)
+			deleted := make([]string, 0, len(delReq.Keys))
+			for _, hash := range delReq.Keys {
+				for alias, k := range state.keyAliases {
+					if gateway.HashKey(k) == hash {
+						delete(state.virtualKeys, k)
+						delete(state.keyAliases, alias)
+						deleted = append(deleted, hash)
+					}
 				}
 			}
 			state.mu.Unlock()
@@ -151,6 +153,21 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 				return
 			}
 			json.NewEncoder(w).Encode(map[string][]string{"deleted_keys": deleted})
+			return
+		}
+
+		// Key list of a team: the mock names every key after its team
+		if path == "/key/list" && r.Method == http.MethodGet {
+			team := r.URL.Query().Get("team_id")
+			state.mu.Lock()
+			keys := []gateway.TeamKey{}
+			for alias, k := range state.keyAliases {
+				if k == "sk-litellm-e2e-"+team {
+					keys = append(keys, gateway.TeamKey{Token: gateway.HashKey(k), KeyAlias: alias, TeamID: team})
+				}
+			}
+			state.mu.Unlock()
+			json.NewEncoder(w).Encode(gateway.ListKeysResponse{Keys: keys, TotalPages: 1})
 			return
 		}
 
@@ -682,20 +699,26 @@ func TestE2E_LiveGatewayWithPostgreSQL(t *testing.T) {
 		t.Fatalf("expected team_id=%s in Postgres, got %s", tenantID, info.Info.TeamID)
 	}
 
-	// 6. Delete key from live LiteLLM by alias and verify physical cleanup
-	keyAlias := "tenant_" + tenantID
-	if err := gwClient.DeleteKeyByAlias(ctx, keyAlias); err != nil {
-		t.Fatalf("failed to delete key by alias from live gateway: %v", err)
+	// 6. The tenant's gateway team lists exactly the key the platform stored
+	teamKeys, err := gwClient.ListTeamKeys(ctx, tenantID)
+	if err != nil || len(teamKeys) != 1 || teamKeys[0].Token != gateway.HashKey(inst.APIKey) {
+		t.Fatalf("expected the team to hold only the stored key, got %+v (err=%v)", teamKeys, err)
 	}
 
-	// 7. Verify key is no longer active in live LiteLLM
+	// 7. Delete the key from live LiteLLM by hash and verify physical cleanup
+	keyHash := gateway.HashKey(inst.APIKey)
+	if err := gwClient.DeleteKeysByHash(ctx, []string{keyHash}); err != nil {
+		t.Fatalf("failed to delete key by hash from live gateway: %v", err)
+	}
+
+	// 8. Verify key is no longer active in live LiteLLM
 	delInfo, err := gwClient.GetKeyInfo(ctx, inst.APIKey)
 	if err == nil && delInfo != nil && delInfo.Info.Status != "deleted" {
 		t.Fatalf("expected deleted virtual key status to be 'deleted' or rejected, got status=%q", delInfo.Info.Status)
 	}
 
-	// 8. Alias is gone: a second revocation reports the key as not found
-	if err := gwClient.DeleteKeyByAlias(ctx, keyAlias); err == nil || !strings.Contains(err.Error(), "status 404") {
-		t.Fatalf("expected 404 when deleting an already revoked alias, got: %v", err)
+	// 9. Revocation is idempotent: deleting an already revoked key is not an error
+	if err := gwClient.DeleteKeysByHash(ctx, []string{keyHash}); err != nil {
+		t.Fatalf("expected a repeated revocation to succeed, got: %v", err)
 	}
 }

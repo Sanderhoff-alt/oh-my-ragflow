@@ -31,17 +31,25 @@ func LockInstanceWhitelist(instanceID string) (unlock func()) {
 }
 
 // WithInstanceRowLock runs fn as the only writer of an instance's whitelist and tenant_model rows across
-// replicas, using a row lock on the tenant_model_instance row held in a separate transaction while fn
-// runs on its own connection. It does not take the in-process mutex, so it is meant for callers such as
-// the lifecycle managers that take that mutex themselves. SQLite has no row locks and only runs tests.
+// replicas, using a row lock held in a separate transaction while fn runs on its own connection. It does not
+// take the in-process mutex, so it is meant for callers such as the lifecycle managers that take that mutex
+// themselves. SQLite has no row locks and only runs tests.
+//
+// The locked row is the provider the instance belongs to, not the instance itself. fn runs on another
+// connection, and a key rotation writes the instance row (api_key) while it holds this lock: locking that
+// row would make the rotation wait for its own lock until the database gives up.
 func WithInstanceRowLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
 	if db.Dialector.Name() == "sqlite" {
 		return fn()
 	}
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var instance rentity.TenantModelInstance
+		if err := tx.Select("id", "provider_id").Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			return fmt.Errorf("failed to find instance %s: %w", instanceID, err)
+		}
+		var provider rentity.TenantModelProvider
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
-			Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			Where("id = ?", instance.ProviderID).First(&provider).Error; err != nil {
 			return fmt.Errorf("failed to lock instance %s: %w", instanceID, err)
 		}
 		return fn()
@@ -75,20 +83,19 @@ const (
 	gatewayOverrideExclude
 )
 
-// rebuildGatewayWhitelist rewrites the tenant virtual key whitelist from the active tenant_model rows
-// of the instance. LiteLLM /key/update replaces the whole models list, so the full set is always sent.
-// overrideType is the model type of overrideModel and decides whether the embedding alias is required.
-// An empty allowedModels permits every model. The caller must hold the instance whitelist lock.
-func rebuildGatewayWhitelist(
+// gatewayWhitelist computes the tenant virtual key whitelist from the active tenant_model rows of the
+// instance. overrideType is the model type of overrideModel and decides whether the embedding alias is
+// required. An empty allowedModels permits every model. An empty result becomes the deny-all placeholder,
+// because LiteLLM treats an empty models list as unrestricted.
+func gatewayWhitelist(
 	ctx context.Context,
 	db *gorm.DB,
-	client GatewayKeyClient,
 	allowedModels []string,
 	instance *rentity.TenantModelInstance,
 	overrideModel string,
 	overrideType int,
 	overrideMode gatewayOverride,
-) error {
+) ([]string, error) {
 	isPermitted := func(model string) bool {
 		return len(allowedModels) == 0 || isModelPermitted(model, allowedModels)
 	}
@@ -96,7 +103,7 @@ func rebuildGatewayWhitelist(
 	var activeModels []rentity.TenantModel
 	if err := db.WithContext(ctx).Where("instance_id = ? AND status = ?", instance.ID, "active").
 		Find(&activeModels).Error; err != nil {
-		return fmt.Errorf("failed to query active models for gateway key update: %w", err)
+		return nil, fmt.Errorf("failed to query active models for gateway key update: %w", err)
 	}
 
 	modelSet := make(map[string]struct{})
@@ -133,12 +140,39 @@ func rebuildGatewayWhitelist(
 	if len(whitelist) == 0 {
 		whitelist = []string{RevokedModelPlaceholder}
 	}
+	return whitelist, nil
+}
+
+// rebuildGatewayWhitelist rewrites the tenant virtual key whitelist from the active tenant_model rows
+// of the instance. LiteLLM /key/update replaces the whole models list, so the full set is always sent.
+// The caller must hold the instance whitelist lock.
+func rebuildGatewayWhitelist(
+	ctx context.Context,
+	db *gorm.DB,
+	client GatewayKeyClient,
+	allowedModels []string,
+	instance *rentity.TenantModelInstance,
+	overrideModel string,
+	overrideType int,
+	overrideMode gatewayOverride,
+) error {
+	whitelist, err := gatewayWhitelist(ctx, db, allowedModels, instance, overrideModel, overrideType, overrideMode)
+	if err != nil {
+		return err
+	}
+
+	// The caller loaded the instance before it waited for the lock, and a key rotation that held the lock in
+	// the meantime replaced the key, so the key to update is read again here.
+	var current rentity.TenantModelInstance
+	if err := db.WithContext(ctx).Select("api_key").Where("id = ?", instance.ID).First(&current).Error; err != nil {
+		return fmt.Errorf("failed to read the current instance key: %w", err)
+	}
 
 	updateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	if _, err := client.UpdateKey(updateCtx, &gateway.UpdateKeyRequest{
-		Key:    instance.APIKey,
+		Key:    current.APIKey,
 		Models: whitelist,
 	}); err != nil {
 		return fmt.Errorf("failed to update gateway virtual key whitelist: %w", err)

@@ -51,8 +51,12 @@ func (g *fakeGateway) GenerateKey(ctx context.Context, req *gateway.GenerateKeyR
 	return nil, errors.New("not used")
 }
 
-func (g *fakeGateway) DeleteKeyByAlias(ctx context.Context, alias string) error {
+func (g *fakeGateway) DeleteKeysByHash(ctx context.Context, hashes []string) error {
 	return errors.New("not used")
+}
+
+func (g *fakeGateway) ListTeamKeys(ctx context.Context, teamID string) ([]gateway.TeamKey, error) {
+	return nil, errors.New("not used")
 }
 
 func (g *fakeGateway) setFail(key string, err error) {

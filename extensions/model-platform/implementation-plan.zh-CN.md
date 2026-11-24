@@ -27,6 +27,7 @@
   - [3.3 租户专属虚拟 Key 签发规范与持久化](#33-租户专属虚拟-key-sk-tenant--签发与标识规范)
   - [3.4 网关权限路由与管理端点物理阻断](#34-网关权限路由与管理端点物理阻断)
   - [3.5 租户注销生命周期与虚拟 Key 吊销](#35-租户注销生命周期与非破坏性停用-lifecycle-cleanup--non-destructive-update)
+  - [3.6 租户 Key 紧急轮换](#36-租户-key-紧急轮换-emergency-key-rotation)
 - [4. 维度三：租户模型生命周期与 Reconciler 设计](#4-维度三租户模型生命周期与-reconciler-设计-tenant-model-lifecycle--reconciler-design)
   - [4.1 GORM Post-Commit 异步解耦机制](#41-上游事务钩子分析与-post-commit-异步触发)
   - [4.2 两级重试自愈控制器架构](#42-两级重试自愈控制器架构-two-tier-self-healing-controller)
@@ -248,7 +249,7 @@ flowchart TD
   }
   ```
 - **持久化标识要求**：
-  LiteLLM `POST /key/update` 要求必须传入 `key`（原始 token）或 `key_alias`。Reconciler 在本地状态表 `platform_tenant_reconcile` 中完整持久化 `gateway_key_alias`（`tenant_<tenantID>`）与 `key_hash`，确保后续白名单变更能精确定位目标凭据。
+  LiteLLM `POST /key/update` 的 `key` 字段接受原始 token 或其 sha256 摘要。Reconciler 在本地状态表 `platform_tenant_reconcile` 中持久化 `key_hash`（key 的 sha256 摘要，非机密，同时也是 LiteLLM 的 token 标识与 spend log 的 `api_key`）与仅作展示用的 `gateway_key_alias`（形如 `tenant_<tenantID>_<8位十六进制>`），确保后续白名单变更与吊销能精确定位目标凭据。
 
 ### 3.4 网关权限路由与管理端点物理阻断
 - **管理端点 Master Key 鉴权**：
@@ -260,7 +261,7 @@ flowchart TD
 1. **模型停用更新（Non-Destructive Update）**：
    管理员从模型池中下架某个模型时，调用 `POST /key/update` 传入缩减后的 `models` 列表，**严禁执行 `POST /key/delete`**，防止中断租户持有的其他正常模型。
 2. **租户注销清理（Tenant Deletion Lifecycle）**：
-   当租户在 RAGFlow 中被删除注销时，触发异步清理钩子，调用 LiteLLM `POST /key/delete`（传入包含 `keys` 或 `key_aliases` 的 JSON 请求体），彻底吊销并注销该虚拟 Key，回收网关配额，防止产生未受管的僵尸密钥（Zombie Orphan Keys）。
+   当租户在 RAGFlow 中被删除注销时，触发异步清理钩子，吊销该租户网关 team 下的全部虚拟 Key（先 `GET /key/list?team_id=<tenant>` 列出，再按 key 的 sha256 摘要调用 `POST /key/delete`），回收网关配额，防止产生未受管的僵尸密钥（Zombie Orphan Keys）。租户在网关侧的身份是 team（`team_id` 即 tenant_id），而不是 `key_alias`：LiteLLM 仅在应用层校验别名唯一，并发请求可能产生重复别名，且按别名删除会删掉所有同名 Key。
 3. **HTTP 客户端超时控制（Worker Starvation Prevention）**：
    Go 扩展包与 LiteLLM 通信的 `http.Client` 必须设置显式超时：
    - 连接/拨号超时（Dial Timeout）：5 秒
@@ -268,6 +269,45 @@ flowchart TD
    - 响应头超时（Response Header Timeout）：10 秒
    - 总体请求超时（Total Timeout）：15 秒
    - 每次 HTTP 调用均传入带有上限的 `context.WithTimeout(ctx, 30*time.Second)`，彻底防止网关挂起时耗尽 Worker Goroutine 线程池。
+
+### 3.6 租户 Key 紧急轮换 (Emergency Key Rotation)
+管理员在 Key 泄露等场景下可以更换租户的网关 Key。租户状态保持 `ready`，数据库提交之后新请求即使用新 Key，租户不会被下线。仍在使用旧 Key 的在途请求会在旧 Key 被吊销后失败：
+
+```
+POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key
+GET  /api/v1/admin/model-platform/tenants?status=ready&after=<tenant_id>&page_size=100
+```
+
+列表用租户 ID 做游标（`after`）而不是页码，因此翻页之间有租户离开 ready 状态时，不会导致遍历漏掉其他租户。遍历不是快照：如果租户的 ID 已被游标越过，之后才变为 ready，后续页面不会包含该租户。运维人员需重新执行选择，才能包含此前未被返回的此类租户。
+
+`KeyRotator.Rotate` 仅对 `ready` 租户执行，并持有实例白名单锁（对该实例所属 provider 行加行锁，再加进程内互斥锁），因此不会与模型上线或下架交错。锁的是 provider 行而不是实例行，因为轮换本身会在持锁期间写实例行（`api_key`），而行锁是在另一个事务里持有的：
+1. 用 `version` 做乐观锁，把记录标记为脏（`key_dirty_since`）。标记先于任何网关变更写入。
+2. 用租户当前 active 模型重建白名单（永不为空）并签发新 Key。
+3. 在同一个事务内，把托管的 `tenant_model_instance` 指向新 Key，并记录 `key_hash`、`gateway_key_alias`、`key_rotated_at`、`key_rotated_by`。失败时先回读记录：只有回读成功且显示记录指向另一把 Key，才按摘要吊销新 Key 并保留旧 Key。回读失败说明不了任何事（连接断开会让它很可能失败，而提交可能已经成功），此时新 Key 和脏标记保留，由清扫器按记录所指向的 Key 收敛。
+4. 让该租户的网关 team 收敛到新 Key（吊销其余全部 Key），然后清除脏标记。
+
+轮换期间记录状态保持 `ready`。若使用 `provisioning`，Poller 会把中断的轮换当作被放弃的开通，再签发一把 Key。
+
+| HTTP | 含义 |
+|---|---|
+| 200 | 已切换到新 Key，旧 Key 已吊销 |
+| 202 | 已切换到新 Key，但旧 Key 可能仍有效（`old_keys_revoked: false`）。后台清扫会继续吊销。再次调用该接口不会续跑这次吊销，而是对租户再轮换一次：签发新 Key，第一次调用的 Key 同样被替换并吊销，所有被取代的 Key 都会被吊销 |
+| 400 / 404 | 租户 ID 不能作为网关 team ID / 租户不受平台管理 |
+| 409 | 租户未就绪，或其记录在轮换期间发生变化 |
+| 502 | 网关无法签发 Key。当前 Key 保留且仍有效，租户保持脏标记；如果网关在失败之前已经创建了 Key（例如只是响应丢失），后台清扫会吊销它 |
+| 503 | 网关或数据库未配置 |
+
+响应只包含指纹（key 摘要前 8 位），不包含 Key 本身。操作人取自已认证的管理员，每次轮换都会记录新旧 key 摘要的结构化日志。
+
+**崩溃恢复**：`key_dirty_since` 在任何步骤崩溃后都会保留。Worker 每分钟清扫一次脏超过 2 分钟的租户，在同一把锁下让其收敛到记录所指向的 Key。收敛是幂等的，失败只会在下一轮重试。
+
+**吊销延迟**：LiteLLM 各 worker 会缓存 Key `user_api_key_cache_ttl` 秒（本项目配置为 5 秒，LiteLLM 默认 60 秒），被吊销的 Key 在这段时间内仍可能通过认证。多副本网关需要 Redis 才能广播吊销。`POST /key/block` 并不更快。
+
+**计量连续性**：spend 记录携带 team ID，新旧两把 Key 的调用会汇入同一行 `(tenant_id, model_name, usage_date)`。使用已吊销 Key 的调用会被记为无 team 的失败记录，不计费。
+
+**批量轮换**：`scripts/emergency-rotate-keys.sh` 支持 `--tenant`、`--all --force`、`--concurrency`、`--rate-limit`、`--dry-run` 与 `--resume`（跳过结果文件中已成功的租户）。依赖 `curl`、`jq` 与超级管理员 `ADMIN_TOKEN`，逐租户输出一行 JSON，存在失败或旧 Key 仍待吊销的租户时以非 0 退出。
+
+`/key/regenerate` 与自动轮换是 LiteLLM 企业版功能，本方案不使用。
 
 ---
 
@@ -327,7 +367,7 @@ flowchart TD
 - **租约超时与崩溃回收（Provisioning Lease Timeout）**：
   若 Worker 在执行初始化过程中发生进程崩溃或 OOM，处于 `provisioning` 状态的记录将被孤立。Poller 定期检测处于 `provisioning` 且 `updated_at < NOW() - INTERVAL 5 MINUTE` 的租约超时记录，自动重置为 `pending` 或 `degraded`，交由后续重试轮次自愈，杜绝永久悬挂。
 - **补偿回滚机制（Compensating Rollback）**：
-  若 Reconciler 成功在 LiteLLM 签发了虚拟 Key，但在后续持久化到 RAGFlow 数据库时发生不可恢复的致命异常（如唯一键永久冲突），Worker 必须立即向 LiteLLM 发出 `POST /key/delete`（传入刚签发的 Key 或别名）吊销该 Key，杜绝产生孤儿凭据。
+  若 Reconciler 成功在 LiteLLM 签发了虚拟 Key，但在后续持久化到 RAGFlow 数据库时发生不可恢复的致命异常（如唯一键永久冲突），Worker 必须立即按刚签发 Key 的 sha256 摘要向 LiteLLM 发出 `POST /key/delete` 吊销该 Key，杜绝产生孤儿凭据。签发新 Key 之前，Worker 还会先吊销该租户 team 下此前失败尝试遗留的 Key。
 - **多副本防并发抢占（Distributed Row Locking）**：
   在多副本部署环境中，Poller 查询待处理记录时采用数据库行级锁：
   `SELECT * FROM platform_tenant_reconcile WHERE status IN ('pending', 'degraded') AND next_retry_at <= NOW() LIMIT 50 FOR UPDATE SKIP LOCKED`。在不支持 `SKIP LOCKED` 的数据库上采用乐观版本锁（`UPDATE ... SET status = 'provisioning', version = version + 1 WHERE tenant_id = ? AND version = ?`）。
@@ -345,10 +385,14 @@ CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
     last_error TEXT NULL,
     gateway_key_alias VARCHAR(128) NULL,
     key_hash VARCHAR(128) NULL,
+    key_dirty_since DATETIME NULL, -- 轮换尚未吊销旧 Key 时置位
+    key_rotated_at DATETIME NULL,
+    key_rotated_by VARCHAR(128) NULL,
     version BIGINT NOT NULL DEFAULT 1,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
-    INDEX idx_status_retry (status, next_retry_at)
+    INDEX idx_status_retry (status, next_retry_at),
+    INDEX idx_key_dirty (key_dirty_since)
 );
 ```
 
@@ -987,7 +1031,7 @@ flowchart TD
   - `extensions/model-platform/backend/dao/reconcile.go`
   - `extensions/model-platform/backend/migration/001_reconcile_schema.go`
 - **核心技术要点**：
-  1. `platform_tenant_reconcile` 表字段包含：`tenant_id`, `status` (`pending`, `provisioning`, `ready`, `degraded`, `failed`, `deleted`), `retry_count`, `max_retries`, `next_retry_at`, `gateway_key_alias`, `key_hash`, `version`。
+  1. `platform_tenant_reconcile` 表字段包含：`tenant_id`, `status` (`pending`, `provisioning`, `ready`, `degraded`, `failed`, `deleted`), `retry_count`, `max_retries`, `next_retry_at`, `gateway_key_alias`, `key_hash`, `key_dirty_since`, `key_rotated_at`, `key_rotated_by`, `version`。
   2. 遵循 `AGENTS.md` GORM 规范，查询严禁使用裸字符串 ID，使用显式参数绑定。
 - **完成标准**：
   - 迁移脚本在 MySQL / PostgreSQL 平滑执行，状态机单测通过。
@@ -1032,8 +1076,8 @@ flowchart TD
   - `extensions/model-platform/backend/reconciler/tenant_cleanup.go`
 - **核心技术要点**：
   1. 订阅租户删除事件（或由后台定期审计扫描已被软删除/硬删除的租户）。
-  2. 查询对应的 `gateway_key_alias`（`tenant_<tenantID>`）或 `key_hash`。
-  3. 调用 LiteLLM 客户端 `DeleteKey` 执行 `POST /key/delete`，彻底销毁虚拟凭据并更新状态为 `deleted`。
+  2. 列出该租户 team 下的全部虚拟 Key（`GET /key/list?team_id=<tenantID>`）。
+  3. 对每个 Key 按其 sha256 摘要执行 `POST /key/delete`，彻底销毁虚拟凭据并更新状态为 `deleted`。已不存在的 Key 视为成功。
 - **完成标准**：
   - 删除租户后，LiteLLM 中该租户的虚拟 Key 被物理清除，使用该 Key 再次调用网关返回 401。
 
@@ -1305,8 +1349,9 @@ sequenceDiagram
 | 故障场景 | 影响范围 | 容灾防护策略 |
 |---|---|---|
 | 租户注册时 LiteLLM 网关停机或超时 | 租户开通平台模型延时 | 租户本地注册事务正常提交不受阻；异步 Reconciler 进入两级重试队列，一级快速重试失败后转为 `degraded`，网关恢复后由后台 Poller 自动自愈，绝不永久放弃。 |
-| 异步开通成功后 RAGFlow 数据库断开 | 凭据写入失败 | 触发补偿回滚机制，立即调用 LiteLLM `POST /key/delete` 注销刚签发的虚拟 Key，防止孤儿凭据产生。 |
-| 租户用户被彻底删除/注销 | 虚拟 Key 残留占用配额 | 租户删除事件触发异步清理钩子，调用 LiteLLM `POST /key/delete` 吊销并回收虚拟 Key。 |
+| 异步开通成功后 RAGFlow 数据库断开 | 凭据写入失败 | 触发补偿回滚机制，立即按摘要吊销刚签发的虚拟 Key（`POST /key/delete`），防止孤儿凭据产生。 |
+| 租户用户被彻底删除/注销 | 虚拟 Key 残留占用配额 | 租户删除事件触发异步清理钩子，吊销该租户 team 下的全部虚拟 Key 并回收配额。 |
+| 租户 Key 泄露 | 在更换前存在被盗用的额度风险 | 管理员调用 `POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key`（或批量脚本 `scripts/emergency-rotate-keys.sh`），租户在数据库提交时切换到新 Key，不会被下线，旧 Key 被吊销，因此仍在使用旧 Key 的在途请求会失败，详见 3.6。 |
 | 外部供应商发生网络中断或 504 错误 | 正在进行的推理请求失败 | LiteLLM 透明重试或返回对应 HTTP 状态码；RAGFlow 现有模型驱动按照既有逻辑处理报错，网关仅对实际完成的 Token 计费。 |
 | 管理员停用平台 Embedding 模型 | 存量知识库向量检索 | 实施三段式生命周期，存量知识库存在时模型进入 `Deprecated/Read-Only` 状态，网关白名单不剔除，存量检索完全通畅，仅对新库隐藏。 |
 | 对账流水线因网络延迟回溯 48 小时重算 | 账单统计数据 | 引入 `platform_gateway_spend_log` 原始暂存表以 `spend_id` 去重；聚合使用覆盖赋值而非增量累加，100% 保障数学幂等。 |

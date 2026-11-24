@@ -6,6 +6,7 @@ import (
 
 	"ragflow/extensions/model-platform/backend/gateway"
 	"ragflow/extensions/model-platform/backend/publisher"
+	"ragflow/extensions/model-platform/backend/reconciler"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -71,8 +72,10 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 
 	client := resolveGatewayClient(gwClient)
 	var pub *publisher.Publisher
+	var rotator *reconciler.KeyRotator
 	if client != nil {
 		pub = publisher.New(client)
+		rotator = reconciler.NewKeyRotator(client, nil)
 	}
 
 	modelPlatform := protected.Group("/model-platform")
@@ -87,6 +90,10 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 		modelPlatform.PUT("/models/:id/default", SetDefaultModelHandler(customDB...))
 		modelPlatform.GET("/models/publish/tasks/:id", GetPublishTaskHandler(customDB...))
 		modelPlatform.POST("/models/publish/tasks/:id/retry", RetryPublishTaskHandler(customDB...))
+
+		// Emergency credential rotation of tenants
+		modelPlatform.GET("/tenants", ListTenantKeysHandler(customDB...))
+		modelPlatform.POST("/tenants/:tenant_id/rotate-key", RotateTenantKeyHandler(rotator, customDB...))
 
 		// Metering and billing management endpoints
 		modelPlatform.GET("/usage/daily", GetDailyUsageHandler(customDB...))

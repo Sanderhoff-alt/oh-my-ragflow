@@ -438,6 +438,8 @@ func extractNestedFloat(m map[string]interface{}, keys ...string) float64 {
 }
 
 // ExtractTenantID parses tenant ID from authoritative metadata and team attributes.
+// The key alias is deliberately not a source: it is a free-form label (rotated keys carry a random
+// suffix), while the gateway team id is always set to the tenant id when a key is issued.
 // Strictly guards against untrusted client-supplied user string spoofing.
 func ExtractTenantID(teamID string, user string, metadata map[string]interface{}) string {
 	if teamID != "" {
@@ -450,11 +452,6 @@ func ExtractTenantID(teamID string, user string, metadata map[string]interface{}
 		}
 		if tid, ok := metadata["user_api_key_team_id"].(string); ok && tid != "" {
 			return strings.TrimPrefix(tid, "tenant_")
-		}
-		if alias, ok := metadata["user_api_key_alias"].(string); ok && alias != "" {
-			if strings.HasPrefix(alias, "tenant_") {
-				return strings.TrimPrefix(alias, "tenant_")
-			}
 		}
 	}
 

@@ -3,7 +3,10 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,11 +17,22 @@ import (
 	"time"
 )
 
+// StatusError is returned when the gateway answers with a non-2xx status.
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("gateway returned error status %d: %s", e.Code, e.Body)
+}
+
 // Client defines the interface for managing LiteLLM virtual keys and proxy communication.
 type Client interface {
 	GenerateKey(ctx context.Context, req *GenerateKeyRequest) (*GenerateKeyResponse, error)
 	UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*UpdateKeyResponse, error)
-	DeleteKeyByAlias(ctx context.Context, alias string) error
+	DeleteKeysByHash(ctx context.Context, hashes []string) error
+	ListTeamKeys(ctx context.Context, teamID string) ([]TeamKey, error)
 	GetKeyInfo(ctx context.Context, key string) (*KeyInfoResponse, error)
 	ListModels(ctx context.Context) ([]string, error)
 	GetSpendLogs(ctx context.Context, params SpendLogQueryParams) ([]SpendLogEntry, error)
@@ -132,18 +146,68 @@ func (c *litellmClient) UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*
 	return &resp, nil
 }
 
-// DeleteKeyByAlias revokes the virtual key identified by its unique key_alias from the LiteLLM proxy.
-func (c *litellmClient) DeleteKeyByAlias(ctx context.Context, alias string) error {
-	if alias == "" {
-		return fmt.Errorf("key alias cannot be empty")
+// DeleteKeysByHash revokes virtual keys addressed by the sha256 hex digest of the key. It is idempotent:
+// LiteLLM answers 404 "No keys found" only when none of the keys exists, which means they are all gone, so a
+// retry after a partial failure is always safe. Any other 404, such as a wrong route in front of the proxy,
+// is reported, because treating it as success would claim a revocation that did not happen.
+func (c *litellmClient) DeleteKeysByHash(ctx context.Context, hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	for _, h := range hashes {
+		if !isKeyHash(h) {
+			return fmt.Errorf("key hash must be a sha256 hex digest")
+		}
 	}
 
-	req := DeleteKeyRequest{KeyAliases: []string{alias}}
-	if err := c.doRequest(ctx, http.MethodPost, "/key/delete", req, nil); err != nil {
-		return fmt.Errorf("failed to delete virtual key by alias: %w", err)
+	err := c.doRequest(ctx, http.MethodPost, "/key/delete", DeleteKeyRequest{Keys: hashes}, nil)
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.Code == http.StatusNotFound && strings.Contains(statusErr.Body, "No keys found") {
+		return nil
 	}
-
+	if err != nil {
+		return fmt.Errorf("failed to delete virtual keys: %w", err)
+	}
 	return nil
+}
+
+// ListTeamKeys returns every virtual key that belongs to the gateway team, following pagination.
+func (c *litellmClient) ListTeamKeys(ctx context.Context, teamID string) ([]TeamKey, error) {
+	if teamID == "" {
+		return nil, fmt.Errorf("team id is required")
+	}
+
+	var keys []TeamKey
+	for page := 1; ; page++ {
+		endpoint := fmt.Sprintf("/key/list?team_id=%s&return_full_object=true&page=%d&size=%d",
+			url.QueryEscape(teamID), page, listKeysPageSize)
+		var resp ListKeysResponse
+		if err := c.doRequest(ctx, http.MethodGet, endpoint, nil, &resp); err != nil {
+			return nil, fmt.Errorf("failed to list team keys: %w", err)
+		}
+		keys = append(keys, resp.Keys...)
+		if page >= resp.TotalPages {
+			return keys, nil
+		}
+	}
+}
+
+// listKeysPageSize is the largest page LiteLLM /key/list accepts.
+const listKeysPageSize = 100
+
+// HashKey returns the gateway token identifier of a virtual key: its sha256 hex digest. The same value
+// is the api_key of the key's spend logs and the token LiteLLM stores, so it is safe to persist and log.
+func HashKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func isKeyHash(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // GetKeyInfo retrieves metadata and usage metrics for a given virtual key.
@@ -296,7 +360,7 @@ func (c *litellmClient) doRequest(ctx context.Context, method, endpoint string, 
 	}
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return fmt.Errorf("gateway returned error status %d: %s", httpResp.StatusCode, string(respBytes))
+		return &StatusError{Code: httpResp.StatusCode, Body: string(respBytes)}
 	}
 
 	if resultObj != nil && len(respBytes) > 0 {

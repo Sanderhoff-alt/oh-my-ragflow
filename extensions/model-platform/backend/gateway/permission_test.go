@@ -111,11 +111,11 @@ func (m *mockLiteLLMProxy) handleManagementEndpoints(w http.ResponseWriter, r *h
 			return
 		}
 		deleted := make([]string, 0)
-		for _, alias := range req.KeyAliases {
-			for k, rec := range m.keys {
-				if rec.alias == alias {
+		for _, hash := range req.Keys {
+			for k := range m.keys {
+				if HashKey(k) == hash {
 					delete(m.keys, k)
-					deleted = append(deleted, alias)
+					deleted = append(deleted, hash)
 				}
 			}
 		}
@@ -249,7 +249,7 @@ func TestGatewayPermissions_ManagementEndpointBlocking(t *testing.T) {
 	}
 
 	// 3. Tenant Virtual Key attempts to call /key/delete
-	err = tenantClient.DeleteKeyByAlias(context.Background(), "tenant-rogue-target")
+	err = tenantClient.DeleteKeysByHash(context.Background(), []string{HashKey("sk-rogue-target")})
 	if err == nil {
 		t.Fatal("expected virtual key to be blocked from /key/delete, but succeeded!")
 	}

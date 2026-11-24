@@ -65,7 +65,7 @@ func (e *catalogEnv) provisionTenant(t *testing.T, name string) string {
 	e.db.Create(&rentity.User{ID: userID, Nickname: userID, Status: &valid})
 	e.db.Create(&rentity.UserTenant{ID: "ut-" + tenantID, UserID: userID, TenantID: tenantID})
 	e.db.Create(&mpentity.TenantReconcileRecord{TenantID: tenantID, Status: mpentity.StatusPending, Version: 1})
-	t.Cleanup(func() { _ = e.client.DeleteKeyByAlias(ctx, "tenant_"+tenantID) })
+	t.Cleanup(func() { _, _ = mpreconciler.RevokeTenantKeys(ctx, e.client, tenantID) })
 
 	if err := mpreconciler.NewTenantReconciler(e.client, e.baseURL, nil).Reconcile(ctx, e.db, tenantID); err != nil {
 		t.Fatalf("failed to provision tenant %s: %v", name, err)

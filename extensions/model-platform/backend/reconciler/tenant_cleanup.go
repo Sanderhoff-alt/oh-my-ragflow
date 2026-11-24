@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"ragflow/extensions/model-platform/backend/dao"
@@ -41,22 +40,7 @@ func (d *TenantDecommissioner) RegisterWithEventBus(bus *event.EventBus, db *gor
 	})
 }
 
-func isKeyNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "status 404") {
-		return true
-	}
-	// If no HTTP status code is embedded (e.g. mock or wrapped), match specific key-not-found phrases
-	if !strings.Contains(msg, "status ") && (strings.Contains(msg, "key not found") || strings.Contains(msg, "not found")) {
-		return true
-	}
-	return false
-}
-
-// DecommissionTenant physically revokes the tenant's gateway virtual key,
+// DecommissionTenant physically revokes every gateway virtual key of the tenant,
 // transitions the reconcile state to 'deleted', and deactivates platform instances.
 func (d *TenantDecommissioner) DecommissionTenant(ctx context.Context, db *gorm.DB, tenantID string) error {
 	if db == nil {
@@ -89,14 +73,13 @@ func (d *TenantDecommissioner) DecommissionTenant(ctx context.Context, db *gorm.
 		return nil
 	}
 
-	// 2. Revoke the tenant's virtual key from LiteLLM Gateway by its canonical alias
+	// 2. Revoke every virtual key of the tenant's gateway team. The team is the tenant's identity at the
+	// gateway, so this works without the raw token and also removes keys left behind by failed rotations.
 	revokeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if err := d.gatewayClient.DeleteKeyByAlias(revokeCtx, tenantKeyAlias(tenantID)); err != nil {
-		if !isKeyNotFound(err) {
-			return fmt.Errorf("failed to revoke virtual key from gateway: %w", err)
-		}
+	if _, err := RevokeTenantKeys(revokeCtx, d.gatewayClient, tenantID); err != nil {
+		return fmt.Errorf("failed to revoke virtual keys from gateway: %w", err)
 	}
 
 	// 3. Update database state in transaction: mark deleted and scrub key

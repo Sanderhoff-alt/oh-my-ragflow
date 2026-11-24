@@ -2,7 +2,6 @@ package reconciler
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,7 +84,8 @@ func initialWhitelist(catalog []entity.PlatformManagedModel, allowedModels []str
 type GatewayKeyClient interface {
 	GenerateKey(ctx context.Context, req *gateway.GenerateKeyRequest) (*gateway.GenerateKeyResponse, error)
 	UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error)
-	DeleteKeyByAlias(ctx context.Context, alias string) error
+	DeleteKeysByHash(ctx context.Context, hashes []string) error
+	ListTeamKeys(ctx context.Context, teamID string) ([]gateway.TeamKey, error)
 }
 
 // TenantReconciler handles idempotent provisioning of tenant models and virtual keys.
@@ -208,16 +208,11 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 	}
 	rec = claimedRec
 
-	// 4. Request virtual key from LiteLLM Gateway
-	keyAlias := tenantKeyAlias(tenantID)
-	genReq := &gateway.GenerateKeyRequest{
-		KeyName: keyAlias,
-		TeamID:  tenantID,
-		UserID:  tenantID,
-		Models:  initialWhitelist(catalog, r.allowedModels),
-	}
+	// 4. Drop keys that earlier failed attempts left behind, then request the virtual key from LiteLLM Gateway.
+	// A tenant that is not ready has no committed credential, so the gateway team must end up with this one key.
+	genReq := newTenantKeyRequest(tenantID, initialWhitelist(catalog, r.allowedModels))
 
-	genResp, err := r.gatewayClient.GenerateKey(ctx, genReq)
+	genResp, err := r.issueFreshKey(ctx, tenantID, genReq)
 	if err != nil {
 		// Transient failure: mark degraded using bounded recovery context in case ctx timed out
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -344,10 +339,10 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		}
 
 		// E. Mark Ready in Reconcile state table
-		keyHash := hashKey(virtualKey)
+		keyHash := gateway.HashKey(virtualKey)
 		aliasToSave := genResp.KeyName
 		if aliasToSave == "" {
-			aliasToSave = keyAlias
+			aliasToSave = genReq.KeyName
 		}
 		_, err = r.reconcileDAO.MarkReady(ctx, tx, tenantID, rec.Version, aliasToSave, keyHash)
 		return err
@@ -359,12 +354,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		defer cancel()
 
 		// Verify whether transaction actually committed despite returning an error (e.g. connection drop after commit)
-		if checkRec, err := r.reconcileDAO.GetByTenantID(rollbackCtx, silentDB, tenantID); err == nil && checkRec.Status == entity.StatusReady && checkRec.KeyHash == hashKey(virtualKey) {
+		if checkRec, err := r.reconcileDAO.GetByTenantID(rollbackCtx, silentDB, tenantID); err == nil && checkRec.Status == entity.StatusReady && checkRec.KeyHash == gateway.HashKey(virtualKey) {
 			return nil
 		}
 
-		// Immediately revoke the issued virtual key to prevent orphaned credentials
-		delErr := r.gatewayClient.DeleteKeyByAlias(rollbackCtx, keyAlias)
+		// Immediately revoke the issued virtual key, addressed by its own hash, to prevent orphaned credentials
+		delErr := r.gatewayClient.DeleteKeysByHash(rollbackCtx, []string{gateway.HashKey(virtualKey)})
 
 		if errors.Is(persistErr, entity.ErrOptimisticLockConflict) {
 			if delErr != nil {
@@ -414,15 +409,31 @@ func (r *TenantReconciler) calculateBackoff(retries int) time.Duration {
 	return 30 * time.Second
 }
 
-// tenantKeyAlias is the canonical gateway key_alias of a tenant and the single
-// identity used to issue and revoke its virtual key.
-func tenantKeyAlias(tenantID string) string {
-	return fmt.Sprintf("tenant_%s", tenantID)
+// issueFreshKey leaves the tenant's gateway team with exactly one key: it revokes any key a failed earlier
+// attempt left behind and then issues the requested one.
+func (r *TenantReconciler) issueFreshKey(ctx context.Context, tenantID string, req *gateway.GenerateKeyRequest) (*gateway.GenerateKeyResponse, error) {
+	if _, err := RevokeTenantKeys(ctx, r.gatewayClient, tenantID); err != nil {
+		return nil, err
+	}
+	return r.gatewayClient.GenerateKey(ctx, req)
 }
 
-func hashKey(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return fmt.Sprintf("%x", sum)
+// newKeyAlias names a freshly issued key. The alias is a human readable label only: the gateway does not
+// reliably enforce its uniqueness and revocation addresses keys by hash, so the random suffix simply lets
+// the old and the new key of a rotation coexist.
+func newKeyAlias(tenantID string) string {
+	return fmt.Sprintf("tenant_%s_%s", tenantID, generateID()[:8])
+}
+
+// newTenantKeyRequest builds the request for a tenant's virtual key. The gateway team is the tenant id, so
+// every key of a tenant can be found, converged and revoked through its team.
+func newTenantKeyRequest(tenantID string, models []string) *gateway.GenerateKeyRequest {
+	return &gateway.GenerateKeyRequest{
+		KeyName: newKeyAlias(tenantID),
+		TeamID:  tenantID,
+		UserID:  tenantID,
+		Models:  models,
+	}
 }
 
 func generateID() string {

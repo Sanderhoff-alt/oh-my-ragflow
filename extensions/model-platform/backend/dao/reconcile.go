@@ -272,3 +272,105 @@ func (d *ReconcileDAO) FindDueRetries(ctx context.Context, db *gorm.DB, now time
 	}
 	return records, nil
 }
+
+// ListByStatus returns a page of the records in the given status, ordered by tenant id, that follow
+// afterTenantID (empty for the first page), together with the total number of such records. Paging by cursor
+// instead of by offset means a record that leaves the status between two pages cannot make the walk skip
+// another one. It is not a snapshot: a record that enters the status behind the cursor is not returned.
+func (d *ReconcileDAO) ListByStatus(ctx context.Context, db *gorm.DB, status entity.ReconcileStatus, afterTenantID string, limit int) ([]*entity.TenantReconcileRecord, int64, error) {
+	if db == nil {
+		return nil, 0, ErrNilTransaction
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).Where("status = ?", status)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var records []*entity.TenantReconcileRecord
+	if err := query.Where("tenant_id > ?", afterTenantID).Order("tenant_id ASC").Limit(limit).Find(&records).Error; err != nil {
+		return nil, 0, err
+	}
+	return records, total, nil
+}
+
+// MarkKeyDirty records that a key rotation is starting, so the gateway may hold keys of the tenant besides
+// the one named by key_hash. It is a compare-and-swap on a 'ready' record: a concurrent decommission or
+// rotation makes it fail with ErrOptimisticLockConflict. The status stays 'ready'.
+func (d *ReconcileDAO) MarkKeyDirty(ctx context.Context, db *gorm.DB, tenantID string, currentVersion int64, now time.Time) (*entity.TenantReconcileRecord, error) {
+	return d.updateReady(ctx, db, tenantID, currentVersion, map[string]interface{}{
+		"key_dirty_since": now,
+	})
+}
+
+// CommitKeyRotation points a 'ready' record at the newly issued key. It is meant to run in the same
+// transaction that swaps the key the tenant's model instance uses.
+func (d *ReconcileDAO) CommitKeyRotation(ctx context.Context, db *gorm.DB, tenantID string, currentVersion int64, gatewayKeyAlias, keyHash, rotatedBy string, now time.Time) (*entity.TenantReconcileRecord, error) {
+	return d.updateReady(ctx, db, tenantID, currentVersion, map[string]interface{}{
+		"gateway_key_alias": gatewayKeyAlias,
+		"key_hash":          keyHash,
+		"key_rotated_at":    now,
+		"key_rotated_by":    rotatedBy,
+	})
+}
+
+// ClearKeyDirty marks the gateway keys of the tenant as converged on keyHash. It does nothing when the
+// record already names another key, so a stale caller cannot clear the marker of a newer rotation.
+func (d *ReconcileDAO) ClearKeyDirty(ctx context.Context, db *gorm.DB, tenantID, keyHash string) error {
+	if db == nil {
+		return ErrNilTransaction
+	}
+	return db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
+		Where("tenant_id = ? AND key_hash = ?", tenantID, keyHash).
+		Update("key_dirty_since", nil).Error
+}
+
+// FindDirtyKeyTenants returns a page of the 'ready' tenants whose gateway keys have not converged since before
+// olderThan. Pages are ordered by tenant id and continue after afterTenantID, so a caller can walk all of
+// them and a tenant that keeps failing cannot hold back the ones behind it.
+func (d *ReconcileDAO) FindDirtyKeyTenants(ctx context.Context, db *gorm.DB, olderThan time.Time, afterTenantID string, limit int) ([]string, error) {
+	if db == nil {
+		return nil, ErrNilTransaction
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+
+	var tenantIDs []string
+	err := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
+		Where("status = ? AND key_dirty_since IS NOT NULL AND key_dirty_since <= ? AND tenant_id > ?", entity.StatusReady, olderThan, afterTenantID).
+		Order("tenant_id ASC").
+		Limit(limit).
+		Pluck("tenant_id", &tenantIDs).Error
+	if err != nil {
+		return nil, err
+	}
+	return tenantIDs, nil
+}
+
+// updateReady applies updates to a 'ready' record under an optimistic version check and bumps the version.
+func (d *ReconcileDAO) updateReady(ctx context.Context, db *gorm.DB, tenantID string, currentVersion int64, updates map[string]interface{}) (*entity.TenantReconcileRecord, error) {
+	if db == nil {
+		return nil, ErrNilTransaction
+	}
+	if tenantID == "" {
+		return nil, ErrEmptyTenantID
+	}
+
+	updates["version"] = currentVersion + 1
+	updates["updated_at"] = time.Now()
+
+	res := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
+		Where("tenant_id = ? AND version = ? AND status = ?", tenantID, currentVersion, entity.StatusReady).
+		Updates(updates)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, entity.ErrOptimisticLockConflict
+	}
+	return d.GetByTenantID(ctx, db, tenantID)
+}
