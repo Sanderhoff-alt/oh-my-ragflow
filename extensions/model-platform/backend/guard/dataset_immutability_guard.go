@@ -100,7 +100,7 @@ func DatasetEmbeddingGuardMiddleware(customDB ...*gorm.DB) gin.HandlerFunc {
 				targetModel = requestedModels[0]
 			} else if tenantID != "" {
 				// No embedding model specified in request; resolve tenant default embedding
-				targetModel = resolveTenantDefaultEmbedding(c.Request.Context(), db, tenantID)
+				targetModel = resolveTenantDefaultEmbedding(c.Request.Context(), db, tenantID, strings.TrimSpace(c.GetString("user_id")))
 				if targetModel != "" && isModelDeprecated(c.Request.Context(), db, tenantID, targetModel) {
 					c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 						"code":    http.StatusBadRequest,
@@ -264,53 +264,76 @@ func extractEmbeddingFields(payload map[string]interface{}) []string {
 	return models
 }
 
-func resolveTenantDefaultEmbedding(ctx context.Context, db *gorm.DB, tenantID string) string {
+// resolveTenantDefaultEmbedding returns the default embedding model of the requesting user, which is what the
+// upstream uses when a dataset is created without one. Without a known user it falls back to the tenant's
+// oldest member.
+func resolveTenantDefaultEmbedding(ctx context.Context, db *gorm.DB, tenantID, userID string) string {
 	if db == nil || tenantID == "" {
 		return ""
 	}
-	var ut rentity.UserTenant
-	if err := db.WithContext(ctx).Where("tenant_id = ?", tenantID).Order("create_time ASC").First(&ut).Error; err == nil {
-		return ut.EmbdID
+	query := db.WithContext(ctx).Where("tenant_id = ?", tenantID)
+	if userID != "" {
+		query = query.Where("user_id = ?", userID)
+	} else {
+		query = query.Order("create_time ASC")
+	}
+	var members []rentity.UserTenant
+	if err := query.Limit(1).Find(&members).Error; err == nil && len(members) > 0 {
+		return members[0].EmbdID
 	}
 	return ""
 }
 
+// isModelDeprecated reports whether the referenced model can no longer be bound to a dataset. The reference is
+// a tenant_model id, a bare name, or name@instance@provider. A composite reference only matches its own
+// instance, and a bare name is retired only when no row with that name is healthy, so a tenant's own model
+// that shares the name of a retired managed one is never blocked.
 func isModelDeprecated(ctx context.Context, db *gorm.DB, tenantID, modelRef string) bool {
 	if db == nil || modelRef == "" {
 		return false
 	}
 	modelRef = strings.TrimSpace(modelRef)
-	baseName := modelRef
-	if strings.Contains(modelRef, "@") {
-		parts := strings.Split(modelRef, "@")
-		baseName = parts[0]
+	baseName, instanceName := modelRef, ""
+	if parts := strings.Split(modelRef, "@"); len(parts) >= 2 {
+		baseName, instanceName = parts[0], parts[1]
 	}
 
-	var tm rentity.TenantModel
-	query := db.WithContext(ctx).Table("tenant_model")
+	query := db.WithContext(ctx).Table("tenant_model").Select("tenant_model.*")
 	if tenantID != "" {
 		query = query.Joins("JOIN tenant_model_provider ON tenant_model_provider.id = tenant_model.provider_id").
 			Where("tenant_model_provider.tenant_id = ?", tenantID)
 	}
-	query = query.Where("(tenant_model.id = ? OR tenant_model.model_name = ? OR tenant_model.model_name = ?)",
-		modelRef, modelRef, baseName)
+	if instanceName != "" {
+		query = query.Joins("JOIN tenant_model_instance ON tenant_model_instance.id = tenant_model.instance_id").
+			Where("tenant_model_instance.instance_name = ?", instanceName)
+	}
+	query = query.Where("(tenant_model.id = ? OR tenant_model.model_name = ?)", modelRef, baseName)
 
-	if err := query.First(&tm).Error; err == nil {
-		if tm.Status != "" && !strings.EqualFold(tm.Status, "active") {
-			return true
-		}
-		if strings.TrimSpace(tm.Extra) != "" {
-			var extra map[string]interface{}
-			if err := json.Unmarshal([]byte(tm.Extra), &extra); err == nil {
-				if isExtraFlagTrue(extra["deprecated"]) ||
-					isExtraFlagTrue(extra["tombstoned"]) ||
-					isExtraFlagTrue(extra["read_only"]) {
-					return true
-				}
-			}
+	var rows []rentity.TenantModel
+	if err := query.Find(&rows).Error; err != nil || len(rows) == 0 {
+		return false
+	}
+	for _, tm := range rows {
+		if isModelRowHealthy(tm) {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// isModelRowHealthy reports whether a tenant_model row is active and carries no retirement flag.
+func isModelRowHealthy(tm rentity.TenantModel) bool {
+	if tm.Status != "" && !strings.EqualFold(tm.Status, "active") {
+		return false
+	}
+	if strings.TrimSpace(tm.Extra) == "" {
+		return true
+	}
+	var extra map[string]interface{}
+	if err := json.Unmarshal([]byte(tm.Extra), &extra); err != nil {
+		return true
+	}
+	return !isExtraFlagTrue(extra["deprecated"]) && !isExtraFlagTrue(extra["tombstoned"]) && !isExtraFlagTrue(extra["read_only"])
 }
 
 func isExtraFlagTrue(val interface{}) bool {
