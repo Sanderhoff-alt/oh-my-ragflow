@@ -25,7 +25,13 @@ var (
 
 var dbProvider func() *gorm.DB
 
-const orphanScanInterval = time.Hour
+const (
+	orphanScanInterval = time.Hour
+
+	keySweepInterval = time.Minute
+	keySweepMinAge   = 2 * time.Minute
+	keySweepBatch    = 50
+)
 
 // SetDBProvider registers how the workers obtain the process database handle.
 // The upstream server package cannot import its dao package, so the dao seam registers it.
@@ -73,10 +79,28 @@ func Start(ctx context.Context) (*Workers, error) {
 
 	scanCtx, cancel := context.WithCancel(ctx)
 	w := &Workers{controller: controller, daemon: daemon, publisher: publishWorker, cancel: cancel}
-	w.wg.Add(1)
+	w.wg.Add(2)
 	go w.scanOrphanedTenants(scanCtx, db, reconciler.NewTenantDecommissioner(client))
+	go w.sweepDirtyKeys(scanCtx, db, reconciler.NewKeyRotator(client, nil))
 
 	return w, nil
+}
+
+// sweepDirtyKeys finishes key rotations that were interrupted or could not revoke the superseded keys.
+// A tenant is picked up once its rotation has been unfinished for keySweepMinAge, so a rotation that is still
+// running is left alone. The sweep is idempotent, and failures are retried on the next tick.
+func (w *Workers) sweepDirtyKeys(ctx context.Context, db *gorm.DB, rotator *reconciler.KeyRotator) {
+	defer w.wg.Done()
+	ticker := time.NewTicker(keySweepInterval)
+	defer ticker.Stop()
+	for {
+		_, _ = rotator.ConvergeDirtyTenants(ctx, db, keySweepMinAge, keySweepBatch)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // scanOrphanedTenants revokes the gateway keys of tenants removed from the upstream tenant table.
