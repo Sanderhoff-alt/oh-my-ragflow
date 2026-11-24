@@ -161,11 +161,18 @@ func rebuildGatewayWhitelist(
 		return err
 	}
 
+	// The caller loaded the instance before it waited for the lock, and a key rotation that held the lock in
+	// the meantime replaced the key, so the key to update is read again here.
+	var current rentity.TenantModelInstance
+	if err := db.WithContext(ctx).Select("api_key").Where("id = ?", instance.ID).First(&current).Error; err != nil {
+		return fmt.Errorf("failed to read the current instance key: %w", err)
+	}
+
 	updateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	if _, err := client.UpdateKey(updateCtx, &gateway.UpdateKeyRequest{
-		Key:    instance.APIKey,
+		Key:    current.APIKey,
 		Models: whitelist,
 	}); err != nil {
 		return fmt.Errorf("failed to update gateway virtual key whitelist: %w", err)
