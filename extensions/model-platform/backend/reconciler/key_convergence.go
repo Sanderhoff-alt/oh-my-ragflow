@@ -10,6 +10,9 @@ import (
 // Converging without a hash would revoke the tenant's only working credential.
 var ErrNoCurrentKey = errors.New("tenant has no current key hash to converge on")
 
+// ErrCurrentKeyNotListed is returned when the gateway does not list the key the tenant's record names.
+var ErrCurrentKeyNotListed = errors.New("the tenant's current key is not among its gateway keys")
+
 // ConvergeTenantKeys makes the gateway hold exactly one virtual key for the tenant: the one whose
 // sha256 digest is keepHash. Every other key of the tenant's gateway team is revoked, and the number
 // of revoked keys is returned.
@@ -40,10 +43,20 @@ func revokeTeamKeysExcept(ctx context.Context, client GatewayKeyClient, tenantID
 	}
 
 	var stale []string
+	keepListed := false
 	for _, k := range keys {
-		if k.Token != "" && k.Token != keepHash {
+		switch {
+		case k.Token == "":
+		case k.Token == keepHash:
+			keepListed = true
+		default:
 			stale = append(stale, k.Token)
 		}
+	}
+	// A record whose key the gateway does not list is stale or the listing is unreliable. Revoking everything
+	// else then would leave the tenant without any working credential.
+	if keepHash != "" && !keepListed {
+		return 0, fmt.Errorf("%w: tenant %s", ErrCurrentKeyNotListed, tenantID)
 	}
 	if len(stale) == 0 {
 		return 0, nil

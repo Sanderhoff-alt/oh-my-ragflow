@@ -147,20 +147,26 @@ func (c *litellmClient) UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*
 }
 
 // DeleteKeysByHash revokes virtual keys addressed by the sha256 hex digest of the key. It is idempotent:
-// a key that is already gone is not an error, so a retry after a partial failure is always safe.
+// LiteLLM answers 404 "No keys found" only when none of the keys exists, which means they are all gone, so a
+// retry after a partial failure is always safe. Any other 404, such as a wrong route in front of the proxy,
+// is reported, because treating it as success would claim a revocation that did not happen.
 func (c *litellmClient) DeleteKeysByHash(ctx context.Context, hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
 	for _, h := range hashes {
 		if !isKeyHash(h) {
 			return fmt.Errorf("key hash must be a sha256 hex digest")
 		}
 	}
-	// LiteLLM answers 404 only when none of the keys exists, so each hash is sent on its own.
-	for _, h := range hashes {
-		err := c.doRequest(ctx, http.MethodPost, "/key/delete", DeleteKeyRequest{Keys: []string{h}}, nil)
-		var statusErr *StatusError
-		if err != nil && !(errors.As(err, &statusErr) && statusErr.Code == http.StatusNotFound) {
-			return fmt.Errorf("failed to delete virtual key: %w", err)
-		}
+
+	err := c.doRequest(ctx, http.MethodPost, "/key/delete", DeleteKeyRequest{Keys: hashes}, nil)
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.Code == http.StatusNotFound && strings.Contains(statusErr.Body, "No keys found") {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete virtual keys: %w", err)
 	}
 	return nil
 }

@@ -72,11 +72,20 @@ func TestReconcileDAO_FindDirtyKeyTenants(t *testing.T) {
 	db.Create(&entity.TenantReconcileRecord{TenantID: "t-clean", Status: entity.StatusReady, Version: 1})
 	db.Create(&entity.TenantReconcileRecord{TenantID: "t-gone", Status: entity.StatusDeleted, KeyDirtySince: &old, Version: 1})
 
-	got, err := d.FindDirtyKeyTenants(ctx, db, now.Add(-time.Minute), 10)
+	got, err := d.FindDirtyKeyTenants(ctx, db, now.Add(-time.Minute), "", 10)
 	if err != nil {
 		t.Fatalf("find failed: %v", err)
 	}
 	if len(got) != 1 || got[0] != "t-old" {
 		t.Fatalf("expected only the ready tenant that stayed dirty, got %v", got)
+	}
+
+	for _, id := range []string{"t-old-b", "t-old-c"} {
+		db.Create(&entity.TenantReconcileRecord{TenantID: id, Status: entity.StatusReady, KeyDirtySince: &old, Version: 1})
+	}
+	page, _ := d.FindDirtyKeyTenants(ctx, db, now.Add(-time.Minute), "", 2)
+	next, _ := d.FindDirtyKeyTenants(ctx, db, now.Add(-time.Minute), page[len(page)-1], 2)
+	if len(page) != 2 || page[0] != "t-old" || page[1] != "t-old-b" || len(next) != 1 || next[0] != "t-old-c" {
+		t.Fatalf("expected pages ordered by tenant id that continue after the last one, got %v then %v", page, next)
 	}
 }

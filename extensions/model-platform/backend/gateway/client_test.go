@@ -274,8 +274,11 @@ func TestClient_DeleteKeysByHash(t *testing.T) {
 	if err := client.DeleteKeysByHash(context.Background(), []string{hashA, hashB}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(received) != 2 || received[0][0] != hashA || received[1][0] != hashB {
-		t.Errorf("expected one delete request per hash, got %v", received)
+	if len(received) != 1 || len(received[0]) != 2 || received[0][0] != hashA || received[0][1] != hashB {
+		t.Errorf("expected one delete request carrying both hashes, got %v", received)
+	}
+	if err := client.DeleteKeysByHash(context.Background(), nil); err != nil || len(received) != 1 {
+		t.Errorf("deleting nothing must not call the gateway, got %v (err=%v)", received, err)
 	}
 }
 
@@ -290,6 +293,22 @@ func TestClient_DeleteKeysByHash_NotFoundIsIdempotent(t *testing.T) {
 
 	if err := client.DeleteKeysByHash(context.Background(), []string{HashKey("sk-gone")}); err != nil {
 		t.Fatalf("an already deleted key must not be an error, got %v", err)
+	}
+}
+
+func TestClient_DeleteKeysByHash_UnrelatedNotFoundIsReported(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`<html>404 page not found</html>`))
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	err := client.DeleteKeysByHash(context.Background(), []string{HashKey("sk-any")})
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) || statusErr.Code != http.StatusNotFound {
+		t.Fatalf("a 404 that is not the gateway's 'No keys found' must not count as a revocation, got %v", err)
 	}
 }
 

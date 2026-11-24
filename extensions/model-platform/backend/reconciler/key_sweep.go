@@ -2,7 +2,6 @@ package reconciler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -19,9 +18,6 @@ func (r *KeyRotator) ConvergeTenant(ctx context.Context, db *gorm.DB, tenantID s
 	silentDB := db.Session(&gorm.Session{Logger: db.Logger.LogMode(logger.Silent)})
 	instance, err := findPlatformInstance(ctx, silentDB, tenantID)
 	if err != nil {
-		if errors.Is(err, ErrTenantNotReady) {
-			return nil
-		}
 		return err
 	}
 
@@ -46,24 +42,30 @@ func (r *KeyRotator) ConvergeTenant(ctx context.Context, db *gorm.DB, tenantID s
 }
 
 // ConvergeDirtyTenants converges the ready tenants that have been dirty for longer than minAge, which gives a
-// rotation in progress time to finish on its own. It returns the number of converged tenants; a failing tenant
-// does not stop the others and is retried by the next sweep.
-func (r *KeyRotator) ConvergeDirtyTenants(ctx context.Context, db *gorm.DB, minAge time.Duration, limit int) (int, error) {
-	tenantIDs, err := r.reconcileDAO.FindDirtyKeyTenants(ctx, db, time.Now().Add(-minAge), limit)
-	if err != nil {
-		return 0, err
-	}
-
-	converged := 0
-	for _, tenantID := range tenantIDs {
-		if err := ctx.Err(); err != nil {
+// rotation in progress time to finish on its own. It walks all of them in pages of batch tenants, so a tenant
+// that keeps failing never hides the ones behind it. It returns the number of converged tenants; a failing
+// tenant does not stop the others and is retried by the next sweep.
+func (r *KeyRotator) ConvergeDirtyTenants(ctx context.Context, db *gorm.DB, minAge time.Duration, batch int) (int, error) {
+	cutoff := time.Now().Add(-minAge)
+	converged, after := 0, ""
+	for {
+		tenantIDs, err := r.reconcileDAO.FindDirtyKeyTenants(ctx, db, cutoff, after, batch)
+		if err != nil {
 			return converged, err
 		}
-		if err := r.ConvergeTenant(ctx, db, tenantID); err != nil {
-			slog.Warn("tenant gateway key convergence failed", "tenant_id", tenantID, "error", err)
-			continue
+		for _, tenantID := range tenantIDs {
+			if err := ctx.Err(); err != nil {
+				return converged, err
+			}
+			if err := r.ConvergeTenant(ctx, db, tenantID); err != nil {
+				slog.Warn("tenant gateway key convergence failed", "tenant_id", tenantID, "error", err)
+				continue
+			}
+			converged++
 		}
-		converged++
+		if len(tenantIDs) == 0 || len(tenantIDs) < batch {
+			return converged, nil
+		}
+		after = tenantIDs[len(tenantIDs)-1]
 	}
-	return converged, nil
 }

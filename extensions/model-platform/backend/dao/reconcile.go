@@ -326,9 +326,10 @@ func (d *ReconcileDAO) ClearKeyDirty(ctx context.Context, db *gorm.DB, tenantID,
 		Update("key_dirty_since", nil).Error
 }
 
-// FindDirtyKeyTenants returns the 'ready' tenants whose gateway keys have not converged since before
-// olderThan, oldest first.
-func (d *ReconcileDAO) FindDirtyKeyTenants(ctx context.Context, db *gorm.DB, olderThan time.Time, limit int) ([]string, error) {
+// FindDirtyKeyTenants returns a page of the 'ready' tenants whose gateway keys have not converged since before
+// olderThan. Pages are ordered by tenant id and continue after afterTenantID, so a caller can walk all of
+// them and a tenant that keeps failing cannot hold back the ones behind it.
+func (d *ReconcileDAO) FindDirtyKeyTenants(ctx context.Context, db *gorm.DB, olderThan time.Time, afterTenantID string, limit int) ([]string, error) {
 	if db == nil {
 		return nil, ErrNilTransaction
 	}
@@ -338,8 +339,8 @@ func (d *ReconcileDAO) FindDirtyKeyTenants(ctx context.Context, db *gorm.DB, old
 
 	var tenantIDs []string
 	err := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
-		Where("status = ? AND key_dirty_since IS NOT NULL AND key_dirty_since <= ?", entity.StatusReady, olderThan).
-		Order("key_dirty_since ASC").
+		Where("status = ? AND key_dirty_since IS NOT NULL AND key_dirty_since <= ? AND tenant_id > ?", entity.StatusReady, olderThan, afterTenantID).
+		Order("tenant_id ASC").
 		Limit(limit).
 		Pluck("tenant_id", &tenantIDs).Error
 	if err != nil {
