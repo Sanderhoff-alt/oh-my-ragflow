@@ -27,6 +27,7 @@ English | [简体中文](implementation-plan.zh-CN.md)
   - [3.3 Scoped Tenant Virtual Key Specification (sk-tenant-...)](#33-scoped-tenant-virtual-key-specification-sk-tenant-)
   - [3.4 Gateway Permission Routing & Admin Endpoint Blocking](#34-gateway-permission-routing--admin-endpoint-blocking)
   - [3.5 Tenant Decommissioning & Virtual Key Revocation](#35-tenant-decommissioning--virtual-key-revocation)
+  - [3.6 Emergency Key Rotation](#36-emergency-key-rotation)
 - [4. Dimension 3: Tenant Lifecycle & Self-Healing Reconciler](#4-dimension-3-tenant-lifecycle--self-healing-reconciler)
   - [4.1 GORM Post-Commit Asynchronous Decoupling](#41-gorm-post-commit-asynchronous-decoupling)
   - [4.2 Two-Tier Self-Healing Controller Architecture](#42-two-tier-self-healing-controller-architecture)
@@ -222,7 +223,7 @@ Virtual keys are provisioned via `POST /key/generate`:
   "models": ["gpt-4o-mini", "text-embedding-3-small"],
   "team_id": "tenant-e2e-test",
   "user_id": "user-e2e-test",
-  "key_alias": "tenant_tenant-e2e-test",
+  "key_alias": "tenant_tenant-e2e-test_1a2b3c4d",
   "metadata": {"tenant_id": "tenant-e2e-test"}
 }
 ```
@@ -234,7 +235,51 @@ LiteLLM enforces:
 - Invocations to models outside the tenant's model whitelist return HTTP 403 Forbidden (`ModelNotAllowedError`).
 
 ### 3.5 Tenant Decommissioning & Virtual Key Revocation
-When a tenant is deleted, `TenantDecommissioner` asynchronously invokes `POST /key/delete` (with a JSON payload containing `keys` or `key_aliases`) to revoke the virtual key physically from PostgreSQL.
+When a tenant is deleted, `TenantDecommissioner` asynchronously revokes every virtual key of the tenant's gateway team (see [Key identity](#key-identity-and-revocation)) and then marks the record `deleted` and scrubs the local credential.
+
+#### Key identity and revocation
+A tenant's keys are identified by the gateway **team**, not by `key_alias`. The team id equals the tenant id and groups every key the platform issues for the tenant. A single key is addressed by its token, the sha256 hex digest of the key, which LiteLLM stores, accepts in `POST /key/delete`, and writes as `api_key` into spend logs. The reconcile record keeps that digest as `key_hash`, so the platform can revoke without storing raw tokens.
+
+- `GET /key/list?team_id=<tenant>&return_full_object=true` lists the keys of a tenant. `ConvergeTenantKeys` revokes all of them except the one named by `key_hash`, and `RevokeTenantKeys` revokes all. Both are idempotent, and revoking a key that is already gone is not an error.
+- `key_alias` is only a human readable label of the form `tenant_<id>_<8 hex>`. LiteLLM enforces alias uniqueness in application code only, so concurrent requests can create duplicates, and `POST /key/delete` with `key_aliases` removes every match.
+- Tenant attribution in spend logs uses the team id, never the alias.
+
+### 3.6 Emergency Key Rotation
+Administrators replace the gateway key of a tenant, for example after a leak, without interrupting the tenant:
+
+```
+POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key
+GET  /api/v1/admin/model-platform/tenants?status=ready&page=1&page_size=100
+```
+
+`KeyRotator.Rotate` runs for a `ready` tenant under the instance whitelist lock (row lock plus in-process mutex), so it cannot interleave with a model going live or retiring:
+1. Mark the record dirty (`key_dirty_since`) with a compare-and-swap on `version`. The marker is written before anything changes at the gateway.
+2. Issue the new key with the whitelist rebuilt from the tenant's active models (never empty, so the rotation keeps what the tenant may call).
+3. In one transaction, point the managed `tenant_model_instance` at the new key and record `key_hash`, `gateway_key_alias`, `key_rotated_at` and `key_rotated_by`. If this fails the new key is revoked by its hash and the old key stays.
+4. Converge the tenant's gateway team on the new key, which revokes the old one, and clear the marker.
+
+The record stays `ready` during the rotation. A `provisioning` status would make the poller treat an interrupted rotation as an abandoned provisioning and issue another key.
+
+| HTTP | Meaning |
+|---|---|
+| 200 | New key in use, old key revoked |
+| 202 | New key in use, a superseded key may still be valid (`old_keys_revoked: false`). The key sweeper keeps revoking it, and calling the endpoint again resumes it |
+| 400 / 404 | Tenant id cannot be a gateway team id / tenant not managed by the platform |
+| 409 | Tenant not ready, or its record changed during the rotation |
+| 502 | The gateway could not issue a key, nothing changed |
+| 503 | Gateway or database not configured |
+
+The response carries a fingerprint (first 8 digits of the key hash), never the key. The operator is the authenticated administrator and each rotation is logged with the old and new key hashes.
+
+**Recovery.** `key_dirty_since` survives a crash at any step. A worker sweep (every minute, for tenants dirty for more than two minutes) converges the tenant on the key its record names, taking the same lock. The convergence is idempotent, so a failed sweep is simply retried.
+
+**Revocation latency.** LiteLLM workers cache keys for `user_api_key_cache_ttl` seconds (5 in the test and production configuration, 60 by default), so a revoked key can still authenticate on a worker for that long. Multiple gateway replicas need Redis for the revocation to be broadcast. `POST /key/block` is not faster.
+
+**Metering.** Spend rows carry the team id, so the calls of the old and the new key roll up into the same `(tenant_id, model_name, usage_date)` row. Calls with a revoked key are written as failures without a team and are not billed.
+
+**Batch rotation.** `scripts/emergency-rotate-keys.sh` calls the endpoint for one tenant (`--tenant`) or all ready tenants (`--all --force`), with `--concurrency`, `--rate-limit`, `--dry-run`, and `--resume` to skip tenants an earlier result file shows as rotated. It needs `curl`, `jq` and a superuser `ADMIN_TOKEN`, writes one JSON line per tenant, and exits non-zero while any tenant failed or still has a superseded key.
+
+`/key/regenerate` and automatic key rotation are LiteLLM enterprise features and are not used.
 
 ---
 
@@ -272,7 +317,7 @@ flowchart TD
 - **Tier 1 Fast In-Memory Queue**: New tenant events are processed immediately by the in-memory queue with 5 retries (1s, 2s, 4s, 8s, 16s with jitter, ~31s total).
 - **Tier 2 Level-Triggered Poller**: Scans every 30s for records in `pending` or `degraded` state whose `next_retry_at <= NOW()`. Handles extended outages (e.g., 45-second gateway restarts) using longer backoffs (1m, 2m, 5m, capped at 10m, up to 50 retries / 7 days).
 - **Provisioning Lease Timeout**: Reclaims abandoned `provisioning` records where `updated_at < NOW() - INTERVAL 5 MINUTE` (e.g., if a worker node crashes mid-flight), resetting them back to `pending`/`degraded` for safe recovery.
-- **Compensating Rollback**: If database persistence fails after generating a virtual key on LiteLLM, the worker immediately issues `POST /key/delete` (with `keys` or `key_aliases`) to prevent orphaned credentials.
+- **Compensating Rollback**: If database persistence fails after generating a virtual key on LiteLLM, the worker immediately revokes that key by its own hash (`POST /key/delete`) to prevent orphaned credentials. Before it issues a key, the worker also revokes any key of the tenant's team that an earlier failed attempt left behind.
 - **Distributed Row Locking**: Concurrent pollers use `SELECT * FROM platform_tenant_reconcile WHERE status IN ('pending', 'degraded') AND next_retry_at <= NOW() LIMIT 50 FOR UPDATE SKIP LOCKED` (or optimistic version locking `SET status = 'provisioning', version = version + 1 WHERE tenant_id = ? AND version = ?`).
 
 ### 4.3 State Machine Model & Migration Schema (platform_tenant_reconcile)
@@ -297,7 +342,7 @@ CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
 ### 4.4 Native Driver Resolution & Compensating Rollback
 - Records are stored as `ProviderName = "OpenAI-API-Compatible"` with `InstanceName = "platform"` and `is_managed = true`.
 - Upstream `ModelFactory.CreateModelDriver` matches `"openai-api-compatible"` directly.
-- **Compensating Rollback**: If database persistence fails after virtual key generation, `reconciler` immediately invokes `POST /key/delete` (with `keys` or `key_aliases`) to clean up orphaned credentials.
+- **Compensating Rollback**: If database persistence fails after virtual key generation, `reconciler` immediately revokes the issued key by its hash (`POST /key/delete`) to clean up orphaned credentials.
 
 ### 4.5 Backend Managed Model Protection (ManagedProviderGuardMiddleware)
 `ManagedProviderGuardMiddleware` intercepts write requests (`DELETE`, `PUT`, `PATCH`) to `/v1/user/setting/model/provider`, `/api/v1/user/setting/model/provider`, and `/api/v1/admin/model/provider`:
@@ -861,8 +906,9 @@ sequenceDiagram
 | Failure Scenario | Impact Scope | Defense & Recovery Strategy |
 |---|---|---|
 | Gateway down during tenant registration | Delayed model provisioning | Tenant registration commits locally without blocking. Event enqueues for retry; Tier 1 retries 5 times, then transitions to `degraded`. Tier 2 background poller auto-heals tenant to `ready` once gateway returns. |
-| Database failure after virtual key issued | Orphaned gateway credentials | Compensating rollback invokes `POST /key/delete` to revoke virtual key immediately, preventing orphaned tokens. |
-| Tenant account deleted or decommissioned | Residual token usage | Decommissioning listener triggers `TenantDecommissioner`, invoking `POST /key/delete` to revoke token physically. |
+| Database failure after virtual key issued | Orphaned gateway credentials | Compensating rollback revokes the issued virtual key by its hash immediately, preventing orphaned tokens. |
+| Tenant account deleted or decommissioned | Residual token usage | Decommissioning listener triggers `TenantDecommissioner`, which revokes every key of the tenant's gateway team physically. |
+| Tenant key leaked | Unauthorized spend until the key is replaced | An administrator calls `POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key` (or the batch script). The tenant switches to a new key without downtime and the old key is revoked, see section 3.6. |
 | Upstream provider 5xx or network timeout | Active inference fails | LiteLLM performs transparent retry or returns standard error codes. RAGFlow driver handles errors gracefully; gateway charges only for actual tokens consumed. |
 | Administrator deprecates embedding model | Existing KB vector search | 3-stage lifecycle keeps model in `Deprecated/Read-Only` status. Gateway whitelist retains model, ensuring vector search continues uninterrupted while hiding it from new KBs. |
 | Network delay causes 48h rollup replay | Billing aggregates | Raw staging table uses `spend_id` unique key (`INSERT IGNORE`). Rollup performs replacement upsert (`call_count = VALUES(call_count)`), guaranteeing mathematical idempotence. |
@@ -910,7 +956,7 @@ TENANT_KEY_JSON=$(curl -s -X POST "http://127.0.0.1:4000/key/generate" \
     "models": ["gpt-4o-mini", "text-embedding-3-small"],
     "team_id": "tenant-e2e-core",
     "user_id": "user-e2e-core",
-    "key_alias": "tenant_tenant-e2e-core",
+    "key_alias": "tenant_tenant-e2e-core_1a2b3c4d",
     "metadata": {"tenant_id": "tenant-e2e-core"}
   }')
 
