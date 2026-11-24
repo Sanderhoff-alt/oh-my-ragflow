@@ -26,6 +26,9 @@ func RegisterModelPlatformProtectedRoutes(protected *gin.RouterGroup) {
 
 	// Inject the dataset immutability guard to protect existing dataset vector spaces against corrupting model mutations.
 	protected.Use(guard.DatasetImmutabilityGuardMiddleware())
+
+	// Record user-initiated default model changes as user_explicit so platform default upgrades preserve them.
+	protected.Use(guard.DefaultModelPreferenceMiddleware())
 }
 
 // RegisterModelPlatformAuthRoutes registers authenticated enterprise routes.
