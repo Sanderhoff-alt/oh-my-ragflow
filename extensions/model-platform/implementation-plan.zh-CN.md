@@ -597,18 +597,23 @@ flowchart LR
 1. **第一层：不可变网关原始日志暂存表 (`platform_gateway_spend_log`)**：
    以 LiteLLM 的全局唯一 `spend_id`（或 `request_id`）为主键。日志拉取时执行 `INSERT IGNORE`（或 `ON CONFLICT DO NOTHING`），确保无论拉取多少次、无论时间窗口如何重叠，同一笔调用记录在数据库中严格只存一行。
 2. **第二层：确定性覆盖汇总日账单表 (`platform_tenant_usage_daily`)**：
-   采用确定性聚合替换（Replacement Upsert）而非增量累加（禁止 `+=`）。在重算指定日期或回溯 48 小时窗口时，直接根据第一层暂存日志重新计算该日期的总和，用新的真实总额原子覆盖旧汇总值。
+   采用确定性聚合替换（Replacement Upsert）而非增量累加（禁止 `+=`）。在重算指定日期或回溯滚动窗口时，直接根据第一层暂存日志重新计算该日期的总和，用新的真实总额原子覆盖旧汇总值。
+
+`MeteringDaemon` 通过三种自愈状态协同采集环（Loop 1）与聚合环（Loop 2）：
+- **冷启动（空表）**：按 `METERING_LOOKBACK_HOURS`（默认 `48`）并在 `METERING_TIMEZONE` 下对齐到当天 `00:00:00` 作为起点，与 Loop 2 的全天覆盖边界严格一致。
+- **在线运行（内存检查点生效）**：每次成功拉取后（即使返回 0 条日志）推进 `lastCheckedAt`，常规查询窗口恒定收敛在 `[lastCheckedAt - METERING_FETCH_OVERLAP, Now]`（默认约 10 分钟），消除空闲期窗口膨胀。
+- **重启恢复与动态多天追平（库有存量记录）**：从 `MAX(request_time) - METERING_FETCH_OVERLAP` 无上限分页流式回放，杜绝长停机静默截断；当本轮实际新入库记录的最早 `request_time`（`EarliestInsertedAt`）早于 `EndTime - METERING_LOOKBACK_HOURS` 时，Loop 1 自动触发 `UsagePipeline.AggregateDailyUsage` 对 `[EarliestInsertedAt, EndTime]` 执行全量多天日对齐重算（避免仅插入今日新日志时误重算早已被部分清理的静默历史日，并在瞬时聚合或后续分页失败时于运行进程内保留待追平起点自动重试）。
 
 ```mermaid
 flowchart TD
-    LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"定时拉取窗口日志: 支持回溯 48h"| Collector["对账采集器 Collector"]
+    LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"内存检查点 (~10m) / 重启无上限回放 / 日对齐冷启动"| Collector["对账采集器 Collector"]
 
     subgraph Tier1_Staging ["第一层: 原始日志暂存去重"]
         Collector -->|"INSERT IGNORE INTO spend_id"| SpendLogTable[("platform_gateway_spend_log<br>唯一键: spend_id")]
     end
 
-    subgraph Tier2_Aggregation ["第二层: 确定性重算覆盖汇总"]
-        SpendLogTable -->|"GROUP BY tenant, model, usage_date<br>SUM(tokens), SUM(spend)"| RollupEngine["聚合重算引擎"]
+    subgraph Tier2_Aggregation ["第二层: 确定性重算覆盖汇总与动态追平"]
+        SpendLogTable -->|"例行滚动窗口 + 动态多天追平<br>GROUP BY tenant, model, usage_date"| RollupEngine["聚合重算引擎"]
         RollupEngine -->|"ON DUPLICATE KEY UPDATE<br>call_count = VALUES(call_count)"| DailyTable[("platform_tenant_usage_daily<br>联合唯一键: tenant_id, model_name, usage_date")]
     end
 ```
@@ -684,7 +689,7 @@ INSERT INTO platform_tenant_usage_daily (
     created_at, updated_at
 )
 SELECT
-    tenant_id, model_name, DATE_FORMAT(request_time, '%Y-%m-%d'),
+    tenant_id, model_name, DATE_FORMAT(CONVERT_TZ(request_time, '+00:00', /* METERING_TIMEZONE 偏移，例如 '+08:00' */ ?), '%Y-%m-%d'),
     COUNT(*),
     SUM(prompt_tokens),
     SUM(completion_tokens),
@@ -698,8 +703,9 @@ SELECT
     SUM(cache_savings),
     NOW(), NOW()
 FROM platform_gateway_spend_log
-WHERE request_time >= NOW() - INTERVAL 48 HOUR
-GROUP BY tenant_id, model_name, DATE_FORMAT(request_time, '%Y-%m-%d')
+WHERE request_time >= /* 按 METERING_TIMEZONE 对齐的起始自然日 00:00:00 对应 UTC（dayAlignedLookbackStart） */ ?
+  AND request_time <= ?
+GROUP BY tenant_id, model_name, DATE_FORMAT(CONVERT_TZ(request_time, '+00:00', /* METERING_TIMEZONE 偏移，例如 '+08:00' */ ?), '%Y-%m-%d')
 ON DUPLICATE KEY UPDATE
     call_count = VALUES(call_count),
     prompt_tokens = VALUES(prompt_tokens),
@@ -714,7 +720,7 @@ ON DUPLICATE KEY UPDATE
     cache_savings = VALUES(cache_savings),
     updated_at = NOW();
 ```
-**数学幂等保证**：即使对账流水线因网络崩溃反复执行 100 次，或回溯 48 小时覆盖处理迟到日志，日账单数据也绝对保持一致，杜绝任何形式的重叠计费。
+**数学幂等与日边界对齐保证**：查询下界必须先在 `METERING_TIMEZONE` 下对齐至起始自然日 `00:00:00`（与 `dayAlignedLookbackStart` / `UsagePipeline.RunWindow` / `AggregateDailyUsage` 一致），防止起始日半天聚合结果覆盖全天总额。即使对账流水线因网络崩溃反复执行 100 次，或回溯滚动窗口覆盖处理迟到日志，日账单数据也绝对保持一致，杜绝任何形式的重叠计费。
 
 #### 声明式原始流水保留策略（默认关闭，按需开启）
 原始流水表（网关侧 `LiteLLM_SpendLogs` 与控制面 `platform_gateway_spend_log`）默认**永久保留**，避免升级后静默删除审计明细。运维可按需在两层分别声明启用，互不跨库、不依赖 DDL 分区：

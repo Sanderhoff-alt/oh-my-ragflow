@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ragflow/extensions/model-platform/backend/entity"
@@ -19,6 +20,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const defaultOverlapWindow = 5 * time.Minute
+
 // SpendLogGatewayClient defines the interface required by SpendLogCollector.
 type SpendLogGatewayClient interface {
 	GetSpendLogs(ctx context.Context, params gateway.SpendLogQueryParams) ([]gateway.SpendLogEntry, error)
@@ -26,11 +29,12 @@ type SpendLogGatewayClient interface {
 
 // CollectResult captures the metrics of a spend log collection run.
 type CollectResult struct {
-	TotalFetched  int       `json:"total_fetched"`
-	InsertedCount int       `json:"inserted_count"`
-	SkippedCount  int       `json:"skipped_count"`
-	StartTime     time.Time `json:"start_time"`
-	EndTime       time.Time `json:"end_time"`
+	TotalFetched       int       `json:"total_fetched"`
+	InsertedCount      int       `json:"inserted_count"`
+	SkippedCount       int       `json:"skipped_count"`
+	StartTime          time.Time `json:"start_time"`
+	EndTime            time.Time `json:"end_time"`
+	EarliestInsertedAt time.Time `json:"earliest_inserted_at,omitempty"`
 }
 
 // SpendLogCollector coordinates the pulling of raw gateway spend logs and
@@ -39,6 +43,13 @@ type SpendLogCollector struct {
 	db            *gorm.DB
 	gatewayClient SpendLogGatewayClient
 	batchSize     int
+	nowFunc       func() time.Time
+
+	collectMu          sync.Mutex
+	mu                 sync.RWMutex
+	loc                *time.Location
+	lastCheckedAt      time.Time
+	pendingReplayStart time.Time
 }
 
 // CollectorOption configures optional SpendLogCollector settings.
@@ -53,8 +64,18 @@ func WithBatchSize(size int) CollectorOption {
 	}
 }
 
+// WithCollectorTimezone sets the calendar-day alignment timezone for cold-start collection.
+func WithCollectorTimezone(loc *time.Location) CollectorOption {
+	return func(c *SpendLogCollector) {
+		if loc != nil {
+			c.loc = loc
+		}
+	}
+}
+
 // NewSpendLogCollector creates a new collector instance.
-// Environment variable METERING_COLLECTOR_BATCH_SIZE serves as default, overridden by explicit CollectorOption.
+// Environment variables METERING_COLLECTOR_BATCH_SIZE and METERING_TIMEZONE serve as defaults,
+// overridden by explicit CollectorOptions.
 func NewSpendLogCollector(db *gorm.DB, client SpendLogGatewayClient, opts ...CollectorOption) *SpendLogCollector {
 	batchSize := 100
 	if v := os.Getenv("METERING_COLLECTOR_BATCH_SIZE"); v != "" {
@@ -67,11 +88,41 @@ func NewSpendLogCollector(db *gorm.DB, client SpendLogGatewayClient, opts ...Col
 		db:            db,
 		gatewayClient: client,
 		batchSize:     batchSize,
+		loc:           ResolveMeteringLocation(""),
+		nowFunc:       time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
+}
+
+// Location returns the configured calendar-day alignment timezone.
+func (c *SpendLogCollector) Location() *time.Location {
+	c.mu.RLock()
+	loc := c.loc
+	c.mu.RUnlock()
+	if loc == nil {
+		return time.UTC
+	}
+	return loc
+}
+
+// SetLocation updates the calendar-day alignment timezone on the collector.
+func (c *SpendLogCollector) SetLocation(loc *time.Location) {
+	if loc == nil {
+		return
+	}
+	c.mu.Lock()
+	c.loc = loc
+	c.mu.Unlock()
+}
+
+func (c *SpendLogCollector) now() time.Time {
+	if c.nowFunc != nil {
+		return c.nowFunc()
+	}
+	return time.Now()
 }
 
 // CollectSpendLogs fetches logs from the gateway proxy within [startTime, endTime]
@@ -96,6 +147,8 @@ func (c *SpendLogCollector) CollectSpendLogs(ctx context.Context, startTime, end
 
 	totalFetched := 0
 	insertedTotal := 0
+	skippedTotal := 0
+	var earliestInsertedAt time.Time
 	page := 1
 
 	for {
@@ -108,7 +161,7 @@ func (c *SpendLogCollector) CollectSpendLogs(ctx context.Context, startTime, end
 
 		entries, err := c.gatewayClient.GetSpendLogs(ctx, params)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch spend logs from gateway (page %d): %w", page, err)
+			return partialCollectResult(totalFetched, insertedTotal, skippedTotal, startTime, endTime, earliestInsertedAt), fmt.Errorf("failed to fetch spend logs from gateway (page %d): %w", page, err)
 		}
 
 		if len(entries) == 0 {
@@ -122,6 +175,25 @@ func (c *SpendLogCollector) CollectSpendLogs(ctx context.Context, startTime, end
 			logs = append(logs, ConvertEntryToSpendLog(entry))
 		}
 
+		// Identify which spend_ids in this batch are genuinely new before inserting so
+		// EarliestInsertedAt reflects only newly inserted rows, never pre-existing rows
+		// that happened to fall inside the overlap/replay window.
+		spendIDs := make([]string, len(logs))
+		for i, l := range logs {
+			spendIDs[i] = l.SpendID
+		}
+		var existingIDs []string
+		if err := c.db.WithContext(ctx).
+			Model(&entity.GatewaySpendLog{}).
+			Where("spend_id IN ?", spendIDs).
+			Pluck("spend_id", &existingIDs).Error; err != nil {
+			return partialCollectResult(totalFetched, insertedTotal, skippedTotal, startTime, endTime, earliestInsertedAt), fmt.Errorf("failed to check existing spend logs batch (page %d): %w", page, err)
+		}
+		existingSet := make(map[string]struct{}, len(existingIDs))
+		for _, id := range existingIDs {
+			existingSet[id] = struct{}{}
+		}
+
 		// Idempotent insertion using primary key (spend_id)
 		res := c.db.WithContext(ctx).
 			Clauses(clause.OnConflict{
@@ -130,28 +202,42 @@ func (c *SpendLogCollector) CollectSpendLogs(ctx context.Context, startTime, end
 			}).
 			Create(&logs)
 		if res.Error != nil {
-			return nil, fmt.Errorf("failed to insert spend logs batch (page %d): %w", page, res.Error)
+			return partialCollectResult(totalFetched, insertedTotal, skippedTotal, startTime, endTime, earliestInsertedAt), fmt.Errorf("failed to insert spend logs batch (page %d): %w", page, res.Error)
 		}
-		insertedTotal += int(res.RowsAffected)
+		inserted := int(res.RowsAffected)
+		insertedTotal += inserted
+		if batchSkipped := len(entries) - inserted; batchSkipped > 0 {
+			skippedTotal += batchSkipped
+		}
+		if inserted > 0 {
+			for _, l := range logs {
+				if _, existed := existingSet[l.SpendID]; existed {
+					continue
+				}
+				if l.RequestTime.Unix() > 0 && (earliestInsertedAt.IsZero() || l.RequestTime.Before(earliestInsertedAt)) {
+					earliestInsertedAt = l.RequestTime
+				}
+			}
+		}
 
-		if len(entries) < batchSize || page >= 10000 {
+		if len(entries) < batchSize {
 			break
 		}
 		page++
 	}
 
-	skippedCount := totalFetched - insertedTotal
-	if skippedCount < 0 {
-		skippedCount = 0
-	}
+	return partialCollectResult(totalFetched, insertedTotal, skippedTotal, startTime, endTime, earliestInsertedAt), nil
+}
 
+func partialCollectResult(totalFetched, insertedTotal, skippedTotal int, startTime, endTime, earliestInsertedAt time.Time) *CollectResult {
 	return &CollectResult{
-		TotalFetched:  totalFetched,
-		InsertedCount: insertedTotal,
-		SkippedCount:  skippedCount,
-		StartTime:     startTime,
-		EndTime:       endTime,
-	}, nil
+		TotalFetched:       totalFetched,
+		InsertedCount:      insertedTotal,
+		SkippedCount:       skippedTotal,
+		StartTime:          startTime,
+		EndTime:            endTime,
+		EarliestInsertedAt: earliestInsertedAt,
+	}
 }
 
 // ConvertEntryToSpendLog maps a raw gateway SpendLogEntry into an entity.GatewaySpendLog.
@@ -512,42 +598,84 @@ func (c *SpendLogCollector) GetLatestRequestTime(ctx context.Context) (*time.Tim
 	return parseScannedTime(raw)
 }
 
-// CollectIncremental performs watermark-driven incremental spend log pulling.
-// It derives the start time from MAX(request_time) minus an overlapWindow (default 5m)
-// to prevent edge dropping, capped by maxLookback (default 30d).
-// If the table is empty (cold start), it pulls from Now() - 48h.
-func (c *SpendLogCollector) CollectIncremental(ctx context.Context, overlapWindow, maxLookback time.Duration) (*CollectResult, error) {
+// CollectIncremental performs self-healing watermark-driven incremental spend log pulling:
+//   - Online operation (in-memory checkpoint active): pulls [lastCheckedAt - overlapWindow, now]
+//     so idle periods stay strictly bounded without window dilation. If the wall clock moves
+//     backward behind lastCheckedAt, it replays [now - overlapWindow, now] and rebases the
+//     checkpoint on success.
+//   - Restart recovery (checkpoint unset, DB has records): resumes from MAX(request_time) - overlapWindow
+//     with no lookback cap, streaming in batches to guarantee zero data loss.
+//   - Cold start (checkpoint unset, DB empty): starts at 00:00:00 in the configured timezone for the
+//     calendar day lookbackHours (default 48) before now, matching daily aggregation boundaries.
+//
+// Calls are serialized per collector instance so overlapping invocations cannot clear each other's
+// pendingReplayStart or race on lastCheckedAt. On success, lastCheckedAt updates to now even when
+// zero new logs are returned.
+func (c *SpendLogCollector) CollectIncremental(ctx context.Context, overlapWindow time.Duration, lookbackHours int) (*CollectResult, error) {
 	if overlapWindow <= 0 {
-		overlapWindow = 5 * time.Minute
+		overlapWindow = defaultOverlapWindow
 	}
-	if maxLookback <= 0 {
-		maxLookback = 30 * 24 * time.Hour
-	}
-
-	latestTime, err := c.GetLatestRequestTime(ctx)
-	if err != nil {
-		return nil, err
+	if lookbackHours <= 0 {
+		lookbackHours = defaultLookbackHours
 	}
 
-	now := time.Now().UTC()
+	c.collectMu.Lock()
+	defer c.collectMu.Unlock()
+
+	now := c.now().UTC()
 	var startTime time.Time
 
-	earliestAllowed := now.Add(-maxLookback)
-	if latestTime == nil {
-		// Cold start: table is completely empty, initialize baseline (48h)
-		startTime = now.Add(-48 * time.Hour)
-	} else {
-		// Incremental: resume from watermark minus safety overlap window
-		startTime = latestTime.UTC().Add(-overlapWindow)
-	}
+	c.mu.RLock()
+	checkpoint := c.lastCheckedAt
+	replayStart := c.pendingReplayStart
+	c.mu.RUnlock()
 
-	if startTime.Before(earliestAllowed) {
-		startTime = earliestAllowed
+	if !checkpoint.IsZero() {
+		if checkpoint.After(now) {
+			// Wall clock stepped backward: query an overlap window ending at corrected now.
+			startTime = now.Add(-overlapWindow)
+		} else {
+			// Online operation: bound query window using in-memory progress checkpoint.
+			startTime = checkpoint.UTC().Add(-overlapWindow)
+		}
+	} else if !replayStart.IsZero() {
+		// Incomplete startup/cold-start replay: keep the original lower bound so
+		// partially committed newest-first pages cannot advance MAX(request_time)
+		// past older uncommitted pages on retry.
+		startTime = replayStart
+	} else {
+		latestTime, err := c.GetLatestRequestTime(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if latestTime == nil {
+			// Cold start: align to 00:00:00 in configured timezone for full calendar-day coverage.
+			startTime = dayAlignedLookbackStart(now, lookbackHours, c.Location())
+		} else {
+			// Restart recovery: uncapped watermark replay from persisted MAX(request_time).
+			startTime = latestTime.UTC().Add(-overlapWindow)
+		}
 	}
 
 	if startTime.After(now) {
 		startTime = now
 	}
 
-	return c.CollectSpendLogs(ctx, startTime, now)
+	if checkpoint.IsZero() && replayStart.IsZero() {
+		c.mu.Lock()
+		c.pendingReplayStart = startTime
+		c.mu.Unlock()
+	}
+
+	res, err := c.CollectSpendLogs(ctx, startTime, now)
+	if err != nil {
+		return res, err
+	}
+
+	c.mu.Lock()
+	c.lastCheckedAt = now
+	c.pendingReplayStart = time.Time{}
+	c.mu.Unlock()
+
+	return res, nil
 }

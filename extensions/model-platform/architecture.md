@@ -61,8 +61,8 @@ flowchart LR
   *Tradeoff*: Concurrent registrations risk overwrite races, and default upgrades must not overwrite explicit user choices. Decided on atomic conditional SQL and preference tracking.
 - **ADR-5: Three-Stage Embedding Lifecycle (Active -> Deprecated -> Tombstoned)**  
   *Tradeoff*: Revoking embedding models breaks retrieval for existing knowledge bases. Decided to retain gateway read-only access for deprecated models until reference count hits zero.
-- **ADR-6: Authoritative Gateway Spend Logs, Fine-Grained Token Breakdown & Idempotent Replacement Rollup**  
-  *Tradeoff*: App-level metering is unreliable and network retries risk double-billing. Also, modern prompt caching and reasoning models demand transparent audit breakdowns (cache read discounts, reasoning tokens, cache savings) rather than coarse total tokens. Decided on immutable spend log staging capturing normalized cache/reasoning metrics with 48h calendar-aligned replacement upserts. Late logs older than 48 hours are backfilled via on-demand historical window recomputation (`RunWindow(ctx, lookbackHours)`).
+- **ADR-6: Authoritative Gateway Spend Logs, Fine-Grained Token Breakdown & Self-Healing Replacement Rollup**  
+  *Tradeoff*: App-level metering is unreliable and network retries risk double-billing. Also, modern prompt caching and reasoning models demand transparent audit breakdowns (cache read discounts, reasoning tokens, cache savings) rather than coarse total tokens, while long idle spans and multi-day outages expose fixed-window polling to query dilation or aggregation gaps. Decided on immutable spend log staging capturing normalized cache/reasoning metrics, bounded in-memory checkpoint polling during online operation, uncapped watermark replay on restart, day-aligned cold starts governed by `METERING_LOOKBACK_HOURS` (default 48h), and calendar-aligned replacement upserts with automatic dynamic multi-day catch-up aggregation whenever historical logs older than the rolling window are recovered.
 
 ---
 
