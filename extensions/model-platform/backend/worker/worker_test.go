@@ -29,8 +29,8 @@ func setupDB(t *testing.T) *gorm.DB {
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
-	if err := db.AutoMigrate(&entity.TenantReconcileRecord{}); err != nil {
-		t.Fatalf("failed to migrate reconcile record: %v", err)
+	if err := db.AutoMigrate(&entity.TenantReconcileRecord{}, &entity.GatewaySpendLog{}, &entity.TenantUsageDaily{}); err != nil {
+		t.Fatalf("failed to migrate model platform tables: %v", err)
 	}
 	db.Exec("CREATE TABLE tenant (id VARCHAR(32) PRIMARY KEY, status VARCHAR(1));")
 	db.Exec("CREATE TABLE user_tenant (id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32));")
@@ -113,6 +113,40 @@ func TestStart_TenantCreationReachesGateway(t *testing.T) {
 	for generateCalls.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("gateway never received /key/generate after tenant creation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStart_PollsSpendLogs(t *testing.T) {
+	var spendLogCalls atomic.Int32
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/spend/logs/v2" {
+			spendLogCalls.Add(1)
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer gw.Close()
+
+	db := setupDB(t)
+	configureGateway(t, gw.URL)
+	SetDBProvider(func() *gorm.DB { return db })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workers, err := Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer workers.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for spendLogCalls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("metering daemon never polled /spend/logs/v2")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

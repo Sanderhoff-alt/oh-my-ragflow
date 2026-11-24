@@ -7,6 +7,7 @@ import (
 
 	"ragflow/extensions/model-platform/backend/event"
 	"ragflow/extensions/model-platform/backend/gateway"
+	"ragflow/extensions/model-platform/backend/metering"
 	"ragflow/extensions/model-platform/backend/reconciler"
 
 	"gorm.io/gorm"
@@ -30,6 +31,7 @@ func SetDBProvider(provider func() *gorm.DB) {
 // Workers owns the model platform background loops of one server process.
 type Workers struct {
 	controller *reconciler.SelfHealingController
+	daemon     *metering.MeteringDaemon
 }
 
 // Start launches the background workers. Without a configured gateway nothing is started,
@@ -53,10 +55,14 @@ func Start(ctx context.Context) (*Workers, error) {
 	controller := reconciler.NewSelfHealingController(db, event.GetDefaultBus(), tenantReconciler)
 	controller.Start(ctx)
 
-	return &Workers{controller: controller}, nil
+	daemon := metering.NewMeteringDaemon(db, metering.NewSpendLogCollector(db, client), metering.NewUsagePipeline(db))
+	daemon.Start(ctx)
+
+	return &Workers{controller: controller, daemon: daemon}, nil
 }
 
 // Stop terminates the background workers and waits for in-flight work to finish.
 func (w *Workers) Stop() {
+	w.daemon.Stop()
 	w.controller.Stop()
 }
