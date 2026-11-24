@@ -21,6 +21,7 @@ type mockLiteLLMProxy struct {
 
 type virtualKeyRecord struct {
 	key       string
+	alias     string
 	models    map[string]bool
 	maxBudget *float64
 	spend     float64
@@ -87,6 +88,7 @@ func (m *mockLiteLLMProxy) handleManagementEndpoints(w http.ResponseWriter, r *h
 		}
 		record := &virtualKeyRecord{
 			key:       generatedKey,
+			alias:     req.KeyName,
 			models:    modelsMap,
 			maxBudget: req.MaxBudget,
 			spend:     0.0,
@@ -109,14 +111,21 @@ func (m *mockLiteLLMProxy) handleManagementEndpoints(w http.ResponseWriter, r *h
 			return
 		}
 		deleted := make([]string, 0)
-		for _, k := range req.Keys {
-			if _, exists := m.keys[k]; exists {
-				delete(m.keys, k)
-				deleted = append(deleted, k)
+		for _, alias := range req.KeyAliases {
+			for k, rec := range m.keys {
+				if rec.alias == alias {
+					delete(m.keys, k)
+					deleted = append(deleted, alias)
+				}
 			}
 		}
+		if len(deleted) == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"detail":{"error":"No keys found"}}`))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(DeleteKeyResponse{DeletedKeys: deleted})
+		json.NewEncoder(w).Encode(map[string][]string{"deleted_keys": deleted})
 
 	case "/key/info":
 		keyParam := r.URL.Query().Get("key")
@@ -240,7 +249,7 @@ func TestGatewayPermissions_ManagementEndpointBlocking(t *testing.T) {
 	}
 
 	// 3. Tenant Virtual Key attempts to call /key/delete
-	_, err = tenantClient.DeleteKey(context.Background(), []string{tenantVirtualKey})
+	err = tenantClient.DeleteKeyByAlias(context.Background(), "tenant-rogue-target")
 	if err == nil {
 		t.Fatal("expected virtual key to be blocked from /key/delete, but succeeded!")
 	}

@@ -10,6 +10,7 @@ import (
 	"ragflow/extensions/model-platform/backend/dao"
 	"ragflow/extensions/model-platform/backend/entity"
 	"ragflow/extensions/model-platform/backend/event"
+	"ragflow/extensions/model-platform/backend/gateway"
 	rentity "ragflow/internal/entity"
 )
 
@@ -252,7 +253,7 @@ func TestTenantDecommissioner_GatewayOutage_PreservesStateForRetry(t *testing.T)
 	}
 }
 
-func TestTenantDecommissioner_FallbackToKeyAliasWhenInstanceMissing(t *testing.T) {
+func TestTenantDecommissioner_RevokesByAliasWhenInstanceMissing(t *testing.T) {
 	db := setupTestDB(t)
 	mockClient := newMockGatewayClient()
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
@@ -271,11 +272,80 @@ func TestTenantDecommissioner_FallbackToKeyAliasWhenInstanceMissing(t *testing.T
 	}
 
 	mockClient.mu.Lock()
-	deletedCount := len(mockClient.deletedKeys)
+	deleted := append([]string(nil), mockClient.deletedKeys...)
+	remaining := len(mockClient.generated)
 	mockClient.mu.Unlock()
 
-	if deletedCount == 0 {
-		t.Error("expected key alias to be revoked even when instance row was deleted")
+	if len(deleted) != 1 || deleted[0] != "tenant_"+tenantID {
+		t.Errorf("expected key revoked by alias tenant_%s, got %v", tenantID, deleted)
+	}
+	if remaining != 0 {
+		t.Errorf("expected gateway key to be gone, %d remaining", remaining)
+	}
+}
+
+func TestTenantDecommissioner_RevokesByAliasIgnoringStoredCredential(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := newMockGatewayClient()
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+	decommissioner := NewTenantDecommissioner(mockClient)
+
+	ctx := context.Background()
+	tenantID := "tenant-decom-stale-credential"
+	createTestTenantInDB(db, tenantID)
+	_ = rec.Reconcile(ctx, db, tenantID)
+
+	// A rotated or tampered local credential must not influence revocation
+	db.Model(&rentity.TenantModelInstance{}).
+		Where("instance_name = ?", PlatformInstanceName).
+		Update("api_key", "sk-stale-local-credential")
+
+	if err := decommissioner.DecommissionTenant(ctx, db, tenantID); err != nil {
+		t.Fatalf("DecommissionTenant failed: %v", err)
+	}
+
+	mockClient.mu.Lock()
+	deleted := append([]string(nil), mockClient.deletedKeys...)
+	remaining := len(mockClient.generated)
+	mockClient.mu.Unlock()
+
+	if len(deleted) != 1 || deleted[0] != "tenant_"+tenantID {
+		t.Errorf("expected key revoked by alias tenant_%s, got %v", tenantID, deleted)
+	}
+	if remaining != 0 {
+		t.Errorf("expected gateway key to be gone, %d remaining", remaining)
+	}
+
+	var instance rentity.TenantModelInstance
+	db.Where("instance_name = ?", PlatformInstanceName).First(&instance)
+	if instance.APIKey != "" || instance.Status != "deleted" {
+		t.Errorf("expected instance scrubbed and deleted, got api_key=%q status=%q", instance.APIKey, instance.Status)
+	}
+}
+
+func TestTenantDecommissioner_GatewayKeyAlreadyAbsent_Decommissions(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := newMockGatewayClient()
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+	decommissioner := NewTenantDecommissioner(mockClient)
+
+	ctx := context.Background()
+	tenantID := "tenant-decom-already-absent"
+	createTestTenantInDB(db, tenantID)
+	_ = rec.Reconcile(ctx, db, tenantID)
+
+	// Key was already revoked out-of-band: gateway answers 404 for the alias
+	mockClient.mu.Lock()
+	mockClient.generated = make(map[string]*gateway.GenerateKeyRequest)
+	mockClient.mu.Unlock()
+
+	if err := decommissioner.DecommissionTenant(ctx, db, tenantID); err != nil {
+		t.Fatalf("DecommissionTenant failed for already-absent key: %v", err)
+	}
+
+	state, err := dao.NewReconcileDAO().GetByTenantID(ctx, db, tenantID)
+	if err != nil || state.Status != entity.StatusDeleted {
+		t.Fatalf("expected status deleted, got %v (err=%v)", state, err)
 	}
 }
 
