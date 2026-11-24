@@ -6,6 +6,6 @@ const apiAdminPrefix = '/api/v1/admin';
 
 export default {
   adminModelPlatformHealth: `${apiAdminPrefix}/model-platform/health`,
-  adminModelPlatformProviders: `${apiAdminPrefix}/model-platform/providers`,
+  adminModelPlatformModels: `${apiAdminPrefix}/model-platform/models`,
   adminModelPlatformUsage: `${apiAdminPrefix}/model-platform/usage`,
 };

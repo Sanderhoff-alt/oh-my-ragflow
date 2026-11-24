@@ -38,7 +38,7 @@ English | [简体中文](implementation-plan.zh-CN.md)
   - [5.2 Explicit Preference Tracking & Sticky Guard](#52-explicit-preference-tracking--sticky-guard)
   - [5.3 Three-Stage Embedding Lifecycle Protection](#53-three-stage-embedding-lifecycle-protection)
   - [5.4 Dataset Vector Space Immutability & Deprecated Model Guard (DatasetEmbeddingGuardMiddleware)](#54-dataset-vector-space-immutability--deprecated-model-guard-datasetembeddingguardmiddleware)
-  - [5.5 Model Onboarding Fan-out to All Tenants](#55-model-onboarding-fan-out-to-all-tenants)
+  - [5.5 Managed Model Catalog, Fan-out and Lifecycle](#55-managed-model-catalog-fan-out-and-lifecycle)
 - [6. Dimension 5: Metering & Authoritative Reconciliation Pipeline](#6-dimension-5-metering--authoritative-reconciliation-pipeline)
   - [6.1 Authoritative Gateway Spend Logs & Raw Staging Deduplication](#61-authoritative-gateway-spend-logs--raw-staging-deduplication)
   - [6.2 48-Hour Rolling Lookback Replacement Upsert Pipeline](#62-48-hour-rolling-lookback-replacement-upsert-pipeline)
@@ -379,27 +379,40 @@ stateDiagram-v2
 - **Empty Dataset Mutation Guard**: Blocks switching an empty dataset's embedding model to a retired/deprecated model. Returns HTTP 400 Bad Request.
 - **Non-Empty Immutability Guard**: If the dataset contains parsed documents or chunks (`chunk_num > 0 || doc_num > 0`) and the request mutates `embedding_model`, it aborts with HTTP 400 Bad Request.
 
-### 5.5 Model Onboarding Fan-out to All Tenants
-An administrator onboards a model once with `POST /api/v1/admin/model-platform/models` (`model_name`, `model_type` as `ModelType` bit flags: chat, embedding or rerank). The model must already be routed by the gateway; onboarding verifies it with `GET /v1/models`, so upstream provider credentials never pass through RAGFlow.
+### 5.5 Managed Model Catalog, Fan-out and Lifecycle
+`platform_managed_model` is the single source of truth for what the platform offers. The catalog only records the administrator's intent (`active` or `retired`, plus at most one `is_default` per type). Everything a tenant has is derived from it by one level-triggered worker. An administrator onboards a model once with `POST /api/v1/admin/model-platform/models` (`model_name`, `model_type` as `ModelType` bit flags: chat, embedding or rerank). The model must already be routed by the gateway; onboarding verifies it with `GET /v1/models`, so upstream provider credentials never pass through RAGFlow.
 
 ```mermaid
 flowchart LR
-    Admin["POST models"] --> Tx["One transaction"]
-    Tx --> Cat["platform_managed_model"]
+    Admin["POST models<br>retire, reactivate, default"] --> Tx["One transaction"]
+    Tx --> Cat["platform_managed_model<br>active or retired, is_default"]
     Tx --> Task["platform_model_publish_task"]
-    Tx --> Items["platform_model_publish_item<br>one per Ready tenant"]
-    Sweep["Worker sweep"] -->|"Ready tenants missing the model"| Items
-    Items --> Worker["Fan-out worker"]
-    Worker --> GW["1. Rebuild virtual key whitelist<br>existing models + new model"]
-    GW --> DB["2. Insert tenant_model<br>status=active, is_managed=true"]
+    Tx --> Items["platform_model_publish_item<br>one per tenant that must change"]
+    Sweep["Worker sweep"] -->|"tenants that differ from the catalog"| Items
+    Items --> Worker["Convergence worker"]
+    Worker -->|"reads the catalog status now"| Cat
+    Worker --> GW["1. Rebuild virtual key whitelist"]
+    GW --> DB["2. Change tenant_model"]
+    DB --> Def["3. If the model is the default:<br>UpgradeDefaultModel"]
 ```
 
-- **Gateway first, database second**: if the worker stops between the two steps, the key allows a model the tenant cannot see yet. The reverse order would show a model that the gateway rejects. LiteLLM `/key/update` replaces the whole `models` list, so the whitelist is always rebuilt from the active `tenant_model` rows plus the new model (`reconciler.IncludeModelInWhitelist`), under the same per-instance lock as the embedding lifecycle.
+The state of a model in one tenant is derived from the catalog intent, never stored in the catalog:
+
+| Catalog intent | Model type | That tenant's references | `tenant_model` | Whitelist |
+| --- | --- | --- | --- | --- |
+| active | any | any | `active` | included |
+| retired | embedding | active knowledge bases > 0 | `active` + `deprecated`, `read_only` | kept |
+| retired | embedding | none | `disabled` + `tombstoned` | removed |
+| retired | chat, rerank, others | any | `disabled` + `tombstoned` | removed |
+
+- **Gateway first, database second**: if the worker stops between the two steps, the key allows a model the tenant cannot see yet. The reverse order would show a model that the gateway rejects. LiteLLM `/key/update` replaces the whole `models` list, so the whitelist is always rebuilt from the active `tenant_model` rows (`reconciler.IncludeModelInWhitelist`). A row lock on the `tenant_model_instance` row serializes the rebuild across replicas, on top of the in-process mutex shared with the embedding lifecycle.
+- **Retire and reactivate**: `POST /models/:id/retire` and `/reactivate` flip the catalog status and answer 202 with a task. The worker applies the status it reads when it processes an item, so an item queued by an outdated request follows the latest intent. Embedding models use `EmbeddingLifecycleManager` (deprecated while the tenant still has knowledge bases, then tombstoned by the sweep), other models use `NonEmbeddingLifecycleManager` (straight to tombstoned). The platform default of a type cannot be retired, and users who pinned a retired model keep their choice; the retire response reports how many there are.
+- **Set default**: `PUT /models/:id/default` switches `is_default` in one transaction and creates an item for every Ready tenant. After the tenant has the model, `StickyGuard.UpgradeDefaultModel` moves `platform_default` users with the tenant's own `tenant_model` id and keeps `user_explicit` users (#49). Upgraded and preserved counts are stored per item and summed in the task progress.
+- **Cold start and new tenants**: `Reconcile` reads the active catalog for the key whitelist, the `tenant_model` rows and the initial user defaults. An empty catalog still creates the managed provider and instance and generates the key with the deny-all placeholder, because LiteLLM treats an empty `models` list as unrestricted. Deployments that predate the catalog are adopted once by `BackfillManagedCatalog`, which keeps the legacy `gpt-4o-mini` and `text-embedding-3-small` as the defaults of their type.
 - **Optimistic claim**: each item is claimed with `UPDATE ... WHERE version = ? AND status = 'pending'`, so several replicas can run the worker. A `running` item untouched for 2 minutes returns to `pending`. Failures retry with the Tier 2 backoff policy and become `failed` after 20 attempts until `POST .../publish/tasks/:id/retry`.
-- **Level-triggered sweep**: every tick adds items for Ready tenants that still lack an active catalog model, so tenants that become Ready after the request are covered. A tenant with an existing `tenant_model` row in any status is skipped, so a retired model is never resurrected.
-- **Progress**: `GET .../publish/tasks/:id` counts items by status (total, succeeded, pending, failed), derives the task status (`running`, `completed`, `partial_failed`) and lists failed tenants with their last error.
-- **Idempotency**: publishing the same model again only creates items for tenants still missing it. A disabled catalog entry or a different `model_type` for an existing name returns 409.
-- **Defaults are untouched**: onboarding never changes a tenant's or user's default model.
+- **Level-triggered sweep**: every tick adds items for Ready tenants that lack an active catalog model and for tenants that still hold a retired one, so tenants that become Ready later are covered. A row disabled by someone else (no retirement flag) is never resurrected.
+- **Progress and catalog view**: `GET .../publish/tasks/:id` counts items by status, derives the task status (`running`, `completed`, `partial_failed`) and lists failed tenants. `GET /models` lists the catalog with the number of tenants in each derived state and the knowledge bases and assistants that reference each model.
+- **Defaults are never changed by onboarding**: a model only becomes a default through `PUT /models/:id/default`.
 
 ---
 
