@@ -43,7 +43,7 @@ flowchart LR
 
 1. **Non-Invasive Extensibility**: `upstream/ragflow` diff is strictly empty. Enhancements rely entirely on workspace overlays, Go build tag stubs, and external services.
 2. **Zero-Leakage Credential Boundary**: Root provider API keys reside strictly inside the gateway. Tenants receive only scoped virtual keys (`sk-tenant-...`).
-3. **Transaction Decoupled Events**: Remote network RPCs are strictly prohibited inside database transactions. Tenant lifecycle hooks dispatch asynchronously via post-commit transaction callbacks and an event bus (`RegisterPostCommitHook` / `event.EventBus`).
+3. **Transaction Decoupled Events**: Remote network RPCs are strictly prohibited inside database transactions. Tenant lifecycle hooks dispatch asynchronously once the transaction is visible (`event.PreFlightCheck`) through an event bus (`event.EventBus`).
 4. **Dataset Vector Space Immutability**: Once a dataset contains parsed chunks, its embedding model is permanently frozen. The API rejects mutation attempts with HTTP 400.
 5. **Physical Zero-Billing Bypass**: Self-owned models connect directly to external endpoints, bypassing the gateway physically and incurring strictly $0.00 platform spend.
 
