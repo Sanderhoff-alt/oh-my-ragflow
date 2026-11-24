@@ -10,6 +10,7 @@ import (
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // instanceWhitelistLocks serializes whitelist rebuilds per platform instance in this process,
@@ -27,6 +28,27 @@ func LockInstanceWhitelist(instanceID string) (unlock func()) {
 	mu := instanceWhitelistMutex(instanceID)
 	mu.Lock()
 	return mu.Unlock
+}
+
+// WithInstanceWhitelistLock runs fn as the only writer of an instance's whitelist and tenant_model rows,
+// across goroutines (in-process mutex) and across replicas (row lock on the tenant_model_instance row,
+// held in a separate transaction while fn runs on its own connection). SQLite has no row locks and is
+// only used by tests, so it relies on the in-process mutex alone.
+func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
+	unlock := LockInstanceWhitelist(instanceID)
+	defer unlock()
+
+	if db.Dialector.Name() == "sqlite" {
+		return fn()
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var instance rentity.TenantModelInstance
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
+			Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			return fmt.Errorf("failed to lock instance %s: %w", instanceID, err)
+		}
+		return fn()
+	})
 }
 
 type gatewayOverride int

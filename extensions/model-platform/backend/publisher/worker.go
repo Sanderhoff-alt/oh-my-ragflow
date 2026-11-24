@@ -12,7 +12,6 @@ import (
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -251,31 +250,31 @@ func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublis
 		return fmt.Errorf("managed platform instance unavailable: %w", err)
 	}
 
-	unlock := reconciler.LockInstanceWhitelist(instance.ID)
-	defer unlock()
+	return reconciler.WithInstanceWhitelistLock(ctx, db, instance.ID, func() error {
+		var existing []rentity.TenantModel
+		if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, task.ModelName, task.ModelType).
+			Limit(1).Find(&existing).Error; err != nil {
+			return err
+		}
+		if len(existing) > 0 {
+			return nil
+		}
 
-	var existing []rentity.TenantModel
-	if err := db.Where("instance_id = ? AND model_name = ?", instance.ID, task.ModelName).Limit(1).Find(&existing).Error; err != nil {
-		return err
-	}
-	if len(existing) > 0 {
-		return nil
-	}
+		if err := reconciler.IncludeModelInWhitelist(ctx, db, w.client, &instance, task.ModelName, task.ModelType); err != nil {
+			return err
+		}
 
-	if err := reconciler.IncludeModelInWhitelist(ctx, db, w.client, &instance, task.ModelName, task.ModelType); err != nil {
-		return err
-	}
-
-	extra, _ := json.Marshal(map[string]interface{}{"is_managed": true})
-	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&rentity.TenantModel{
-		ID:         newID(),
-		ModelName:  task.ModelName,
-		ProviderID: provider.ID,
-		InstanceID: instance.ID,
-		ModelType:  task.ModelType,
-		Status:     "active",
-		Extra:      string(extra),
-	}).Error
+		extra, _ := json.Marshal(map[string]interface{}{"is_managed": true})
+		return db.Create(&rentity.TenantModel{
+			ID:         newID(),
+			ModelName:  task.ModelName,
+			ProviderID: provider.ID,
+			InstanceID: instance.ID,
+			ModelType:  task.ModelType,
+			Status:     "active",
+			Extra:      string(extra),
+		}).Error
+	})
 }
 
 func truncate(s string, n int) string {

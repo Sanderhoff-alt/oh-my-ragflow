@@ -129,31 +129,30 @@ func (p *Publisher) Publish(ctx context.Context, db *gorm.DB, req Request) (*Res
 	return result, nil
 }
 
-// ensureCatalogEntry creates the active catalog row, or accepts an existing active one.
+// ensureCatalogEntry creates the active catalog row, or accepts an existing active one with the same type.
+// model_name is unique, so a concurrent publish of the same name loses the insert and re-reads the winner.
 func ensureCatalogEntry(tx *gorm.DB, req Request) error {
-	var sameName []entity.PlatformManagedModel
-	if err := tx.Where("model_name = ?", req.ModelName).Find(&sameName).Error; err != nil {
-		return err
-	}
-	if len(sameName) > 0 {
-		m := sameName[0]
-		if m.ModelType != req.ModelType {
-			return fmt.Errorf("%w: %q is already published with model_type %d", ErrModelConflict, req.ModelName, m.ModelType)
-		}
-		if m.Status != entity.ManagedModelStatusActive {
-			return fmt.Errorf("%w: %q is %s and must be reactivated instead of published", ErrModelConflict, req.ModelName, m.Status)
-		}
-		return nil
-	}
-
 	row := entity.PlatformManagedModel{
 		ID:        newID(),
 		ModelName: req.ModelName,
 		ModelType: req.ModelType,
 		Status:    entity.ManagedModelStatusActive,
 	}
-	// A concurrent publish of the same model may win the insert; the unique index makes this a no-op.
-	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+		return err
+	}
+
+	var current entity.PlatformManagedModel
+	if err := tx.Where("model_name = ?", req.ModelName).First(&current).Error; err != nil {
+		return err
+	}
+	if current.ModelType != req.ModelType {
+		return fmt.Errorf("%w: %q is already published with model_type %d", ErrModelConflict, req.ModelName, current.ModelType)
+	}
+	if current.Status != entity.ManagedModelStatusActive {
+		return fmt.Errorf("%w: %q is %s and must be reactivated instead of published", ErrModelConflict, req.ModelName, current.Status)
+	}
+	return nil
 }
 
 // readyTenantsMissingModel returns Ready tenants that have no tenant_model row (in any status, so a

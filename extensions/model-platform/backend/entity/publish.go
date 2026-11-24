@@ -2,18 +2,19 @@ package entity
 
 import "time"
 
-// Catalog status values of PlatformManagedModel.
+// Catalog status values of PlatformManagedModel. The catalog only records the administrator's intent;
+// deprecated and tombstoned are per-tenant states derived from it (see tenant_model extra flags).
 const (
-	ManagedModelStatusActive     = "active"
-	ManagedModelStatusDeprecated = "deprecated"
-	ManagedModelStatusDisabled   = "disabled"
+	ManagedModelStatusActive  = "active"
+	ManagedModelStatusRetired = "retired"
 )
 
 // PlatformManagedModel is the administrator-owned catalog of platform managed models.
+// model_name is unique because the gateway routes and the virtual key whitelists are keyed by name.
 type PlatformManagedModel struct {
 	ID         string  `gorm:"column:id;primaryKey;size:32" json:"id"`
-	ModelName  string  `gorm:"column:model_name;size:128;not null;uniqueIndex:idx_model_type_name" json:"model_name"`
-	ModelType  int     `gorm:"column:model_type;not null;index;uniqueIndex:idx_model_type_name" json:"model_type"` // bit flags of ragflow/internal/entity.ModelType
+	ModelName  string  `gorm:"column:model_name;size:128;not null;uniqueIndex:idx_managed_model_name" json:"model_name"`
+	ModelType  int     `gorm:"column:model_type;not null;index" json:"model_type"` // bit flags of ragflow/internal/entity.ModelType
 	IsDefault  bool    `gorm:"column:is_default;not null;default:false;index" json:"is_default"`
 	Status     string  `gorm:"column:status;size:32;not null;default:'active';index" json:"status"`
 	Extra      *string `gorm:"column:extra;type:text" json:"extra,omitempty"`

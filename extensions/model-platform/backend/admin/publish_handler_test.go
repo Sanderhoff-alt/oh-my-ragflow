@@ -97,7 +97,7 @@ func TestPublishAPI_PublishAndProgress(t *testing.T) {
 
 func TestPublishAPI_ErrorMapping(t *testing.T) {
 	r, db := setupPublishAdminServer(t, "deepseek-v3")
-	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusDisabled})
+	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusRetired})
 
 	cases := []struct {
 		name string
