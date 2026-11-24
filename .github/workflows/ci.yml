@@ -92,6 +92,10 @@ jobs:
           sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
       - name: Download native libraries and runtime resources
         working-directory: build/ragflow
+        env:
+          # The upstream pyproject pins a China-only PyPI mirror (mirrors.aliyun.com) as its default index,
+          # and that mirror answers 403 to GitHub runners. The script only needs public PyPI packages.
+          UV_NO_CONFIG: '1'
         run: uv run tools/scripts/download_dev_deps.py
       - name: Cache C++ tokenizer library
         id: cache-tokenizer
