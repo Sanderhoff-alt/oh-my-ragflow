@@ -157,6 +157,15 @@ func (r *KeyRotator) rotateLocked(ctx context.Context, db *gorm.DB, tenantID, op
 		return err
 	})
 	if err != nil {
+		// The error may come from a connection that dropped while the commit went through, in which case
+		// the record already names the new key and revoking it would leave the tenant on a dead credential.
+		verifyCtx, cancelVerify := context.WithTimeout(context.Background(), rotationCleanupTimeout)
+		defer cancelVerify()
+		if committed, getErr := r.reconcileDAO.GetByTenantID(verifyCtx, db, tenantID); getErr == nil && committed.KeyHash == newHash {
+			err = nil
+		}
+	}
+	if err != nil {
 		// Nothing points at the new key, so it is an orphan. Revoke it by its own hash; if that fails the
 		// dirty marker lets the sweeper do it.
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), rotationCleanupTimeout)
