@@ -39,16 +39,7 @@ func generatePrefID() string {
 }
 
 func isSupportedModelType(mt int) bool {
-	switch mt {
-	case int(rentity.ModelTypeChat),
-		int(rentity.ModelTypeEmbedding),
-		int(rentity.ModelTypeRerank),
-		int(rentity.ModelTypeSpeech2Text),
-		int(rentity.ModelTypeImage2Text):
-		return true
-	default:
-		return false
-	}
+	return mpentity.IsManagedModelType(mt)
 }
 
 // SetUserExplicitPreference records that a user intentionally chose a specific model,
@@ -74,7 +65,8 @@ func (g *StickyGuard) SetUserExplicitPreference(
 	if modelID == "" {
 		return errors.New("modelID cannot be empty")
 	}
-	if !isSupportedModelType(modelType) {
+	spec, ok := mpentity.LookupModelSlot(modelType)
+	if !ok {
 		return fmt.Errorf("unsupported model type: %d", modelType)
 	}
 	if err := ctx.Err(); err != nil {
@@ -101,33 +93,17 @@ func (g *StickyGuard) SetUserExplicitPreference(
 		nowMilli := now.UnixMilli()
 		nowDate := now.Truncate(time.Second)
 
-		// 2. Update user_tenant based on model type (with stale pointer clearing)
-		updates := map[string]interface{}{
-			"update_time": &nowMilli,
-			"update_date": &nowDate,
-		}
-
 		var tIDPtr *string
 		if tenantModelID != "" {
 			tIDPtr = &tenantModelID
 		}
 
-		switch modelType {
-		case int(rentity.ModelTypeChat):
-			updates["llm_id"] = modelID
-			updates["tenant_llm_id"] = tIDPtr
-		case int(rentity.ModelTypeEmbedding):
-			updates["embd_id"] = modelID
-			updates["tenant_embd_id"] = tIDPtr
-		case int(rentity.ModelTypeRerank):
-			updates["rerank_id"] = modelID
-			updates["tenant_rerank_id"] = tIDPtr
-		case int(rentity.ModelTypeSpeech2Text):
-			updates["asr_id"] = modelID
-			updates["tenant_asr_id"] = tIDPtr
-		case int(rentity.ModelTypeImage2Text):
-			updates["img2txt_id"] = modelID
-			updates["tenant_img2txt_id"] = tIDPtr
+		// 2. Update user_tenant based on model type (with stale pointer clearing)
+		updates := map[string]interface{}{
+			spec.IDColumn:       modelID,
+			spec.TenantIDColumn: tIDPtr,
+			"update_time":       &nowMilli,
+			"update_date":       &nowDate,
 		}
 
 		if err := tx.Model(&rentity.UserTenant{}).
@@ -153,24 +129,6 @@ func (g *StickyGuard) SetUserExplicitPreference(
 			}),
 		}).Create(&pref).Error
 	})
-}
-
-// userTenantSlotColumns returns the user_tenant columns holding the model reference and the tenant model id
-// of a model type.
-func userTenantSlotColumns(modelType int) (idColumn, tenantModelColumn string) {
-	switch modelType {
-	case int(rentity.ModelTypeChat):
-		return "llm_id", "tenant_llm_id"
-	case int(rentity.ModelTypeEmbedding):
-		return "embd_id", "tenant_embd_id"
-	case int(rentity.ModelTypeRerank):
-		return "rerank_id", "tenant_rerank_id"
-	case int(rentity.ModelTypeSpeech2Text):
-		return "asr_id", "tenant_asr_id"
-	case int(rentity.ModelTypeImage2Text):
-		return "img2txt_id", "tenant_img2txt_id"
-	}
-	return "", ""
 }
 
 // ReplaceRetiredDefault moves every user of the tenant whose default of modelType is the retired model to the
@@ -199,8 +157,8 @@ func (g *StickyGuard) ReplaceRetiredDefault(
 	if retiredModelID == "" {
 		return 0, errors.New("retiredModelID cannot be empty")
 	}
-	idColumn, tenantModelColumn := userTenantSlotColumns(modelType)
-	if idColumn == "" {
+	spec, ok := mpentity.LookupModelSlot(modelType)
+	if !ok {
 		return 0, fmt.Errorf("unsupported model type: %d", modelType)
 	}
 	if err := ctx.Err(); err != nil {
@@ -210,10 +168,10 @@ func (g *StickyGuard) ReplaceRetiredDefault(
 	silentDB := db.WithContext(ctx).Session(&gorm.Session{Logger: db.Logger.LogMode(logger.Silent)})
 	var moved int64
 	err := silentDB.Transaction(func(tx *gorm.DB) error {
-		match := idColumn + " = ?"
+		match := spec.IDColumn + " = ?"
 		args := []interface{}{tenantID, retiredModelID}
 		if retiredTenantModelID != "" {
-			match += " OR " + tenantModelColumn + " = ?"
+			match += " OR " + spec.TenantIDColumn + " = ?"
 			args = append(args, retiredTenantModelID)
 		}
 		query := tx.Where("tenant_id = ? AND ("+match+")", args...)
@@ -228,16 +186,21 @@ func (g *StickyGuard) ReplaceRetiredDefault(
 		now := time.Now().Local()
 		nowMilli := now.UnixMilli()
 		nowDate := now.Truncate(time.Second)
+
+		var modelValue interface{} = newModelID
+		if newModelID == "" {
+			modelValue = spec.ClearedIDValue()
+		}
 		var tenantModelValue interface{}
 		if newTenantModelID != "" {
 			tenantModelValue = newTenantModelID
 		}
 		for _, m := range members {
 			if err := tx.Model(&rentity.UserTenant{}).Where("id = ?", m.ID).Updates(map[string]interface{}{
-				idColumn:          newModelID,
-				tenantModelColumn: tenantModelValue,
-				"update_time":     &nowMilli,
-				"update_date":     &nowDate,
+				spec.IDColumn:       modelValue,
+				spec.TenantIDColumn: tenantModelValue,
+				"update_time":       &nowMilli,
+				"update_date":       &nowDate,
 			}).Error; err != nil {
 				return fmt.Errorf("failed to replace the retired default of user %s: %w", m.UserID, err)
 			}
@@ -273,29 +236,6 @@ func (g *StickyGuard) ReplaceRetiredDefault(
 	return moved, err
 }
 
-// userTenantSlot returns the model reference and tenant model id a membership currently holds for a model type.
-func userTenantSlot(ut *rentity.UserTenant, modelType int) (modelID, tenantModelID string) {
-	deref := func(s *string) string {
-		if s == nil {
-			return ""
-		}
-		return *s
-	}
-	switch modelType {
-	case int(rentity.ModelTypeChat):
-		return ut.LLMID, deref(ut.TenantLLMID)
-	case int(rentity.ModelTypeEmbedding):
-		return ut.EmbdID, deref(ut.TenantEmbdID)
-	case int(rentity.ModelTypeRerank):
-		return ut.RerankID, deref(ut.TenantRerankID)
-	case int(rentity.ModelTypeSpeech2Text):
-		return ut.ASRID, deref(ut.TenantASRID)
-	case int(rentity.ModelTypeImage2Text):
-		return ut.Img2TxtID, deref(ut.TenantImg2TxtID)
-	}
-	return "", ""
-}
-
 // RecordObservedUserChoice marks a default that a user changed through the upstream API as user_explicit.
 // Unlike SetUserExplicitPreference it never writes user_tenant: the value was observed after the upstream
 // handler committed it, so only the preference is recorded. Inside one transaction, with the membership row
@@ -321,7 +261,8 @@ func (g *StickyGuard) RecordObservedUserChoice(
 	if userID == "" || observedModelID == "" {
 		return false, errors.New("userID and observedModelID cannot be empty")
 	}
-	if !isSupportedModelType(modelType) {
+	spec, ok := mpentity.LookupModelSlot(modelType)
+	if !ok {
 		return false, fmt.Errorf("unsupported model type: %d", modelType)
 	}
 	if err := ctx.Err(); err != nil {
@@ -342,7 +283,8 @@ func (g *StickyGuard) RecordObservedUserChoice(
 		if len(members) == 0 {
 			return nil
 		}
-		if currentID, currentTenantID := userTenantSlot(&members[0], modelType); currentID != observedModelID || currentTenantID != observedTenantModelID {
+		current := spec.Read(&members[0])
+		if current.ModelID != observedModelID || current.TenantModelID != observedTenantModelID {
 			return nil
 		}
 
@@ -471,7 +413,8 @@ func (g *StickyGuard) UpgradeDefaultModel(
 	if newModelID == "" {
 		return nil, errors.New("newModelID cannot be empty")
 	}
-	if !isSupportedModelType(modelType) {
+	spec, ok := mpentity.LookupModelSlot(modelType)
+	if !ok {
 		return nil, fmt.Errorf("unsupported model type for upgrade: %d", modelType)
 	}
 	if err := ctx.Err(); err != nil {
@@ -533,26 +476,10 @@ func (g *StickyGuard) UpgradeDefaultModel(
 
 			// 4. User is on platform_default or has no explicit preference: upgrade model!
 			updates := map[string]interface{}{
-				"update_time": &nowMilli,
-				"update_date": &nowDate,
-			}
-
-			switch modelType {
-			case int(rentity.ModelTypeChat):
-				updates["llm_id"] = newModelID
-				updates["tenant_llm_id"] = tIDPtr
-			case int(rentity.ModelTypeEmbedding):
-				updates["embd_id"] = newModelID
-				updates["tenant_embd_id"] = tIDPtr
-			case int(rentity.ModelTypeRerank):
-				updates["rerank_id"] = newModelID
-				updates["tenant_rerank_id"] = tIDPtr
-			case int(rentity.ModelTypeSpeech2Text):
-				updates["asr_id"] = newModelID
-				updates["tenant_asr_id"] = tIDPtr
-			case int(rentity.ModelTypeImage2Text):
-				updates["img2txt_id"] = newModelID
-				updates["tenant_img2txt_id"] = tIDPtr
+				spec.IDColumn:       newModelID,
+				spec.TenantIDColumn: tIDPtr,
+				"update_time":       &nowMilli,
+				"update_date":       &nowDate,
 			}
 
 			if err := tx.Model(&rentity.UserTenant{}).

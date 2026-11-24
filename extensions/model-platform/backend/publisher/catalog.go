@@ -85,8 +85,8 @@ GROUP BY m.model_name`,
 	return entries, nil
 }
 
-// countReferences counts live knowledge bases (embedding) and assistants (chat) bound to the model, matching
-// the bare name, the composite managed reference, or the id of a managed tenant_model row.
+// countReferences counts live knowledge bases (embedding) and assistants (chat / decision) bound to the
+// model, matching the bare name, the composite managed reference, or the id of a managed tenant_model row.
 func countReferences(db *gorm.DB, entry *CatalogEntry) error {
 	composite := entry.ModelName + "@" + reconciler.PlatformInstanceName + "@" + reconciler.ProviderOpenAIAPICompatible
 	managedIDs := `SELECT m.id FROM tenant_model m
@@ -103,6 +103,11 @@ AND (embd_id IN (?, ?) OR tenant_embd_id IN (`+managedIDs+`))`,
 		return db.Raw(`SELECT COUNT(*) FROM dialog
 WHERE (status IS NULL OR status != '0')
 AND (llm_id IN (?, ?) OR tenant_llm_id IN (`+managedIDs+`))`,
+			entry.ModelName, composite, reconciler.PlatformInstanceName, entry.ModelName).Scan(&entry.ActiveDialogCount).Error
+	case int(rentity.ModelTypeDecision):
+		return db.Raw(`SELECT COUNT(*) FROM dialog
+WHERE (status IS NULL OR status != '0')
+AND (decision_id IN (?, ?) OR tenant_decision_id IN (`+managedIDs+`))`,
 			entry.ModelName, composite, reconciler.PlatformInstanceName, entry.ModelName).Scan(&entry.ActiveDialogCount).Error
 	}
 	return nil

@@ -66,10 +66,14 @@ func TestTenantReconciler_ProvisionsFromCatalogAndHonorsCatalogDefaults(t *testi
 	clearCatalog(t, db)
 	chat := int(rentity.ModelTypeChat)
 	rerank := int(rentity.ModelTypeRerank)
+	tts := int(rentity.ModelTypeTTS)
+	decision := int(rentity.ModelTypeDecision)
 	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: chat, IsDefault: true, Status: entity.ManagedModelStatusActive})
 	db.Create(&entity.PlatformManagedModel{ID: "m2", ModelName: "qwen-max", ModelType: chat, Status: entity.ManagedModelStatusActive})
 	db.Create(&entity.PlatformManagedModel{ID: "m3", ModelName: "bge-reranker", ModelType: rerank, IsDefault: true, Status: entity.ManagedModelStatusActive})
 	db.Create(&entity.PlatformManagedModel{ID: "m4", ModelName: "retired-model", ModelType: chat, Status: entity.ManagedModelStatusRetired})
+	db.Create(&entity.PlatformManagedModel{ID: "m5", ModelName: "tts-1", ModelType: tts, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m6", ModelName: "qwen-2.5-7b-router", ModelType: decision, IsDefault: true, Status: entity.ManagedModelStatusActive})
 	mockClient := newMockGatewayClient()
 	createBareTestTenant(db, "tenant-catalog")
 	createTestUserTenantInDB(db, "user-catalog", "tenant-catalog", "", "")
@@ -80,7 +84,7 @@ func TestTenantReconciler_ProvisionsFromCatalogAndHonorsCatalogDefaults(t *testi
 
 	got := lastGeneratedModels(mockClient)
 	sort.Strings(got)
-	want := []string{"bge-reranker", "deepseek-v3", "platform/chat", "qwen-max"}
+	want := []string{"bge-reranker", "deepseek-v3", "platform/chat", "qwen-2.5-7b-router", "qwen-max", "tts-1"}
 	if len(got) != len(want) {
 		t.Fatalf("expected whitelist %v, got %v", want, got)
 	}
@@ -94,6 +98,12 @@ func TestTenantReconciler_ProvisionsFromCatalogAndHonorsCatalogDefaults(t *testi
 	db.Where("user_id = ?", "user-catalog").First(&ut)
 	if ut.LLMID != "deepseek-v3@platform@OpenAI-API-Compatible" || ut.RerankID != "bge-reranker@platform@OpenAI-API-Compatible" {
 		t.Errorf("expected the catalog defaults, got llm=%q rerank=%q", ut.LLMID, ut.RerankID)
+	}
+	if ut.TTSID == nil || *ut.TTSID != "tts-1@platform@OpenAI-API-Compatible" || ut.TenantTTSID == nil || *ut.TenantTTSID == "" {
+		t.Errorf("expected catalog TTS default to be initialized, got tts=%v tenant_tts=%v", ut.TTSID, ut.TenantTTSID)
+	}
+	if ut.DecisionID == nil || *ut.DecisionID != "qwen-2.5-7b-router@platform@OpenAI-API-Compatible" || ut.TenantDecisionID == nil || *ut.TenantDecisionID == "" {
+		t.Errorf("expected catalog Decision default to be initialized, got decision=%v tenant_decision=%v", ut.DecisionID, ut.TenantDecisionID)
 	}
 	var retired int64
 	db.Model(&rentity.TenantModel{}).Where("model_name = ?", "retired-model").Count(&retired)

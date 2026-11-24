@@ -7,50 +7,21 @@ import (
 	"time"
 
 	"ragflow/extensions/model-platform/backend/dao"
+	mpentity "ragflow/extensions/model-platform/backend/entity"
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
-// DefaultModelConfig defines recommended default models to initialize for a tenant or user.
-type DefaultModelConfig struct {
-	ChatModelID             string
-	ChatTenantModelID       string
-	EmbeddingModelID        string
-	EmbeddingTenantModelID  string
-	RerankModelID           string
-	RerankTenantModelID     string
-	ASRModelID              string
-	ASRTenantModelID        string
-	Image2TextModelID       string
-	Image2TextTenantModelID string
-}
+// DefaultSlot aliases entity.DefaultSlot for callers building DefaultModelConfig maps.
+type DefaultSlot = mpentity.DefaultSlot
 
-// setDefault records the default model of one ModelType. Types without a default slot are ignored.
-func (c *DefaultModelConfig) setDefault(modelType int, modelRef, tenantModelID string) {
-	switch modelType {
-	case int(rentity.ModelTypeChat):
-		c.ChatModelID, c.ChatTenantModelID = modelRef, tenantModelID
-	case int(rentity.ModelTypeEmbedding):
-		c.EmbeddingModelID, c.EmbeddingTenantModelID = modelRef, tenantModelID
-	case int(rentity.ModelTypeRerank):
-		c.RerankModelID, c.RerankTenantModelID = modelRef, tenantModelID
-	case int(rentity.ModelTypeSpeech2Text):
-		c.ASRModelID, c.ASRTenantModelID = modelRef, tenantModelID
-	case int(rentity.ModelTypeImage2Text):
-		c.Image2TextModelID, c.Image2TextTenantModelID = modelRef, tenantModelID
-	}
-}
+// DefaultModelConfig maps each managed ModelType to its recommended default model slot.
+type DefaultModelConfig map[rentity.ModelType]DefaultSlot
 
-// DefaultsInitResult records the number of user_tenant rows updated for each model type.
-type DefaultsInitResult struct {
-	ChatUpdated       int64
-	EmbeddingUpdated  int64
-	RerankUpdated     int64
-	ASRUpdated        int64
-	Image2TextUpdated int64
-}
+// DefaultsInitResult records the number of user_tenant rows updated per managed ModelType.
+type DefaultsInitResult map[rentity.ModelType]int64
 
 // DefaultsManager handles atomic and safe initialization of tenant default models.
 // It uses conditional atomic SQL to guarantee that user-explicit custom selections
@@ -74,7 +45,7 @@ func (m *DefaultsManager) InitializeTenantDefaults(
 	db *gorm.DB,
 	tenantID string,
 	cfg DefaultModelConfig,
-) (*DefaultsInitResult, error) {
+) (DefaultsInitResult, error) {
 	return m.InitializeUserDefaults(ctx, db, "", tenantID, cfg)
 }
 
@@ -85,7 +56,7 @@ func (m *DefaultsManager) InitializeMemberFromOwner(
 	db *gorm.DB,
 	tenantID string,
 	userID string,
-) (*DefaultsInitResult, error) {
+) (DefaultsInitResult, error) {
 	if db == nil {
 		return nil, dao.ErrNilTransaction
 	}
@@ -101,33 +72,18 @@ func (m *DefaultsManager) InitializeMemberFromOwner(
 		Where("tenant_id = ? AND role = ?", tenantID, "owner").
 		First(&owner).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return &DefaultsInitResult{}, nil
+		return DefaultsInitResult{}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup tenant owner for tenant %s: %w", tenantID, err)
 	}
 
-	cfg := DefaultModelConfig{
-		ChatModelID:       owner.LLMID,
-		EmbeddingModelID:  owner.EmbdID,
-		RerankModelID:     owner.RerankID,
-		ASRModelID:        owner.ASRID,
-		Image2TextModelID: owner.Img2TxtID,
-	}
-	if owner.TenantLLMID != nil {
-		cfg.ChatTenantModelID = *owner.TenantLLMID
-	}
-	if owner.TenantEmbdID != nil {
-		cfg.EmbeddingTenantModelID = *owner.TenantEmbdID
-	}
-	if owner.TenantRerankID != nil {
-		cfg.RerankTenantModelID = *owner.TenantRerankID
-	}
-	if owner.TenantASRID != nil {
-		cfg.ASRTenantModelID = *owner.TenantASRID
-	}
-	if owner.TenantImg2TxtID != nil {
-		cfg.Image2TextTenantModelID = *owner.TenantImg2TxtID
+	cfg := make(DefaultModelConfig, len(mpentity.ManagedModelSlots))
+	for _, spec := range mpentity.ManagedModelSlots {
+		slot := spec.Read(&owner)
+		if slot.ModelID != "" {
+			cfg[spec.Type] = slot
+		}
 	}
 
 	return m.InitializeUserDefaults(ctx, db, userID, tenantID, cfg)
@@ -168,7 +124,7 @@ func (m *DefaultsManager) InitializeUserDefaults(
 	userID string,
 	tenantID string,
 	cfg DefaultModelConfig,
-) (*DefaultsInitResult, error) {
+) (DefaultsInitResult, error) {
 	if db == nil {
 		return nil, dao.ErrNilTransaction
 	}
@@ -180,13 +136,12 @@ func (m *DefaultsManager) InitializeUserDefaults(
 	}
 
 	silentDB := db.WithContext(ctx).Session(&gorm.Session{Logger: db.Logger.LogMode(logger.Silent)})
-	result := &DefaultsInitResult{}
+	result := make(DefaultsInitResult, len(cfg))
 
 	now := time.Now().Local()
 	nowMilli := now.UnixMilli()
 	nowDate := now.Truncate(time.Second)
 
-	// Helper to apply user filter if specified
 	applyUserScope := func(tx *gorm.DB) *gorm.DB {
 		tx = tx.Where("tenant_id = ?", tenantID)
 		if userID != "" {
@@ -195,131 +150,32 @@ func (m *DefaultsManager) InitializeUserDefaults(
 		return tx
 	}
 
-	// 1. Conditionally initialize Chat Model (llm_id, tenant_llm_id)
-	if cfg.ChatModelID != "" {
-		chatUpdates := map[string]interface{}{
-			"llm_id":      cfg.ChatModelID,
+	for _, spec := range mpentity.ManagedModelSlots {
+		slot, ok := cfg[spec.Type]
+		if !ok || slot.ModelID == "" {
+			continue
+		}
+
+		updates := map[string]interface{}{
+			spec.IDColumn: slot.ModelID,
 			"update_time": &nowMilli,
 			"update_date": &nowDate,
 		}
-		if cfg.ChatTenantModelID != "" {
-			chatUpdates["tenant_llm_id"] = &cfg.ChatTenantModelID
+		if slot.TenantModelID != "" {
+			tid := slot.TenantModelID
+			updates[spec.TenantIDColumn] = &tid
 		}
 
 		res := applyUserScope(silentDB.Model(&rentity.UserTenant{})).
-			Where("(llm_id IS NULL OR llm_id = '')").
-			Updates(chatUpdates)
+			Where(fmt.Sprintf("(%s IS NULL OR %s = '')", spec.IDColumn, spec.IDColumn)).
+			Updates(updates)
 		if res.Error != nil {
-			return nil, fmt.Errorf("failed to atomically initialize chat default model: %w", res.Error)
+			return nil, fmt.Errorf("failed to atomically initialize %s default model: %w", spec.Name, res.Error)
 		}
-		result.ChatUpdated = res.RowsAffected
+		result[spec.Type] = res.RowsAffected
 
 		if res.RowsAffected > 0 {
-			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeChat), cfg.ChatModelID, "llm_id"); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// 2. Conditionally initialize Embedding Model (embd_id, tenant_embd_id)
-	if cfg.EmbeddingModelID != "" {
-		embdUpdates := map[string]interface{}{
-			"embd_id":     cfg.EmbeddingModelID,
-			"update_time": &nowMilli,
-			"update_date": &nowDate,
-		}
-		if cfg.EmbeddingTenantModelID != "" {
-			embdUpdates["tenant_embd_id"] = &cfg.EmbeddingTenantModelID
-		}
-
-		res := applyUserScope(silentDB.Model(&rentity.UserTenant{})).
-			Where("(embd_id IS NULL OR embd_id = '')").
-			Updates(embdUpdates)
-		if res.Error != nil {
-			return nil, fmt.Errorf("failed to atomically initialize embedding default model: %w", res.Error)
-		}
-		result.EmbeddingUpdated = res.RowsAffected
-
-		if res.RowsAffected > 0 {
-			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeEmbedding), cfg.EmbeddingModelID, "embd_id"); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// 3. Conditionally initialize Rerank Model (rerank_id, tenant_rerank_id)
-	if cfg.RerankModelID != "" {
-		rerankUpdates := map[string]interface{}{
-			"rerank_id":   cfg.RerankModelID,
-			"update_time": &nowMilli,
-			"update_date": &nowDate,
-		}
-		if cfg.RerankTenantModelID != "" {
-			rerankUpdates["tenant_rerank_id"] = &cfg.RerankTenantModelID
-		}
-
-		res := applyUserScope(silentDB.Model(&rentity.UserTenant{})).
-			Where("(rerank_id IS NULL OR rerank_id = '')").
-			Updates(rerankUpdates)
-		if res.Error != nil {
-			return nil, fmt.Errorf("failed to atomically initialize rerank default model: %w", res.Error)
-		}
-		result.RerankUpdated = res.RowsAffected
-
-		if res.RowsAffected > 0 {
-			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeRerank), cfg.RerankModelID, "rerank_id"); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// 4. Conditionally initialize ASR Model (asr_id, tenant_asr_id)
-	if cfg.ASRModelID != "" {
-		asrUpdates := map[string]interface{}{
-			"asr_id":      cfg.ASRModelID,
-			"update_time": &nowMilli,
-			"update_date": &nowDate,
-		}
-		if cfg.ASRTenantModelID != "" {
-			asrUpdates["tenant_asr_id"] = &cfg.ASRTenantModelID
-		}
-
-		res := applyUserScope(silentDB.Model(&rentity.UserTenant{})).
-			Where("(asr_id IS NULL OR asr_id = '')").
-			Updates(asrUpdates)
-		if res.Error != nil {
-			return nil, fmt.Errorf("failed to atomically initialize asr default model: %w", res.Error)
-		}
-		result.ASRUpdated = res.RowsAffected
-
-		if res.RowsAffected > 0 {
-			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeSpeech2Text), cfg.ASRModelID, "asr_id"); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// 5. Conditionally initialize Image2Text Model (img2txt_id, tenant_img2txt_id)
-	if cfg.Image2TextModelID != "" {
-		imgUpdates := map[string]interface{}{
-			"img2txt_id":  cfg.Image2TextModelID,
-			"update_time": &nowMilli,
-			"update_date": &nowDate,
-		}
-		if cfg.Image2TextTenantModelID != "" {
-			imgUpdates["tenant_img2txt_id"] = &cfg.Image2TextTenantModelID
-		}
-
-		res := applyUserScope(silentDB.Model(&rentity.UserTenant{})).
-			Where("(img2txt_id IS NULL OR img2txt_id = '')").
-			Updates(imgUpdates)
-		if res.Error != nil {
-			return nil, fmt.Errorf("failed to atomically initialize image2text default model: %w", res.Error)
-		}
-		result.Image2TextUpdated = res.RowsAffected
-
-		if res.RowsAffected > 0 {
-			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(rentity.ModelTypeImage2Text), cfg.Image2TextModelID, "img2txt_id"); err != nil {
+			if err := m.recordModelDefaults(ctx, silentDB, tenantID, userID, int(spec.Type), slot.ModelID, spec.IDColumn); err != nil {
 				return nil, err
 			}
 		}

@@ -466,6 +466,43 @@ func TestSpendLogCollector_TokenDetailsExtraction(t *testing.T) {
 	}
 }
 
+func TestSpendLogCollector_TTSCharacterExtraction(t *testing.T) {
+	// 1. Explicit metadata.characters
+	ttsMeta := ConvertEntryToSpendLog(gateway.SpendLogEntry{
+		SpendID:  "spend-tts-meta",
+		Model:    "tts-1",
+		CallType: "speech",
+		Metadata: map[string]interface{}{"characters": float64(1350)},
+	})
+	if ttsMeta.Characters != 1350 {
+		t.Errorf("expected 1350 characters from metadata, got %d", ttsMeta.Characters)
+	}
+
+	// 2. Fallback to prompt_tokens for speech call_type when metadata omits characters
+	ttsFallback := ConvertEntryToSpendLog(gateway.SpendLogEntry{
+		SpendID:      "spend-tts-fallback",
+		Model:        "tts-1-hd",
+		CallType:     "aspeech",
+		PromptTokens: 640,
+		TotalTokens:  640,
+	})
+	if ttsFallback.Characters != 640 {
+		t.Errorf("expected 640 characters fallback for aspeech, got %d", ttsFallback.Characters)
+	}
+
+	// 3. Regular chat call must not copy prompt_tokens into Characters
+	chatLog := ConvertEntryToSpendLog(gateway.SpendLogEntry{
+		SpendID:      "spend-chat-no-chars",
+		Model:        "deepseek-v3",
+		CallType:     "completion",
+		PromptTokens: 900,
+		TotalTokens:  1200,
+	})
+	if chatLog.Characters != 0 {
+		t.Errorf("expected 0 characters for chat completion, got %d", chatLog.Characters)
+	}
+}
+
 func TestSpendLogCollector_FallbackHashDifferentiationAndReplay(t *testing.T) {
 	db := setupTestDB(t)
 

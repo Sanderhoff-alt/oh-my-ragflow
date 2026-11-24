@@ -426,3 +426,78 @@ func TestAdmin_AuditUsage(t *testing.T) {
 		t.Errorf("expected audit_passed=false for rogue tenant, got %v", dataRogue["audit_passed"])
 	}
 }
+
+func TestAdmin_UsageFilterByModelType_TTSAndDecision(t *testing.T) {
+	db := setupTestDB(t)
+	if err := migration.MigratePublishSchema(context.Background(), db); err != nil {
+		t.Fatalf("failed to migrate publish schema: %v", err)
+	}
+	r := setupTestServer(db)
+
+	db.Create(&entity.PlatformManagedModel{ID: "cat-chat", ModelName: "gpt-4o", ModelType: int(rentity.ModelTypeChat), Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "cat-tts", ModelName: "tts-1", ModelType: int(rentity.ModelTypeTTS), Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "cat-dec", ModelName: "qwen-router", ModelType: int(rentity.ModelTypeDecision), Status: entity.ManagedModelStatusActive})
+
+	for _, rec := range []entity.TenantUsageDaily{
+		{TenantID: "t1", ModelName: "gpt-4o", UsageDate: "2026-11-20", CallCount: 5, PromptTokens: 500, CompletionTokens: 100, TotalTokens: 600, TotalSpend: 0.01},
+		{TenantID: "t1", ModelName: "tts-1", UsageDate: "2026-11-20", CallCount: 3, Characters: 4200, TotalSpend: 0.06},
+		{TenantID: "t1", ModelName: "qwen-router", UsageDate: "2026-11-20", CallCount: 20, PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200, TotalSpend: 0.002},
+	} {
+		db.Create(&rec)
+	}
+
+	// 1. Filter daily usage by TTS (32)
+	req, _ := http.NewRequest(http.MethodGet, "/admin/model-platform/usage/daily?model_type=32", nil)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for TTS daily filter, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var dailyResp struct {
+		Data struct {
+			Total int64 `json:"total"`
+			Items []struct {
+				ModelName  string `json:"model_name"`
+				ModelType  int    `json:"model_type"`
+				Characters int64  `json:"characters"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &dailyResp); err != nil {
+		t.Fatalf("unmarshal daily response failed: %v", err)
+	}
+	if dailyResp.Data.Total != 1 || len(dailyResp.Data.Items) != 1 {
+		t.Fatalf("expected 1 TTS daily record, got total=%d items=%+v", dailyResp.Data.Total, dailyResp.Data.Items)
+	}
+	if dailyResp.Data.Items[0].ModelName != "tts-1" || dailyResp.Data.Items[0].ModelType != 32 || dailyResp.Data.Items[0].Characters != 4200 {
+		t.Errorf("unexpected TTS daily item: %+v", dailyResp.Data.Items[0])
+	}
+
+	// 2. Filter summary by Decision (128)
+	req, _ = http.NewRequest(http.MethodGet, "/admin/model-platform/usage/summary?model_type=128", nil)
+	resp = httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Decision summary filter, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var sumResp struct {
+		Data struct {
+			TotalCalls  int64 `json:"total_calls"`
+			TotalTokens int64 `json:"total_tokens"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &sumResp); err != nil {
+		t.Fatalf("unmarshal summary response failed: %v", err)
+	}
+	if sumResp.Data.TotalCalls != 20 || sumResp.Data.TotalTokens != 1200 {
+		t.Errorf("unexpected Decision summary: %+v", sumResp.Data)
+	}
+
+	// 3. Reject excluded OCR (64) model_type filter
+	req, _ = http.NewRequest(http.MethodGet, "/admin/model-platform/usage/daily?model_type=64", nil)
+	resp = httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for excluded OCR model_type=64, got %d", resp.Code)
+	}
+}

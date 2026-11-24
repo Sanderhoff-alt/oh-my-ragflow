@@ -288,14 +288,14 @@ func TestStickyGuard_UpgradeDefaultModel_ProtectsExplicitSelections(t *testing.T
 	}
 }
 
-func TestStickyGuard_AllFiveModelTypes_ExplicitAndUpgrade(t *testing.T) {
+func TestStickyGuard_AllSevenModelTypes_ExplicitAndUpgrade(t *testing.T) {
 	db := setupTestDB(t)
 	_ = migration.MigratePreferenceSchema(context.Background(), db)
 	guard := NewStickyGuard()
 	ctx := context.Background()
 
-	tenantID := "tenant-all-5-types"
-	userID := "user-all-5-types"
+	tenantID := "tenant-all-7-types"
+	userID := "user-all-7-types"
 	createBareTestTenant(db, tenantID)
 	createTestUserTenantInDB(db, userID, tenantID, "", "")
 
@@ -310,6 +310,8 @@ func TestStickyGuard_AllFiveModelTypes_ExplicitAndUpgrade(t *testing.T) {
 		{"Rerank", int(rentity.ModelTypeRerank), "my-rerank@cohere", "plat-rerank-v2@plat"},
 		{"ASR", int(rentity.ModelTypeSpeech2Text), "my-asr@whisper", "plat-asr-v2@plat"},
 		{"Image2Text", int(rentity.ModelTypeImage2Text), "my-vision@claude", "plat-vision-v2@plat"},
+		{"TTS", int(rentity.ModelTypeTTS), "my-tts@elevenlabs", "plat-tts-v2@plat"},
+		{"Decision", int(rentity.ModelTypeDecision), "my-decision@deepseek", "plat-decision-v2@plat"},
 	}
 
 	for _, tc := range testCases {
@@ -329,11 +331,99 @@ func TestStickyGuard_AllFiveModelTypes_ExplicitAndUpgrade(t *testing.T) {
 			if res.PreservedCount != 1 || res.UpgradedCount != 0 {
 				t.Errorf("%s explicit model was not preserved! got preserved=%d, upgraded=%d", tc.name, res.PreservedCount, res.UpgradedCount)
 			}
+
+			// Verify stored user_tenant slot matches explicit choice
+			var ut rentity.UserTenant
+			db.Where("user_id = ? AND tenant_id = ?", userID, tenantID).First(&ut)
+			spec, _ := mpentity.LookupModelSlot(tc.modelType)
+			slot := spec.Read(&ut)
+			if slot.ModelID != tc.explicitM || slot.TenantModelID != "tm-"+tc.name {
+				t.Errorf("%s slot mismatch: got %+v", tc.name, slot)
+			}
+		})
+	}
+
+	// Verify OCR remains excluded
+	if err := guard.SetUserExplicitPreference(ctx, db, tenantID, userID, int(rentity.ModelTypeOCR), "deepdoc@local", ""); err == nil {
+		t.Error("expected OCR model type to be rejected by SetUserExplicitPreference")
+	}
+	if _, err := guard.UpgradeDefaultModel(ctx, db, tenantID, int(rentity.ModelTypeOCR), "deepdoc@local", ""); err == nil {
+		t.Error("expected OCR model type to be rejected by UpgradeDefaultModel")
+	}
+}
+
+func TestStickyGuard_TTSAndDecision_UpgradeAndReplaceRetired(t *testing.T) {
+	db := setupTestDB(t)
+	_ = migration.MigratePreferenceSchema(context.Background(), db)
+	guard := NewStickyGuard()
+	ctx := context.Background()
+
+	tenantID := "tenant-tts-dec"
+	userDefault := "user-default"
+	userExplicit := "user-explicit"
+	createBareTestTenant(db, tenantID)
+	createTestUserTenantInDB(db, userDefault, tenantID, "", "")
+	createTestUserTenantInDB(db, userExplicit, tenantID, "", "")
+
+	for _, tc := range []struct {
+		name       string
+		modelType  int
+		initial    string
+		custom     string
+		upgraded   string
+		tmInitial  string
+		tmCustom   string
+		tmUpgraded string
+	}{
+		{"TTS", int(rentity.ModelTypeTTS), "tts-1@platform@OpenAI-API-Compatible", "my-voice@custom", "tts-1-hd@platform@OpenAI-API-Compatible", "tm-tts-1", "tm-tts-c", "tm-tts-2"},
+		{"Decision", int(rentity.ModelTypeDecision), "qwen-7b@platform@OpenAI-API-Compatible", "my-router@custom", "deepseek-v3@platform@OpenAI-API-Compatible", "tm-dec-1", "tm-dec-c", "tm-dec-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewDefaultsManager()
+			_, err := mgr.InitializeTenantDefaults(ctx, db, tenantID, DefaultModelConfig{
+				rentity.ModelType(tc.modelType): {ModelID: tc.initial, TenantModelID: tc.tmInitial},
+			})
+			if err != nil {
+				t.Fatalf("init defaults failed: %v", err)
+			}
+			if err := guard.SetUserExplicitPreference(ctx, db, tenantID, userExplicit, tc.modelType, tc.custom, tc.tmCustom); err != nil {
+				t.Fatalf("set explicit failed: %v", err)
+			}
+
+			res, err := guard.UpgradeDefaultModel(ctx, db, tenantID, tc.modelType, tc.upgraded, tc.tmUpgraded)
+			if err != nil {
+				t.Fatalf("upgrade failed: %v", err)
+			}
+			if res.UpgradedCount != 1 || res.PreservedCount != 1 {
+				t.Fatalf("expected 1 upgraded and 1 preserved, got %+v", res)
+			}
+
+			// Retire the upgraded model with no replacement -> clears nullable column to NULL and drops preference
+			moved, err := guard.ReplaceRetiredDefault(ctx, db, tenantID, tc.modelType, tc.upgraded, tc.tmUpgraded, "", "")
+			if err != nil {
+				t.Fatalf("ReplaceRetiredDefault clear failed: %v", err)
+			}
+			if moved != 1 {
+				t.Fatalf("expected 1 moved user on clear, got %d", moved)
+			}
+
+			var utDefault rentity.UserTenant
+			db.Where("user_id = ? AND tenant_id = ?", userDefault, tenantID).First(&utDefault)
+			spec, _ := mpentity.LookupModelSlot(tc.modelType)
+			if slot := spec.Read(&utDefault); slot.ModelID != "" || slot.TenantModelID != "" {
+				t.Errorf("expected cleared slot, got %+v", slot)
+			}
+			if tc.modelType == int(rentity.ModelTypeTTS) && utDefault.TTSID != nil {
+				t.Errorf("expected nullable tts_id to be nil after clear, got %v", *utDefault.TTSID)
+			}
+			if tc.modelType == int(rentity.ModelTypeDecision) && utDefault.DecisionID != nil {
+				t.Errorf("expected nullable decision_id to be nil after clear, got %v", *utDefault.DecisionID)
+			}
 		})
 	}
 }
 
-func TestDefaultsManager_ProvenanceTrackingForAllFiveTypes(t *testing.T) {
+func TestDefaultsManager_ProvenanceTrackingForAllSevenTypes(t *testing.T) {
 	db := setupTestDB(t)
 	_ = migration.MigratePreferenceSchema(context.Background(), db)
 	mgr := NewDefaultsManager()
@@ -345,11 +435,13 @@ func TestDefaultsManager_ProvenanceTrackingForAllFiveTypes(t *testing.T) {
 	createTestUserTenantInDB(db, userID, tenantID, "", "")
 
 	cfg := DefaultModelConfig{
-		ChatModelID:       "chat@plat",
-		EmbeddingModelID:  "embd@plat",
-		RerankModelID:     "rerank@plat",
-		ASRModelID:        "asr@plat",
-		Image2TextModelID: "vision@plat",
+		rentity.ModelTypeChat:        {ModelID: "chat@plat"},
+		rentity.ModelTypeEmbedding:   {ModelID: "embd@plat"},
+		rentity.ModelTypeRerank:      {ModelID: "rerank@plat"},
+		rentity.ModelTypeSpeech2Text: {ModelID: "asr@plat"},
+		rentity.ModelTypeImage2Text:  {ModelID: "vision@plat"},
+		rentity.ModelTypeTTS:         {ModelID: "tts@plat"},
+		rentity.ModelTypeDecision:    {ModelID: "decision@plat"},
 	}
 
 	res, err := mgr.InitializeTenantDefaults(ctx, db, tenantID, cfg)
@@ -357,27 +449,17 @@ func TestDefaultsManager_ProvenanceTrackingForAllFiveTypes(t *testing.T) {
 		t.Fatalf("InitializeTenantDefaults failed: %v", err)
 	}
 
-	if res.ChatUpdated != 1 || res.EmbeddingUpdated != 1 || res.RerankUpdated != 1 || res.ASRUpdated != 1 || res.Image2TextUpdated != 1 {
-		t.Fatalf("expected all 5 models updated, got %+v", res)
-	}
-
-	// Verify all 5 provenance records exist in platform_user_default_preference with OriginPlatformDefault
-	types := []int{
-		int(rentity.ModelTypeChat),
-		int(rentity.ModelTypeEmbedding),
-		int(rentity.ModelTypeRerank),
-		int(rentity.ModelTypeSpeech2Text),
-		int(rentity.ModelTypeImage2Text),
-	}
-
-	for _, mt := range types {
+	for _, spec := range mpentity.ManagedModelSlots {
+		if res[spec.Type] != 1 {
+			t.Fatalf("expected model type %s updated, got %+v", spec.Name, res)
+		}
 		var pref mpentity.UserDefaultPreference
-		err := db.Where("tenant_id = ? AND user_id = ? AND model_type = ?", tenantID, userID, mt).First(&pref).Error
+		err := db.Where("tenant_id = ? AND user_id = ? AND model_type = ?", tenantID, userID, int(spec.Type)).First(&pref).Error
 		if err != nil {
-			t.Errorf("missing preference record for model type %d: %v", mt, err)
+			t.Errorf("missing preference record for model type %s (%d): %v", spec.Name, int(spec.Type), err)
 		}
 		if pref.Origin != mpentity.OriginPlatformDefault {
-			t.Errorf("expected OriginPlatformDefault for type %d, got %s", mt, pref.Origin)
+			t.Errorf("expected OriginPlatformDefault for type %s, got %s", spec.Name, pref.Origin)
 		}
 	}
 }

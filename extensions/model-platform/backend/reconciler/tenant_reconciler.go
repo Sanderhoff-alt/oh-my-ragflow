@@ -307,7 +307,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		modelExtraBytes, _ := json.Marshal(map[string]interface{}{"is_managed": true})
 		modelExtraJSON := string(modelExtraBytes)
 
-		var defaultsCfg DefaultModelConfig
+		defaultsCfg := make(DefaultModelConfig)
 		for _, m := range catalog {
 			var tm rentity.TenantModel
 			err := tx.Where("instance_id = ? AND model_name = ?", instance.ID, m.ModelName).
@@ -329,8 +329,11 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 				return err
 			}
 
-			if m.IsDefault {
-				defaultsCfg.setDefault(m.ModelType, managedModelRef(m.ModelName), tm.ID)
+			if m.IsDefault && entity.IsManagedModelType(m.ModelType) {
+				defaultsCfg[rentity.ModelType(m.ModelType)] = DefaultSlot{
+					ModelID:       managedModelRef(m.ModelName),
+					TenantModelID: tm.ID,
+				}
 			}
 		}
 

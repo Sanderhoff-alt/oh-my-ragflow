@@ -1,6 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { LucideBox, LucidePlus, LucideStar } from 'lucide-react';
-import { useState } from 'react';
+import {
+  LucideActivity,
+  LucideBox,
+  LucidePlus,
+  LucideStar,
+} from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -23,6 +29,11 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import {
+  getModelTypeSpec,
+  MANAGED_MODEL_TYPES,
+} from '@/ee/constants/model-types';
+import {
+  getAdminHealth,
   getRolloutProgress,
   listManagedModels,
   onboardModel,
@@ -34,34 +45,12 @@ import {
   type RolloutResult,
 } from '@/ee/utils/model-platform-client';
 
-const MODEL_TYPE_LABELS: Record<number, string> = {
-  1: 'Chat',
-  2: 'Embedding',
-  4: 'Speech to text',
-  8: 'Vision',
-  16: 'Rerank',
-};
-
-const ONBOARD_TYPES = [1, 2, 16];
-
 type Action = 'retire' | 'reactivate' | 'default';
 
 type PendingAction = { action: Action; model: ManagedModel };
 
-function describe(action: Action, model: ManagedModel): string {
-  if (action === 'default') {
-    return `Platform default users of ${MODEL_TYPE_LABELS[model.model_type]} will move to ${model.model_name}. Users who chose a model themselves keep it.`;
-  }
-  if (action === 'reactivate') {
-    return `${model.model_name} will become available again in every tenant.`;
-  }
-  if (model.model_type === 2) {
-    return `${model.active_kb_count} knowledge base(s) use ${model.model_name}. Tenants that still have knowledge bases keep it read-only, the others lose it at once. Users who default to it move to the platform default.`;
-  }
-  return `${model.model_name} will be disabled in every tenant at once. ${model.active_dialog_count} assistant(s) use it and will ask their owners to pick another model. Users who default to it move to the platform default.`;
-}
-
 function RolloutBanner({ taskId }: { taskId: string }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: progress } = useQuery({
     queryKey: ['model-platform', 'rollout', taskId],
@@ -86,14 +75,23 @@ function RolloutBanner({ taskId }: { taskId: string }) {
       <div>
         <span className="font-medium">{progress.model_name}</span>
         <span className="ml-2 text-muted-foreground">
-          {progress.status === 'running' ? 'Rolling out' : 'Rollout finished'}:{' '}
-          {progress.succeeded}/{progress.total} tenants done, {progress.pending}{' '}
-          pending, {progress.failed} failed
+          {progress.status === 'running'
+            ? t('modelPlatform.providers.rollout.running')
+            : t('modelPlatform.providers.rollout.finished')}
+          :{' '}
+          {t('modelPlatform.providers.rollout.progress', {
+            succeeded: progress.succeeded,
+            total: progress.total,
+            pending: progress.pending,
+            failed: progress.failed,
+          })}
         </span>
         {progress.upgraded_users_count + progress.preserved_users_count > 0 && (
           <span className="ml-2 text-muted-foreground">
-            ({progress.upgraded_users_count} users moved,{' '}
-            {progress.preserved_users_count} kept their own choice)
+            {t('modelPlatform.providers.rollout.usersSummary', {
+              upgraded: progress.upgraded_users_count,
+              preserved: progress.preserved_users_count,
+            })}
           </span>
         )}
       </div>
@@ -104,7 +102,7 @@ function RolloutBanner({ taskId }: { taskId: string }) {
           loading={retry.isPending}
           onClick={() => retry.mutate()}
         >
-          Retry failed tenants
+          {t('modelPlatform.providers.actions.retryFailed')}
         </Button>
       )}
     </div>
@@ -120,8 +118,11 @@ function OnboardDialog({
   onOpenChange: (open: boolean) => void;
   onStarted: (result: RolloutResult) => void;
 }) {
+  const { t } = useTranslation();
   const [name, setName] = useState('');
-  const [modelType, setModelType] = useState(1);
+  const [modelType, setModelType] = useState<number>(
+    MANAGED_MODEL_TYPES[0].bit,
+  );
   const onboard = useMutation({
     mutationFn: () => onboardModel(name.trim(), modelType),
     onSuccess: (result) => {
@@ -136,41 +137,42 @@ function OnboardDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Onboard a model</DialogTitle>
+          <DialogTitle>
+            {t('modelPlatform.providers.onboardDialog.title')}
+          </DialogTitle>
           <DialogDescription>
-            The model must already be routed by the gateway. Onboarding makes it
-            available to every Ready tenant and never changes a default.
+            {t('modelPlatform.providers.onboardDialog.description')}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <Input
-            placeholder="Gateway model name, for example deepseek-v3"
+            placeholder={t('modelPlatform.providers.onboardDialog.placeholder')}
             value={name}
             onChange={(event) => setName(event.target.value)}
           />
-          <div className="flex gap-2">
-            {ONBOARD_TYPES.map((type) => (
+          <div className="flex flex-wrap gap-2">
+            {MANAGED_MODEL_TYPES.map((spec) => (
               <Button
-                key={type}
+                key={spec.bit}
                 size="sm"
-                variant={modelType === type ? 'default' : 'secondary'}
-                onClick={() => setModelType(type)}
+                variant={modelType === spec.bit ? 'default' : 'secondary'}
+                onClick={() => setModelType(spec.bit)}
               >
-                {MODEL_TYPE_LABELS[type]}
+                {t(`modelPlatform.modelTypes.${spec.key}`)}
               </Button>
             ))}
           </div>
         </div>
         <DialogFooter>
           <Button variant="secondary" onClick={() => onOpenChange(false)}>
-            Cancel
+            {t('modelPlatform.providers.onboardDialog.cancel')}
           </Button>
           <Button
             disabled={name.trim() === ''}
             loading={onboard.isPending}
             onClick={() => onboard.mutate()}
           >
-            Onboard
+            {t('modelPlatform.providers.onboardDialog.confirm')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -179,6 +181,7 @@ function OnboardDialog({
 }
 
 export default function ModelProvidersPage() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [onboardOpen, setOnboardOpen] = useState(false);
   const [pending, setPending] = useState<PendingAction | null>(null);
@@ -188,6 +191,86 @@ export default function ModelProvidersPage() {
     queryKey: ['model-platform', 'models'],
     queryFn: listManagedModels,
   });
+
+  const { data: health } = useQuery({
+    queryKey: ['model-platform', 'health'],
+    queryFn: getAdminHealth,
+    retry: false,
+  });
+
+  const poolSummaries = useMemo(() => {
+    return MANAGED_MODEL_TYPES.map((spec) => {
+      const ofType = models.filter((m) => m.model_type === spec.bit);
+      const activeCount = ofType.filter((m) => m.status === 'active').length;
+      const defaultModel = ofType.find(
+        (m) => m.is_default && m.status === 'active',
+      );
+      return {
+        spec,
+        totalCount: ofType.length,
+        activeCount,
+        defaultModelName: defaultModel?.model_name,
+      };
+    });
+  }, [models]);
+
+  const modelTypeLabel = (modelType: number) => {
+    const spec = getModelTypeSpec(modelType);
+    return spec
+      ? t(`modelPlatform.modelTypes.${spec.key}`)
+      : t('modelPlatform.modelTypes.unknown');
+  };
+
+  const renderReferences = (model: ManagedModel) => {
+    const spec = getModelTypeSpec(model.model_type);
+    if (spec?.refKind === 'dataset') {
+      return t('modelPlatform.providers.references.datasets', {
+        count: model.active_kb_count,
+      });
+    }
+    if (spec?.refKind === 'assistant') {
+      return t('modelPlatform.providers.references.assistants', {
+        count: model.active_dialog_count,
+      });
+    }
+    return t('modelPlatform.providers.references.none');
+  };
+
+  const describeAction = (action: Action, model: ManagedModel): string => {
+    if (action === 'default') {
+      return t('modelPlatform.providers.confirmDialog.describeDefault', {
+        type: modelTypeLabel(model.model_type),
+        model: model.model_name,
+      });
+    }
+    if (action === 'reactivate') {
+      return t('modelPlatform.providers.confirmDialog.describeReactivate', {
+        model: model.model_name,
+      });
+    }
+    const spec = getModelTypeSpec(model.model_type);
+    if (spec?.refKind === 'dataset') {
+      return t(
+        'modelPlatform.providers.confirmDialog.describeRetireEmbedding',
+        {
+          count: model.active_kb_count,
+          model: model.model_name,
+        },
+      );
+    }
+    if (spec?.refKind === 'assistant') {
+      return t(
+        'modelPlatform.providers.confirmDialog.describeRetireAssistant',
+        {
+          count: model.active_dialog_count,
+          model: model.model_name,
+        },
+      );
+    }
+    return t('modelPlatform.providers.confirmDialog.describeRetireGeneric', {
+      model: model.model_name,
+    });
+  };
 
   const startRollout = (result: RolloutResult) => {
     setTaskId(result.task_id);
@@ -208,23 +291,89 @@ export default function ModelProvidersPage() {
     onError: (error: Error) => message.error(error.message),
   });
 
+  const gatewayBadge = useMemo(() => {
+    if (!health) {
+      return {
+        variant: 'secondary' as const,
+        label: t('modelPlatform.status.gatewayUnconfigured'),
+      };
+    }
+    if (health.status === 'ok' && health.gateway === 'healthy') {
+      return {
+        variant: 'success' as const,
+        label: t('modelPlatform.status.gatewayHealthy'),
+      };
+    }
+    if (health.status === 'degraded') {
+      return {
+        variant: 'destructive' as const,
+        label: t('modelPlatform.status.gatewayDegraded'),
+      };
+    }
+    return {
+      variant: 'secondary' as const,
+      label: t('modelPlatform.status.gatewayUnconfigured'),
+    };
+  }, [health, t]);
+
   return (
     <div className="mx-auto max-w-7xl space-y-6 p-8">
       <div className="flex items-center justify-between border-b pb-4">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight">
             <LucideBox className="size-6" />
-            Platform Managed Models
+            {t('modelPlatform.providers.title')}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Models the platform provides to every tenant through the gateway.
+            {t('modelPlatform.providers.subtitle')}
           </p>
         </div>
-        <Button onClick={() => setOnboardOpen(true)}>
-          <LucidePlus />
-          Onboard model
-        </Button>
+        <div className="flex items-center gap-3">
+          <Badge variant={gatewayBadge.variant} className="gap-1.5">
+            <LucideActivity className="size-3.5" />
+            {gatewayBadge.label}
+          </Badge>
+          <Button onClick={() => setOnboardOpen(true)}>
+            <LucidePlus />
+            {t('modelPlatform.providers.onboardButton')}
+          </Button>
+        </div>
       </div>
+
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold text-muted-foreground">
+          {t('modelPlatform.providers.poolOverviewTitle')}
+        </h2>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {poolSummaries.map(({ spec, activeCount, defaultModelName }) => (
+            <div
+              key={spec.bit}
+              className="rounded-xl border bg-card p-4 text-card-foreground shadow-sm"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium">
+                  {t(`modelPlatform.modelTypes.${spec.key}`)}
+                </span>
+                <Badge variant={activeCount > 0 ? 'success' : 'secondary'}>
+                  {t('modelPlatform.providers.poolActiveCount', {
+                    count: activeCount,
+                  })}
+                </Badge>
+              </div>
+              <p
+                className="mt-2 truncate text-xs text-muted-foreground"
+                title={defaultModelName}
+              >
+                {defaultModelName
+                  ? t('modelPlatform.providers.poolDefaultLabel', {
+                      model: defaultModelName,
+                    })
+                  : t('modelPlatform.providers.poolNoDefault')}
+              </p>
+            </div>
+          ))}
+        </div>
+      </section>
 
       {taskId && <RolloutBanner taskId={taskId} />}
 
@@ -232,12 +381,22 @@ export default function ModelProvidersPage() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Model</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Tenants (active / read-only / retired)</TableHead>
-              <TableHead>References</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
+              <TableHead>
+                {t('modelPlatform.providers.columns.model')}
+              </TableHead>
+              <TableHead>{t('modelPlatform.providers.columns.type')}</TableHead>
+              <TableHead>
+                {t('modelPlatform.providers.columns.status')}
+              </TableHead>
+              <TableHead>
+                {t('modelPlatform.providers.columns.tenants')}
+              </TableHead>
+              <TableHead>
+                {t('modelPlatform.providers.columns.references')}
+              </TableHead>
+              <TableHead className="text-right">
+                {t('modelPlatform.providers.columns.actions')}
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -251,25 +410,23 @@ export default function ModelProvidersPage() {
                     )}
                   </span>
                 </TableCell>
-                <TableCell>{MODEL_TYPE_LABELS[model.model_type]}</TableCell>
+                <TableCell>{modelTypeLabel(model.model_type)}</TableCell>
                 <TableCell>
                   <Badge
                     variant={
                       model.status === 'active' ? 'success' : 'secondary'
                     }
                   >
-                    {model.status}
+                    {model.status === 'active'
+                      ? t('modelPlatform.status.active')
+                      : t('modelPlatform.status.retired')}
                   </Badge>
                 </TableCell>
                 <TableCell>
                   {model.tenants.active} / {model.tenants.deprecated} /{' '}
                   {model.tenants.tombstoned}
                 </TableCell>
-                <TableCell>
-                  {model.model_type === 2
-                    ? `${model.active_kb_count} datasets`
-                    : `${model.active_dialog_count} assistants`}
-                </TableCell>
+                <TableCell>{renderReferences(model)}</TableCell>
                 <TableCell className="space-x-2 text-right">
                   {model.status === 'retired' ? (
                     <Button
@@ -279,7 +436,7 @@ export default function ModelProvidersPage() {
                         setPending({ action: 'reactivate', model })
                       }
                     >
-                      Reactivate
+                      {t('modelPlatform.providers.actions.reactivate')}
                     </Button>
                   ) : (
                     <>
@@ -291,7 +448,7 @@ export default function ModelProvidersPage() {
                             setPending({ action: 'default', model })
                           }
                         >
-                          Set default
+                          {t('modelPlatform.providers.actions.setDefault')}
                         </Button>
                       )}
                       <Button
@@ -300,12 +457,14 @@ export default function ModelProvidersPage() {
                         disabled={model.is_default}
                         title={
                           model.is_default
-                            ? 'Set another model as default before retiring this one'
+                            ? t(
+                                'modelPlatform.providers.actions.retireDisabledTitle',
+                              )
                             : undefined
                         }
                         onClick={() => setPending({ action: 'retire', model })}
                       >
-                        Retire
+                        {t('modelPlatform.providers.actions.retire')}
                       </Button>
                     </>
                   )}
@@ -318,8 +477,7 @@ export default function ModelProvidersPage() {
                   colSpan={6}
                   className="py-8 text-center text-muted-foreground"
                 >
-                  No managed models yet. Add a route to the gateway, then
-                  onboard it here.
+                  {t('modelPlatform.providers.empty')}
                 </TableCell>
               </TableRow>
             )}
@@ -337,24 +495,27 @@ export default function ModelProvidersPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {pending?.action === 'retire' && 'Retire model'}
-              {pending?.action === 'reactivate' && 'Reactivate model'}
-              {pending?.action === 'default' && 'Set as platform default'}
+              {pending?.action === 'retire' &&
+                t('modelPlatform.providers.confirmDialog.retireTitle')}
+              {pending?.action === 'reactivate' &&
+                t('modelPlatform.providers.confirmDialog.reactivateTitle')}
+              {pending?.action === 'default' &&
+                t('modelPlatform.providers.confirmDialog.defaultTitle')}
             </DialogTitle>
             <DialogDescription>
-              {pending && describe(pending.action, pending.model)}
+              {pending && describeAction(pending.action, pending.model)}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="secondary" onClick={() => setPending(null)}>
-              Cancel
+              {t('modelPlatform.providers.confirmDialog.cancel')}
             </Button>
             <Button
               variant={pending?.action === 'retire' ? 'destructive' : 'default'}
               loading={run.isPending}
               onClick={() => pending && run.mutate(pending)}
             >
-              Confirm
+              {t('modelPlatform.providers.confirmDialog.confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>
