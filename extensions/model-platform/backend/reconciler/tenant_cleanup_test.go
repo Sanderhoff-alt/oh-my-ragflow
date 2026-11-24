@@ -253,16 +253,27 @@ func TestTenantDecommissioner_GatewayOutage_PreservesStateForRetry(t *testing.T)
 	}
 }
 
-func TestTenantDecommissioner_RevokesByAliasWhenInstanceMissing(t *testing.T) {
+func issuedKeyHashes(m *mockGatewayClient) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var hashes []string
+	for key := range m.generated {
+		hashes = append(hashes, gateway.HashKey(key))
+	}
+	return hashes
+}
+
+func TestTenantDecommissioner_RevokesByTeamWhenInstanceMissing(t *testing.T) {
 	db := setupTestDB(t)
 	mockClient := newMockGatewayClient()
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
 	decommissioner := NewTenantDecommissioner(mockClient)
 
 	ctx := context.Background()
-	tenantID := "tenant-decom-alias-fallback"
+	tenantID := "tenant-decom-team-fallback"
 	createTestTenantInDB(db, tenantID)
 	_ = rec.Reconcile(ctx, db, tenantID)
+	issued := issuedKeyHashes(mockClient)
 
 	// Hard delete instance row before decommissioner runs
 	db.Exec("DELETE FROM tenant_model_instance")
@@ -276,15 +287,15 @@ func TestTenantDecommissioner_RevokesByAliasWhenInstanceMissing(t *testing.T) {
 	remaining := len(mockClient.generated)
 	mockClient.mu.Unlock()
 
-	if len(deleted) != 1 || deleted[0] != "tenant_"+tenantID {
-		t.Errorf("expected key revoked by alias tenant_%s, got %v", tenantID, deleted)
+	if len(issued) != 1 || len(deleted) != 1 || deleted[0] != issued[0] {
+		t.Errorf("expected the issued key %v to be revoked by hash, got %v", issued, deleted)
 	}
 	if remaining != 0 {
 		t.Errorf("expected gateway key to be gone, %d remaining", remaining)
 	}
 }
 
-func TestTenantDecommissioner_RevokesByAliasIgnoringStoredCredential(t *testing.T) {
+func TestTenantDecommissioner_RevokesEveryTeamKeyIgnoringStoredCredential(t *testing.T) {
 	db := setupTestDB(t)
 	mockClient := newMockGatewayClient()
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
@@ -294,6 +305,11 @@ func TestTenantDecommissioner_RevokesByAliasIgnoringStoredCredential(t *testing.
 	tenantID := "tenant-decom-stale-credential"
 	createTestTenantInDB(db, tenantID)
 	_ = rec.Reconcile(ctx, db, tenantID)
+
+	// A key a failed rotation left behind must not survive the decommission
+	mockClient.mu.Lock()
+	mockClient.generated["sk-leftover"] = &gateway.GenerateKeyRequest{KeyName: "leftover", TeamID: tenantID}
+	mockClient.mu.Unlock()
 
 	// A rotated or tampered local credential must not influence revocation
 	db.Model(&rentity.TenantModelInstance{}).
@@ -309,8 +325,8 @@ func TestTenantDecommissioner_RevokesByAliasIgnoringStoredCredential(t *testing.
 	remaining := len(mockClient.generated)
 	mockClient.mu.Unlock()
 
-	if len(deleted) != 1 || deleted[0] != "tenant_"+tenantID {
-		t.Errorf("expected key revoked by alias tenant_%s, got %v", tenantID, deleted)
+	if len(deleted) != 2 {
+		t.Errorf("expected both team keys revoked, got %v", deleted)
 	}
 	if remaining != 0 {
 		t.Errorf("expected gateway key to be gone, %d remaining", remaining)

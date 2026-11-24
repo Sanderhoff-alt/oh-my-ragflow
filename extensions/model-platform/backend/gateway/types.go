@@ -51,6 +51,7 @@ type GenerateKeyResponse struct {
 // UpdateKeyRequest represents payload for LiteLLM /key/update endpoint.
 type UpdateKeyRequest struct {
 	Key       string                 `json:"key"`
+	KeyAlias  string                 `json:"key_alias,omitempty"`
 	Models    []string               `json:"models,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 	MaxBudget *float64               `json:"max_budget,omitempty"`
@@ -68,9 +69,24 @@ type UpdateKeyResponse struct {
 }
 
 // DeleteKeyRequest represents payload for LiteLLM /key/delete endpoint.
-// Keys are addressed by alias; the platform never handles raw virtual key tokens for revocation.
+// Keys are addressed by the sha256 hex digest of the virtual key, which is the gateway's own token
+// identifier. The platform never sends raw virtual key tokens for revocation.
 type DeleteKeyRequest struct {
-	KeyAliases []string `json:"key_aliases"`
+	Keys []string `json:"keys"`
+}
+
+// TeamKey describes one virtual key of a gateway team as returned by LiteLLM /key/list.
+// Token is the sha256 hex digest of the key, the same value that spend logs carry as api_key.
+type TeamKey struct {
+	Token    string `json:"token"`
+	KeyAlias string `json:"key_alias,omitempty"`
+	TeamID   string `json:"team_id,omitempty"`
+}
+
+// ListKeysResponse represents one page of the LiteLLM /key/list response.
+type ListKeysResponse struct {
+	Keys       []TeamKey `json:"keys"`
+	TotalPages int       `json:"total_pages"`
 }
 
 // KeyInfoResponse represents response from LiteLLM /key/info endpoint.

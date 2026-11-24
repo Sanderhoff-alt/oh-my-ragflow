@@ -63,6 +63,12 @@ func chatStatus(t *testing.T, baseURL, key, model string) int {
 	return resp.StatusCode
 }
 
+// revokeAtCleanup revokes a key a test issued once the test ends, addressing it by its hash like the platform does.
+func revokeAtCleanup(t *testing.T, client gateway.Client, key string) {
+	t.Helper()
+	t.Cleanup(func() { _ = client.DeleteKeysByHash(context.Background(), []string{gateway.HashKey(key)}) })
+}
+
 // generateKeyWithoutModels asks LiteLLM for a key and leaves the models field out, which the gateway client
 // refuses to do, to show what an empty whitelist would mean.
 func generateKeyWithoutModels(t *testing.T, baseURL, masterKey, alias string) string {
@@ -102,7 +108,7 @@ func TestE2E_LiveGateway_EmptyCatalogColdStart(t *testing.T) {
 	db.Create(&mpentity.TenantReconcileRecord{TenantID: tenantID, Status: mpentity.StatusPending, Version: 1})
 
 	client := gateway.NewClient(gateway.GatewayConfig{BaseURL: baseURL, MasterKey: masterKey, Timeout: 10 * time.Second})
-	t.Cleanup(func() { _ = client.DeleteKeyByAlias(ctx, "tenant_"+tenantID) })
+	t.Cleanup(func() { _, _ = mpreconciler.RevokeTenantKeys(ctx, client, tenantID) })
 
 	if err := mpreconciler.NewTenantReconciler(client, baseURL, nil).Reconcile(ctx, db, tenantID); err != nil {
 		t.Fatalf("an empty catalog must not fail the tenant: %v", err)
@@ -137,17 +143,17 @@ func TestE2E_LiveGateway_KeyWhitelistSemantics(t *testing.T) {
 
 	// A whitelist may name models that are not routed yet: the catalog onboards a name before its route exists.
 	unroutedAlias := fmt.Sprintf("e2e-unrouted-%d", suffix)
-	t.Cleanup(func() { _ = client.DeleteKeyByAlias(ctx, unroutedAlias) })
-	if _, err := client.GenerateKey(ctx, &gateway.GenerateKeyRequest{
+	unrouted, err := client.GenerateKey(ctx, &gateway.GenerateKeyRequest{
 		KeyAlias: unroutedAlias,
 		Models:   []string{"a-model-without-a-route", "platform/chat"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("LiteLLM must accept model names that are not in model_list: %v", err)
 	}
+	revokeAtCleanup(t, client, unrouted.Key)
 
 	// The deny-all placeholder really denies a routed model.
 	placeholderAlias := fmt.Sprintf("e2e-placeholder-%d", suffix)
-	t.Cleanup(func() { _ = client.DeleteKeyByAlias(ctx, placeholderAlias) })
 	denied, err := client.GenerateKey(ctx, &gateway.GenerateKeyRequest{
 		KeyAlias: placeholderAlias,
 		Models:   []string{mpreconciler.RevokedModelPlaceholder},
@@ -155,14 +161,15 @@ func TestE2E_LiveGateway_KeyWhitelistSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate the placeholder key: %v", err)
 	}
+	revokeAtCleanup(t, client, denied.Key)
 	if status := chatStatus(t, baseURL, denied.Key, "gpt-4o-mini"); status != http.StatusForbidden {
 		t.Errorf("the placeholder key must be denied, got HTTP %d", status)
 	}
 
 	// An empty whitelist is NOT deny-all: this is why the placeholder exists and the client refuses an empty list.
 	openAlias := fmt.Sprintf("e2e-unrestricted-%d", suffix)
-	t.Cleanup(func() { _ = client.DeleteKeyByAlias(ctx, openAlias) })
 	openKey := generateKeyWithoutModels(t, baseURL, masterKey, openAlias)
+	revokeAtCleanup(t, client, openKey)
 	if status := chatStatus(t, baseURL, openKey, "gpt-4o-mini"); status == http.StatusForbidden || status == http.StatusUnauthorized {
 		t.Errorf("a key without a models list is expected to be unrestricted, got HTTP %d", status)
 	}

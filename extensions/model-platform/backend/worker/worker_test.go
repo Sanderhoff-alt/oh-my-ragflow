@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,6 +168,10 @@ func TestStart_DecommissionsOrphanedTenant(t *testing.T) {
 	var deleteCalls atomic.Int32
 	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/key/list" {
+			_, _ = w.Write([]byte(`{"keys":[{"token":"` + strings.Repeat("a", 64) + `","team_id":"tenant-orphan"}],"total_pages":1}`))
+			return
+		}
 		if r.URL.Path == "/key/delete" {
 			deleteCalls.Add(1)
 		}

@@ -177,13 +177,13 @@ func TestSpendLogCollector_TenantIDResolution(t *testing.T) {
 			expected: "def456",
 		},
 		{
-			name: "from metadata alias",
+			name: "key alias is not a tenant source",
 			entry: gateway.SpendLogEntry{
 				Metadata: map[string]interface{}{
-					"user_api_key_alias": "tenant_ghi789",
+					"user_api_key_alias": "tenant_ghi789_1a2b3c4d",
 				},
 			},
-			expected: "ghi789",
+			expected: "",
 		},
 		{
 			name: "from metadata tenant_id",

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -238,7 +239,10 @@ func TestClient_UpdateKey(t *testing.T) {
 	}
 }
 
-func TestClient_DeleteKeyByAlias(t *testing.T) {
+func TestClient_DeleteKeysByHash(t *testing.T) {
+	hashA := HashKey("sk-key-a")
+	hashB := HashKey("sk-key-b")
+	var received [][]string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/key/delete" {
 			t.Errorf("expected /key/delete, got %s", r.URL.Path)
@@ -246,34 +250,36 @@ func TestClient_DeleteKeyByAlias(t *testing.T) {
 
 		var payload map[string]json.RawMessage
 		json.NewDecoder(r.Body).Decode(&payload)
-
-		if _, hasKeys := payload["keys"]; hasKeys {
-			t.Errorf("payload must not carry raw keys, got %v", payload)
+		if _, hasAliases := payload["key_aliases"]; hasAliases {
+			t.Errorf("payload must address keys by hash only, got %v", payload)
 		}
-		var aliases []string
-		json.Unmarshal(payload["key_aliases"], &aliases)
-		if len(aliases) != 1 || aliases[0] != "tenant_t1" {
-			t.Errorf("unexpected key_aliases: %v", aliases)
-		}
+		var keys []string
+		json.Unmarshal(payload["keys"], &keys)
+		received = append(received, keys)
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"deleted_keys":["tenant_t1"]}`))
+		json.NewEncoder(w).Encode(map[string][]string{"deleted_keys": keys})
 	}))
 	defer server.Close()
 
-	cfg := GatewayConfig{BaseURL: server.URL}
-	client := NewClient(cfg)
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
 
-	if err := client.DeleteKeyByAlias(context.Background(), ""); err == nil {
-		t.Fatal("expected error for empty alias, got nil")
+	if err := client.DeleteKeysByHash(context.Background(), []string{"sk-raw-token"}); err == nil {
+		t.Fatal("expected error for a raw key instead of its hash, got nil")
+	}
+	if len(received) != 0 {
+		t.Fatalf("a raw key must never reach the gateway, got %v", received)
 	}
 
-	if err := client.DeleteKeyByAlias(context.Background(), "tenant_t1"); err != nil {
+	if err := client.DeleteKeysByHash(context.Background(), []string{hashA, hashB}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(received) != 2 || received[0][0] != hashA || received[1][0] != hashB {
+		t.Errorf("expected one delete request per hash, got %v", received)
 	}
 }
 
-func TestClient_DeleteKeyByAlias_NotFoundReturnsError(t *testing.T) {
+func TestClient_DeleteKeysByHash_NotFoundIsIdempotent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"detail":{"error":"No keys found"}}`))
@@ -282,12 +288,82 @@ func TestClient_DeleteKeyByAlias_NotFoundReturnsError(t *testing.T) {
 
 	client := NewClient(GatewayConfig{BaseURL: server.URL})
 
-	err := client.DeleteKeyByAlias(context.Background(), "tenant_missing")
-	if err == nil {
-		t.Fatal("expected error when gateway returns 404, got nil")
+	if err := client.DeleteKeysByHash(context.Background(), []string{HashKey("sk-gone")}); err != nil {
+		t.Fatalf("an already deleted key must not be an error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "status 404") {
-		t.Errorf("expected error to carry 404 status, got %v", err)
+}
+
+func TestClient_DeleteKeysByHash_ServerErrorIsReported(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	err := client.DeleteKeysByHash(context.Background(), []string{HashKey("sk-any")})
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) || statusErr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected a 500 StatusError, got %v", err)
+	}
+}
+
+func TestClient_ListTeamKeys_FollowsPagination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/key/list" {
+			t.Errorf("expected /key/list, got %s", r.URL.Path)
+		}
+		q := r.URL.Query()
+		if q.Get("team_id") != "t1" || q.Get("return_full_object") != "true" || q.Get("size") != "100" {
+			t.Errorf("unexpected query: %v", q)
+		}
+		switch q.Get("page") {
+		case "1":
+			w.Write([]byte(`{"keys":[{"token":"h1","key_alias":"a1","team_id":"t1"}],"total_pages":2}`))
+		case "2":
+			w.Write([]byte(`{"keys":[{"token":"h2","team_id":"t1"}],"total_pages":2}`))
+		default:
+			t.Errorf("unexpected page %q", q.Get("page"))
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	if _, err := client.ListTeamKeys(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty team id, got nil")
+	}
+	keys, err := client.ListTeamKeys(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(keys) != 2 || keys[0].Token != "h1" || keys[1].Token != "h2" {
+		t.Errorf("expected both pages of keys, got %+v", keys)
+	}
+}
+
+func TestClient_ListTeamKeys_EmptyTeam(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"keys":[],"total_count":0,"current_page":1,"total_pages":0}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	keys, err := client.ListTeamKeys(context.Background(), "t1")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("expected no keys and no error, got %+v, %v", keys, err)
+	}
+}
+
+func TestHashKey_MatchesGatewayTokenFormat(t *testing.T) {
+	// sha256("abc") from the FIPS 180-2 test vectors; LiteLLM stores exactly this digest as the key token.
+	const want = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+	if got := HashKey("abc"); got != want {
+		t.Fatalf("HashKey = %s, want %s", got, want)
+	}
+	if !isKeyHash(want) || isKeyHash("sk-abc") || isKeyHash(want[:63]) {
+		t.Fatal("isKeyHash must accept only a 64 character hex digest")
 	}
 }
 

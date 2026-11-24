@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,7 @@ type mockGatewayClient struct {
 	generateErr      error
 	updateErr        error
 	deleteErr        error
+	listErr          error
 	onGenerate       func()
 	keyCounter       int32
 }
@@ -87,7 +89,26 @@ func (m *mockGatewayClient) UpdateKey(ctx context.Context, req *gateway.UpdateKe
 	}, nil
 }
 
-func (m *mockGatewayClient) DeleteKeyByAlias(ctx context.Context, alias string) error {
+func (m *mockGatewayClient) ListTeamKeys(ctx context.Context, teamID string) ([]gateway.TeamKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+
+	var keys []gateway.TeamKey
+	for key, req := range m.generated {
+		if req.TeamID == teamID {
+			keys = append(keys, gateway.TeamKey{Token: gateway.HashKey(key), KeyAlias: req.KeyName, TeamID: req.TeamID})
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Token < keys[j].Token })
+	return keys, nil
+}
+
+// DeleteKeysByHash mirrors the real client: keys that are already gone are not an error.
+func (m *mockGatewayClient) DeleteKeysByHash(ctx context.Context, hashes []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -95,17 +116,14 @@ func (m *mockGatewayClient) DeleteKeyByAlias(ctx context.Context, alias string) 
 		return m.deleteErr
 	}
 
-	found := false
-	for key, req := range m.generated {
-		if req.KeyName == alias {
-			delete(m.generated, key)
-			found = true
+	for _, h := range hashes {
+		for key := range m.generated {
+			if gateway.HashKey(key) == h {
+				delete(m.generated, key)
+				m.deletedKeys = append(m.deletedKeys, h)
+			}
 		}
 	}
-	if !found {
-		return errors.New("gateway returned error status 404: No keys found")
-	}
-	m.deletedKeys = append(m.deletedKeys, alias)
 	return nil
 }
 
@@ -222,11 +240,11 @@ func TestTenantReconciler_SuccessfulProvisioning(t *testing.T) {
 	if state.Status != entity.StatusReady {
 		t.Errorf("expected status ready, got %s", state.Status)
 	}
-	if state.GatewayKeyAlias != "tenant_tenant-test-1" {
-		t.Errorf("expected key alias tenant_tenant-test-1, got %s", state.GatewayKeyAlias)
+	if !strings.HasPrefix(state.GatewayKeyAlias, "tenant_tenant-test-1_") {
+		t.Errorf("expected a key alias labelled with the tenant, got %s", state.GatewayKeyAlias)
 	}
-	if state.KeyHash != hashKey(instance.APIKey) {
-		t.Errorf("expected key hash %s, got %s", hashKey(instance.APIKey), state.KeyHash)
+	if state.KeyHash != gateway.HashKey(instance.APIKey) {
+		t.Errorf("expected key hash %s, got %s", gateway.HashKey(instance.APIKey), state.KeyHash)
 	}
 }
 
