@@ -31,17 +31,25 @@ func LockInstanceWhitelist(instanceID string) (unlock func()) {
 }
 
 // WithInstanceRowLock runs fn as the only writer of an instance's whitelist and tenant_model rows across
-// replicas, using a row lock on the tenant_model_instance row held in a separate transaction while fn
-// runs on its own connection. It does not take the in-process mutex, so it is meant for callers such as
-// the lifecycle managers that take that mutex themselves. SQLite has no row locks and only runs tests.
+// replicas, using a row lock held in a separate transaction while fn runs on its own connection. It does not
+// take the in-process mutex, so it is meant for callers such as the lifecycle managers that take that mutex
+// themselves. SQLite has no row locks and only runs tests.
+//
+// The locked row is the provider the instance belongs to, not the instance itself. fn runs on another
+// connection, and a key rotation writes the instance row (api_key) while it holds this lock: locking that
+// row would make the rotation wait for its own lock until the database gives up.
 func WithInstanceRowLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
 	if db.Dialector.Name() == "sqlite" {
 		return fn()
 	}
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var instance rentity.TenantModelInstance
+		if err := tx.Select("id", "provider_id").Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			return fmt.Errorf("failed to find instance %s: %w", instanceID, err)
+		}
+		var provider rentity.TenantModelProvider
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
-			Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			Where("id = ?", instance.ProviderID).First(&provider).Error; err != nil {
 			return fmt.Errorf("failed to lock instance %s: %w", instanceID, err)
 		}
 		return fn()
