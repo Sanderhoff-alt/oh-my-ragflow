@@ -7,6 +7,7 @@ export default {
       nav: {
         modelProviders: '模型供應商',
         modelUsage: '模型用量統計',
+        tenantCredentials: '租戶憑證與稽核',
       },
       modelTypes: {
         all: '全部類型',
@@ -23,8 +24,94 @@ export default {
         active: '已啟用',
         retired: '已退役',
         gatewayHealthy: '閘道正常',
+        gatewayHealthyWithLatency: '閘道正常 ({{latency}}ms)',
         gatewayDegraded: '閘道異常',
+        gatewayUnreachable: '閘道無法連線',
         gatewayUnconfigured: '閘道狀態不可用',
+        refreshHealth: '重新整理閘道健康狀態',
+        gatewayErrorBannerTitle: '閘道健康檢查回報異常',
+      },
+      actions: {
+        rotateKey: '輪換金鑰',
+        rotateKeyResume: '重新輪換並撤銷',
+        rotateKeyDisabledTitle: '僅就緒狀態的租戶支援輪換閘道金鑰',
+        rotateKeyTitle: '輪換租戶虛擬金鑰',
+        rotateKeyResumeTitle: '重新輪換金鑰並撤銷舊金鑰',
+        rotateKeyDescription:
+          '此操作將為租戶 {{tenantId}} 簽發新的閘道虛擬金鑰，零中斷更新其平台實例設定，並立即撤銷舊金鑰。',
+        rotateKeyResumeDescription:
+          '租戶 {{tenantId}} 上一次金鑰輪換仍有舊金鑰尚未在閘道側完成撤銷（背景清掃任務也會自動重試）。立即確認將簽發新的替代金鑰，並撤銷包含目前生效金鑰在內的所有舊金鑰。',
+        rotateKeyCancel: '取消',
+        rotateKeyConfirm: '確認輪換',
+        rotateKeySuccess:
+          '已完成租戶 {{tenantId}} 的金鑰輪換（別名：{{alias}}）。',
+        rotateKeyPendingRevocation:
+          '租戶 {{tenantId}} 的新金鑰已生效，但舊金鑰撤銷仍在背景收斂中。',
+        rotateKeyResultConverged:
+          '已為租戶 {{tenantId}} 完成金鑰輪換並撤銷全部舊金鑰。',
+        rotateKeyResultPending:
+          '已為租戶 {{tenantId}} 簽發新金鑰，舊金鑰撤銷仍在背景收斂中。',
+        rotateKeyAliasLabel: '新別名：{{alias}}',
+        rotateKeyFingerprintLabel: '新指紋：{{fingerprint}}',
+        rotateKeyTimestampLabel: '輪換時間：{{timestamp}}',
+        rotateKeyRevokedCount: '已撤銷舊金鑰數：{{count}}',
+      },
+      audit: {
+        runAction: '執行稽核',
+        rerun: '重新稽核',
+        close: '關閉',
+        dialogTitle: '租戶消費隔離稽核',
+        dialogSubtitle:
+          '依據平台閘道原始帳單核驗租戶 {{tenantId}} 的模型隔離狀態。',
+        running: '正在執行消費隔離稽核...',
+        failed: '稽核失敗：{{message}}',
+        statusLabel: '稽核結論',
+        passed: '隔離正常',
+        violationDetected: '偵測到異常',
+        notRunYet: '未稽核',
+        selectTenantPrompt: '請輸入租戶 ID',
+        cardHint: '輸入租戶 ID 後即可觸發即時消費隔離稽核。',
+        cardSpendSummary: '託管 {{managed}} / 非託管 {{selfOwned}}',
+        managedSpend: '平台託管模型費用',
+        selfOwnedSpend: '非託管 / 影子消費',
+        unmanagedModels: '偵測到的非託管模型',
+        violations: '違規明細',
+        alertBannerTitle: '偵測到租戶 {{tenantId}} 存在消費隔離違規',
+      },
+      tenants: {
+        title: '租戶憑證與稽核',
+        subtitle:
+          '檢視託管租戶虛擬金鑰狀態、執行緊急金鑰輪換及即時消費隔離稽核。',
+        refresh: '重新整理',
+        dismiss: '關閉提示',
+        totalCount: '共 {{count}} 個租戶',
+        pageLabel: '第 {{page}} 頁',
+        empty: '目前狀態下暫無託管租戶。',
+        loadFailed: '載入租戶憑證清單失敗：{{message}}',
+        filters: {
+          status: '同步狀態',
+        },
+        statuses: {
+          ready: '就緒',
+          degraded: '降級',
+          failed: '失敗',
+          pending: '待處理',
+          provisioning: '初始化中',
+          deleted: '已刪除',
+        },
+        convergence: {
+          clean: '已收斂',
+          dirty: '待完成撤銷',
+        },
+        columns: {
+          tenant: '租戶 ID',
+          status: '狀態',
+          keyAlias: '金鑰別名',
+          fingerprint: '金鑰指紋',
+          lastRotated: '最近輪換',
+          convergence: '金鑰狀態',
+          actions: '操作',
+        },
       },
       providers: {
         title: '平台託管模型',
@@ -62,6 +149,16 @@ export default {
             '已完成 {{succeeded}}/{{total}} 個租戶，待處理 {{pending}}，失敗 {{failed}}',
           usersSummary:
             '（已遷移 {{upgraded}} 名使用者，保留 {{preserved}} 名使用者的自訂選擇）',
+          showFailedDetails: '失敗詳情 ({{count}})',
+          hideFailedDetails: '收合失敗詳情',
+          dismiss: '關閉',
+          loadFailed: '載入下發進度失敗：{{message}}',
+          backToFirstPage: '返回第 1 頁',
+          failedColumns: {
+            tenant: '租戶 ID',
+            retries: '重試次數',
+            error: '最近錯誤',
+          },
         },
         onboardDialog: {
           title: '上架託管模型',
@@ -92,7 +189,10 @@ export default {
         title: '模型用量統計',
         subtitle: '按租戶與模型類型彙總的 Token、語音字元與費用計量檢視。',
         filters: {
-          tenantPlaceholder: '按租戶 ID 篩選',
+          tenantLabel: '租戶 ID',
+          tenantPlaceholder: '例如 tenant_123',
+          modelLabel: '模型名稱',
+          modelPlaceholder: '例如 deepseek-v3',
           startDate: '開始日期',
           endDate: '結束日期',
           modelType: '模型類型',
@@ -101,13 +201,22 @@ export default {
         cards: {
           totalSpend: '累計費用',
           totalCalls: '共 {{value}} 次呼叫',
+          cacheSavings: '快取節省：{{value}}',
           totalTokens: '總 Token 消耗',
           tokenSplit: '輸入 {{prompt}} / 輸出 {{completion}}',
+          advancedTokens: '快取 {{cached}} / 推理 {{reasoning}}',
           totalCharacters: '語音合成字元數 (TTS)',
           charactersHint: '透過 /v1/audio/speech 計量的合成字元數',
-          selfManaged: '租戶自有模型',
-          zeroBilled: '零計費',
-          selfManagedHint: '租戶自配實例嚴格隔離',
+          isolationAudit: '消費隔離稽核',
+        },
+        trend: {
+          title: '每日消耗趨勢',
+          subtitle: '按目前篩選條件的日期維度彙總趨勢。',
+          cappedHint:
+            '目前顯示最近 {{shown}} / {{total}} 筆明細的彙總趨勢，可縮小日期範圍以檢視完整彙總。',
+          spendSeries: '費用 (USD)',
+          tokensSeries: 'Token 數',
+          partialSeriesLabel: '{{series}}（部分統計）',
         },
         table: {
           title: '每日用量明細',
@@ -129,6 +238,7 @@ export default {
         error: {
           summaryFailed: '載入用量彙總失敗：{{message}}',
           dailyFailed: '載入每日用量明細失敗：{{message}}',
+          trendFailed: '載入每日消耗趨勢失敗：{{message}}',
           retry: '重試',
         },
         pagination: {

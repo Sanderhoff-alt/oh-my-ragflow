@@ -27,7 +27,9 @@ function isFlagEnabled(value: boolean | string | undefined): boolean {
  * Detects platform-managed instances (covering Chat, Embedding, Rerank, ASR,
  * Vision, TTS, and Decision models routed through the managed platform
  * instance) and renders a localized read-only protection badge while hiding
- * mutation and deletion controls.
+ * instance-level and model-level mutation controls. Read-only inspection
+ * controls (model search, type tag filters, and connectivity verify) stay
+ * interactive.
  */
 export function ProviderInstanceCardWithPrivilege({
   providerName,
@@ -61,7 +63,22 @@ export function ProviderInstanceCardWithPrivilege({
         <ShieldCheck className="size-3.5 text-blue-600 dark:text-blue-400" />
         <span>{t('modelPlatform.badge.managed')}</span>
       </div>
-      <div className="pointer-events-auto [&_[data-testid=draft-delete]]:hidden [&_[data-testid=instance-delete]]:hidden [&_[data-testid=instance-save]]:hidden [&_button:has(.lucide-trash-2)]:hidden [&_input]:pointer-events-none [&_input]:opacity-85">
+      <div
+        className={[
+          'pointer-events-auto',
+          '[&_[data-testid=draft-delete]]:hidden',
+          '[&_[data-testid=instance-delete]]:hidden',
+          '[&_[data-testid=instance-save]]:hidden',
+          '[&_[data-testid=models-more-actions]]:hidden',
+          '[&_[data-testid=models-batch-toggle]]:hidden',
+          '[&_[data-testid^=models-edit-]]:hidden',
+          '[&_button:has(.lucide-trash-2)]:hidden',
+          '[&_[data-testid^=models-row-]_button:has(.lucide-minus)]:hidden',
+          '[&_[data-testid^=models-row-]_button:has(.lucide-plus)]:hidden',
+          '[&_form_input]:pointer-events-none',
+          '[&_form_input]:opacity-85',
+        ].join(' ')}
+      >
         <ProviderInstanceCard
           providerName={providerName}
           instance={instance}
