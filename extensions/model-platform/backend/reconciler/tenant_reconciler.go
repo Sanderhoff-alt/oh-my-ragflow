@@ -24,13 +24,53 @@ const (
 	ProviderOpenAIAPICompatible = "OpenAI-API-Compatible"
 	// PlatformInstanceName identifies platform-managed instances.
 	PlatformInstanceName = "platform"
-	// DefaultChatModelName is the primary default chat model.
-	DefaultChatModelName = "gpt-4o-mini"
-	// DefaultEmbeddingModelName is the primary default embedding model.
-	DefaultEmbeddingModelName = "text-embedding-3-small"
 	// DefaultGatewayBaseURL is the internal loopback proxy endpoint.
 	DefaultGatewayBaseURL = "http://127.0.0.1:4000"
 )
+
+// managedModelRef is the composite reference stored in user_tenant for a managed model.
+func managedModelRef(modelName string) string {
+	return fmt.Sprintf("%s@%s@%s", modelName, PlatformInstanceName, ProviderOpenAIAPICompatible)
+}
+
+// activeCatalogModels returns the active catalog models a new tenant is provisioned with. A non-empty
+// allowedModels restricts them, an empty one permits every model.
+func (r *TenantReconciler) activeCatalogModels(ctx context.Context, db *gorm.DB) ([]entity.PlatformManagedModel, error) {
+	var rows []entity.PlatformManagedModel
+	if err := db.WithContext(ctx).Where("status = ?", entity.ManagedModelStatusActive).
+		Order("model_name ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(r.allowedModels) == 0 {
+		return rows, nil
+	}
+	permitted := rows[:0]
+	for _, m := range rows {
+		if isModelPermitted(m.ModelName, r.allowedModels) {
+			permitted = append(permitted, m)
+		}
+	}
+	return permitted, nil
+}
+
+// initialWhitelist is the model list of a new tenant's virtual key. LiteLLM treats an empty list as
+// unrestricted and the gateway client rejects it, so an empty catalog yields the deny-all placeholder.
+func initialWhitelist(catalog []entity.PlatformManagedModel) []string {
+	if len(catalog) == 0 {
+		return []string{RevokedModelPlaceholder}
+	}
+	whitelist := []string{"platform/chat"}
+	for _, m := range catalog {
+		if m.ModelType == int(rentity.ModelTypeEmbedding) {
+			whitelist = append(whitelist, "platform/embedding")
+			break
+		}
+	}
+	for _, m := range catalog {
+		whitelist = append(whitelist, m.ModelName)
+	}
+	return whitelist
+}
 
 // GatewayKeyClient defines the contract for LiteLLM virtual key management.
 type GatewayKeyClient interface {
@@ -48,18 +88,11 @@ type TenantReconciler struct {
 	allowedModels   []string
 }
 
-// NewTenantReconciler creates a new TenantReconciler.
+// NewTenantReconciler creates a new TenantReconciler. The models a tenant is provisioned with come from
+// the managed model catalog. A non-empty allowedModels restricts them, an empty one permits every model.
 func NewTenantReconciler(client GatewayKeyClient, baseURL string, allowedModels []string) *TenantReconciler {
 	if baseURL == "" {
 		baseURL = DefaultGatewayBaseURL
-	}
-	if len(allowedModels) == 0 {
-		allowedModels = []string{
-			"platform/chat",
-			"platform/embedding",
-			DefaultChatModelName,
-			DefaultEmbeddingModelName,
-		}
 	}
 	return &TenantReconciler{
 		gatewayClient:   client,
@@ -144,7 +177,13 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		return nil
 	}
 
-	// 3. Claim for provisioning using optimistic lock
+	// 3. Read the catalog before claiming, so a catalog read failure leaves the record untouched for the next attempt
+	catalog, err := r.activeCatalogModels(ctx, silentDB)
+	if err != nil {
+		return fmt.Errorf("failed to read the managed model catalog: %w", err)
+	}
+
+	// 3.1 Claim for provisioning using optimistic lock
 	var claimedRec *entity.TenantReconcileRecord
 	if optCfg.enforceDeadline {
 		claimedRec, err = r.reconcileDAO.ClaimDueForProvisioning(ctx, silentDB, tenantID, rec.Version, time.Now())
@@ -166,7 +205,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		KeyName: keyAlias,
 		TeamID:  tenantID,
 		UserID:  tenantID,
-		Models:  r.allowedModels,
+		Models:  initialWhitelist(catalog),
 	}
 
 	genResp, err := r.gatewayClient.GenerateKey(ctx, genReq)
@@ -255,36 +294,22 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 			}
 		}
 
-		// C. TenantModel records (Chat + Embedding)
+		// C. TenantModel records for every active catalog model
 		modelExtraBytes, _ := json.Marshal(map[string]interface{}{"is_managed": true})
 		modelExtraJSON := string(modelExtraBytes)
 
-		modelsToEnsure := []struct {
-			name      string
-			modelType int
-		}{
-			{name: DefaultChatModelName, modelType: int(rentity.ModelTypeChat)},
-			{name: DefaultEmbeddingModelName, modelType: int(rentity.ModelTypeEmbedding)},
-		}
-
-		var chatTenantModelID string
-		var embdTenantModelID string
-
-		for _, m := range modelsToEnsure {
-			if !isModelPermitted(m.name, r.allowedModels) {
-				continue
-			}
-
+		var defaultsCfg DefaultModelConfig
+		for _, m := range catalog {
 			var tm rentity.TenantModel
-			err := tx.Where("instance_id = ? AND model_name = ?", instance.ID, m.name).
+			err := tx.Where("instance_id = ? AND model_name = ?", instance.ID, m.ModelName).
 				First(&tm).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				tm = rentity.TenantModel{
 					ID:         generateID(),
-					ModelName:  m.name,
+					ModelName:  m.ModelName,
 					ProviderID: provider.ID,
 					InstanceID: instance.ID,
-					ModelType:  m.modelType,
+					ModelType:  m.ModelType,
 					Status:     "active",
 					Extra:      modelExtraJSON,
 				}
@@ -295,24 +320,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 				return err
 			}
 
-			if m.name == DefaultChatModelName {
-				chatTenantModelID = tm.ID
-			} else if m.name == DefaultEmbeddingModelName {
-				embdTenantModelID = tm.ID
+			if m.IsDefault {
+				defaultsCfg.setDefault(m.ModelType, managedModelRef(m.ModelName), tm.ID)
 			}
 		}
 
-		// D. Atomically and conditionally initialize user_tenant default models
-		var defaultsCfg DefaultModelConfig
-		if chatTenantModelID != "" {
-			defaultsCfg.ChatModelID = fmt.Sprintf("%s@%s@%s", DefaultChatModelName, PlatformInstanceName, ProviderOpenAIAPICompatible)
-			defaultsCfg.ChatTenantModelID = chatTenantModelID
-		}
-		if embdTenantModelID != "" {
-			defaultsCfg.EmbeddingModelID = fmt.Sprintf("%s@%s@%s", DefaultEmbeddingModelName, PlatformInstanceName, ProviderOpenAIAPICompatible)
-			defaultsCfg.EmbeddingTenantModelID = embdTenantModelID
-		}
-
+		// D. Atomically and conditionally initialize user_tenant default models from the catalog defaults
 		_, err = r.defaultsManager.InitializeTenantDefaults(ctx, tx, tenantID, defaultsCfg)
 		if err != nil {
 			return fmt.Errorf("failed to initialize tenant defaults: %w", err)

@@ -22,6 +22,7 @@ import (
 	mpmetering "ragflow/extensions/model-platform/backend/metering"
 	mpmigration "ragflow/extensions/model-platform/backend/migration"
 	mpreconciler "ragflow/extensions/model-platform/backend/reconciler"
+	"ragflow/extensions/model-platform/backend/testenv"
 	"ragflow/internal/common"
 	rdao "ragflow/internal/dao"
 	rentity "ragflow/internal/entity"
@@ -55,6 +56,10 @@ func setupStabilityTestDB(t *testing.T) *gorm.DB {
 	_ = mpmigration.MigratePreferenceSchema(ctx, db)
 	_ = mpmigration.MigrateSpendLogSchema(ctx, db)
 	_ = mpmigration.MigrateUsageSchema(ctx, db)
+	_ = mpmigration.MigratePublishSchema(ctx, db)
+	if err := testenv.SeedPlatformTestModels(db); err != nil {
+		t.Fatalf("failed to seed the baseline catalog: %v", err)
+	}
 
 	return db
 }

@@ -18,6 +18,7 @@ import (
 	"ragflow/extensions/model-platform/backend/gateway"
 	mpmigration "ragflow/extensions/model-platform/backend/migration"
 	mpreconciler "ragflow/extensions/model-platform/backend/reconciler"
+	"ragflow/extensions/model-platform/backend/testenv"
 	"ragflow/internal/common"
 	rentity "ragflow/internal/entity"
 	"ragflow/internal/entity/models"
@@ -73,6 +74,12 @@ func setupE2ETestDB(t *testing.T) *gorm.DB {
 	}
 	if err := mpmigration.MigrateUsageSchema(ctx, db); err != nil {
 		t.Fatalf("failed to migrate usage schema: %v", err)
+	}
+	if err := mpmigration.MigratePublishSchema(ctx, db); err != nil {
+		t.Fatalf("failed to migrate publish schema: %v", err)
+	}
+	if err := testenv.SeedPlatformTestModels(db); err != nil {
+		t.Fatalf("failed to seed the baseline catalog: %v", err)
 	}
 
 	return db

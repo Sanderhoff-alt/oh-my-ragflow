@@ -27,6 +27,22 @@ type DefaultModelConfig struct {
 	Image2TextTenantModelID string
 }
 
+// setDefault records the default model of one ModelType. Types without a default slot are ignored.
+func (c *DefaultModelConfig) setDefault(modelType int, modelRef, tenantModelID string) {
+	switch modelType {
+	case int(rentity.ModelTypeChat):
+		c.ChatModelID, c.ChatTenantModelID = modelRef, tenantModelID
+	case int(rentity.ModelTypeEmbedding):
+		c.EmbeddingModelID, c.EmbeddingTenantModelID = modelRef, tenantModelID
+	case int(rentity.ModelTypeRerank):
+		c.RerankModelID, c.RerankTenantModelID = modelRef, tenantModelID
+	case int(rentity.ModelTypeSpeech2Text):
+		c.ASRModelID, c.ASRTenantModelID = modelRef, tenantModelID
+	case int(rentity.ModelTypeImage2Text):
+		c.Image2TextModelID, c.Image2TextTenantModelID = modelRef, tenantModelID
+	}
+}
+
 // DefaultsInitResult records the number of user_tenant rows updated for each model type.
 type DefaultsInitResult struct {
 	ChatUpdated       int64

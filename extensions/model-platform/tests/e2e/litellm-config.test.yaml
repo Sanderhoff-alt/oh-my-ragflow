@@ -1,0 +1,36 @@
+# LiteLLM Proxy Security & Secret Isolation Configuration
+# Pinned version target: v1.110.0+ (Latest Stable)
+
+model_list:
+  # Standard Chat Model (Matches RAGFlow conf/all_models.json catalog metadata)
+  # Note: Per-tenant rate limits and token budgets are enforced dynamically
+  # via LiteLLM Virtual Keys (/key/generate) rather than static model-level router limits.
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
+      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
+
+  # Standard Embedding Model (Matches RAGFlow conf/all_models.json catalog metadata)
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
+      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  disable_spend_logs: false
+
+litellm_settings:
+  # Credential masking & log desensitization:
+  # 1. Redact all user and master API key information from console outputs and logs
+  redact_user_api_key_info: true
+  # 2. Prevent arbitrary unvalidated parameters from propagating upstream
+  drop_params: true
+  # 3. Disable verbose stack traces to prevent sensitive environment variable dumps
+  set_verbose: false
+  # 4. Enforce structured JSON logging for secure log ingestion
+  json_logs: true

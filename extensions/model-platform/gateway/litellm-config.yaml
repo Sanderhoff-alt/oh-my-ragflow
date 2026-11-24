@@ -1,22 +1,18 @@
 # LiteLLM Proxy Security & Secret Isolation Configuration
 # Pinned version target: v1.110.0+ (Latest Stable)
 
-model_list:
-  # Standard Chat Model (Matches RAGFlow conf/all_models.json catalog metadata)
-  # Note: Per-tenant rate limits and token budgets are enforced dynamically
-  # via LiteLLM Virtual Keys (/key/generate) rather than static model-level router limits.
-  - model_name: gpt-4o-mini
-    litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
-      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
-
-  # Standard Embedding Model (Matches RAGFlow conf/all_models.json catalog metadata)
-  - model_name: text-embedding-3-small
-    litellm_params:
-      model: openai/text-embedding-3-small
-      api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
-      api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
+model_list: []
+  # No model is routed by default, so private and air-gapped deployments are not polluted with
+  # unreachable upstream models. Add a route here for every model an administrator onboards through
+  # POST /api/v1/admin/model-platform/models (the publish API verifies it with GET /v1/models).
+  # Per-tenant rate limits and token budgets are enforced dynamically via LiteLLM Virtual Keys
+  # (/key/generate) rather than static model-level router limits.
+  #
+  # - model_name: gpt-4o-mini
+  #   litellm_params:
+  #     model: openai/gpt-4o-mini
+  #     api_key: os.environ/PLATFORM_UPSTREAM_OPENAI_KEY
+  #     api_base: os.environ/PLATFORM_UPSTREAM_OPENAI_BASE
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
