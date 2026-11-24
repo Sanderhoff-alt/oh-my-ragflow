@@ -10,6 +10,7 @@ import (
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // instanceWhitelistLocks serializes whitelist rebuilds per platform instance in this process,
@@ -27,6 +28,43 @@ func LockInstanceWhitelist(instanceID string) (unlock func()) {
 	mu := instanceWhitelistMutex(instanceID)
 	mu.Lock()
 	return mu.Unlock
+}
+
+// WithInstanceRowLock runs fn as the only writer of an instance's whitelist and tenant_model rows across
+// replicas, using a row lock on the tenant_model_instance row held in a separate transaction while fn
+// runs on its own connection. It does not take the in-process mutex, so it is meant for callers such as
+// the lifecycle managers that take that mutex themselves. SQLite has no row locks and only runs tests.
+func WithInstanceRowLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
+	if db.Dialector.Name() == "sqlite" {
+		return fn()
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var instance rentity.TenantModelInstance
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
+			Where("id = ?", instanceID).First(&instance).Error; err != nil {
+			return fmt.Errorf("failed to lock instance %s: %w", instanceID, err)
+		}
+		return fn()
+	})
+}
+
+// WithInstanceWhitelistLock is WithInstanceRowLock plus the in-process mutex, which also serializes the
+// goroutines of one replica and makes SQLite, which has no row locks, behave the same in tests. The order
+// is always row lock first, mutex second: the lifecycle managers take the mutex inside a caller that
+// already holds the row lock, so the reverse order here would deadlock against them.
+func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
+	return WithInstanceRowLock(ctx, db, instanceID, func() error {
+		unlock := LockInstanceWhitelist(instanceID)
+		defer unlock()
+		return fn()
+	})
+}
+
+// RetirementFlags reports the per-tenant retirement state recorded in a tenant_model extra value:
+// deprecated (read-only but still authorized) and tombstoned (disabled and removed from the whitelist).
+func RetirementFlags(extraJSON string) (deprecated, tombstoned bool) {
+	extra := parseExtraMap(extraJSON)
+	return extra["deprecated"] == true, extra["tombstoned"] == true
 }
 
 type gatewayOverride int

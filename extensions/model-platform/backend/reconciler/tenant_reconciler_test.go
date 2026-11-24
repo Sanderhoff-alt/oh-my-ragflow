@@ -14,6 +14,7 @@ import (
 	"ragflow/extensions/model-platform/backend/entity"
 	"ragflow/extensions/model-platform/backend/gateway"
 	"ragflow/extensions/model-platform/backend/migration"
+	"ragflow/extensions/model-platform/backend/testenv"
 	rentity "ragflow/internal/entity"
 
 	"github.com/glebarez/sqlite"
@@ -142,6 +143,14 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	)
 	if err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
+	}
+
+	// The baseline catalog replaces the models Reconcile used to hardcode
+	if err := migration.MigratePublishSchema(context.Background(), db); err != nil {
+		t.Fatalf("failed to migrate publish schema: %v", err)
+	}
+	if err := testenv.SeedPlatformTestModels(db); err != nil {
+		t.Fatalf("failed to seed the baseline catalog: %v", err)
 	}
 
 	return db

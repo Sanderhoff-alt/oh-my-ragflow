@@ -323,18 +323,16 @@ for entry in model_list:
         sys.exit(1)
     models_by_name.setdefault(name, []).append(entry)
 
-for required_model in ['gpt-4o-mini', 'text-embedding-3-small']:
-    if required_model not in models_by_name:
-        print(f"FAIL: Missing active '{required_model}' model_name entry in {config_file}", file=sys.stderr)
-        sys.exit(1)
-    if required_model == 'text-embedding-3-small':
-        for entry in models_by_name[required_model]:
-            target_model = entry.get('litellm_params', {}).get('model', '')
-            if not target_model.startswith('openai/'):
-                print(f"FAIL: Embedding model '{required_model}' litellm_params.model must start with 'openai/', got '{target_model}' in {config_file}", file=sys.stderr)
-                sys.exit(1)
+# The catalog decides which models exist, so an empty model_list is valid. Every route that is listed
+# must name its provider explicitly (for example openai/gpt-4o-mini).
+for name, entries in models_by_name.items():
+    for entry in entries:
+        target_model = entry['litellm_params']['model']
+        if '/' not in target_model:
+            print(f"FAIL: Model '{name}' litellm_params.model must carry an explicit provider prefix, got '{target_model}' in {config_file}", file=sys.stderr)
+            sys.exit(1)
 EOF
-echo "[PASS] Model definitions verified (Chat and Embedding models with explicit prefixes)."
+echo "[PASS] Model definitions verified (every listed route has an explicit provider prefix)."
 
 # 6. Verify security settings (credential desensitization & secret isolation)
 echo "--> Checking security settings..."

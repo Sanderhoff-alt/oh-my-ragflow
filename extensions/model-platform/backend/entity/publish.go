@@ -2,18 +2,19 @@ package entity
 
 import "time"
 
-// Catalog status values of PlatformManagedModel.
+// Catalog status values of PlatformManagedModel. The catalog only records the administrator's intent;
+// deprecated and tombstoned are per-tenant states derived from it (see tenant_model extra flags).
 const (
-	ManagedModelStatusActive     = "active"
-	ManagedModelStatusDeprecated = "deprecated"
-	ManagedModelStatusDisabled   = "disabled"
+	ManagedModelStatusActive  = "active"
+	ManagedModelStatusRetired = "retired"
 )
 
 // PlatformManagedModel is the administrator-owned catalog of platform managed models.
+// model_name is unique because the gateway routes and the virtual key whitelists are keyed by name.
 type PlatformManagedModel struct {
 	ID         string  `gorm:"column:id;primaryKey;size:32" json:"id"`
-	ModelName  string  `gorm:"column:model_name;size:128;not null;uniqueIndex:idx_model_type_name" json:"model_name"`
-	ModelType  int     `gorm:"column:model_type;not null;index;uniqueIndex:idx_model_type_name" json:"model_type"` // bit flags of ragflow/internal/entity.ModelType
+	ModelName  string  `gorm:"column:model_name;size:128;not null;uniqueIndex:idx_managed_model_name" json:"model_name"`
+	ModelType  int     `gorm:"column:model_type;not null;index" json:"model_type"` // bit flags of ragflow/internal/entity.ModelType
 	IsDefault  bool    `gorm:"column:is_default;not null;default:false;index" json:"is_default"`
 	Status     string  `gorm:"column:status;size:32;not null;default:'active';index" json:"status"`
 	Extra      *string `gorm:"column:extra;type:text" json:"extra,omitempty"`
@@ -63,8 +64,12 @@ type ModelPublishItem struct {
 	NextRetryAt *time.Time        `gorm:"column:next_retry_at;index:idx_publish_item_due,priority:2" json:"next_retry_at,omitempty"`
 	LastError   string            `gorm:"column:last_error;type:text" json:"last_error,omitempty"`
 	Version     int64             `gorm:"column:version;not null;default:1" json:"version"`
-	CreatedAt   time.Time         `gorm:"column:created_at;autoCreateTime" json:"created_at"`
-	UpdatedAt   time.Time         `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
+	// UpgradedCount and PreservedCount are the users StickyGuard moved to the platform default in this tenant
+	// and the users whose explicit choice it kept. They stay zero unless the model is the platform default.
+	UpgradedCount  int64     `gorm:"column:upgraded_count;not null;default:0" json:"upgraded_count"`
+	PreservedCount int64     `gorm:"column:preserved_count;not null;default:0" json:"preserved_count"`
+	CreatedAt      time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 }
 
 // TableName returns the physical table name for ModelPublishItem.

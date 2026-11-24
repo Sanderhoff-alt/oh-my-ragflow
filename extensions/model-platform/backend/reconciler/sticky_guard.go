@@ -155,6 +155,124 @@ func (g *StickyGuard) SetUserExplicitPreference(
 	})
 }
 
+// userTenantSlotColumns returns the user_tenant columns holding the model reference and the tenant model id
+// of a model type.
+func userTenantSlotColumns(modelType int) (idColumn, tenantModelColumn string) {
+	switch modelType {
+	case int(rentity.ModelTypeChat):
+		return "llm_id", "tenant_llm_id"
+	case int(rentity.ModelTypeEmbedding):
+		return "embd_id", "tenant_embd_id"
+	case int(rentity.ModelTypeRerank):
+		return "rerank_id", "tenant_rerank_id"
+	case int(rentity.ModelTypeSpeech2Text):
+		return "asr_id", "tenant_asr_id"
+	case int(rentity.ModelTypeImage2Text):
+		return "img2txt_id", "tenant_img2txt_id"
+	}
+	return "", ""
+}
+
+// ReplaceRetiredDefault moves every user of the tenant whose default of modelType is the retired model to the
+// replacement, whatever the origin of that choice was: a tombstoned model cannot be used, so keeping the
+// choice has no value and would only make the next chat or dataset fail. The moved users become
+// platform_default. When there is no replacement (newModelID is empty) the default is cleared, the preference
+// is dropped, and the default initialization fills the slot once the platform has a default.
+// A model is matched by its composite reference or by the id of the tenant's own tenant_model row.
+// It returns the number of users that were moved.
+func (g *StickyGuard) ReplaceRetiredDefault(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	modelType int,
+	retiredModelID string,
+	retiredTenantModelID string,
+	newModelID string,
+	newTenantModelID string,
+) (int64, error) {
+	if db == nil {
+		return 0, dao.ErrNilTransaction
+	}
+	if tenantID == "" {
+		return 0, dao.ErrEmptyTenantID
+	}
+	if retiredModelID == "" {
+		return 0, errors.New("retiredModelID cannot be empty")
+	}
+	idColumn, tenantModelColumn := userTenantSlotColumns(modelType)
+	if idColumn == "" {
+		return 0, fmt.Errorf("unsupported model type: %d", modelType)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	silentDB := db.WithContext(ctx).Session(&gorm.Session{Logger: db.Logger.LogMode(logger.Silent)})
+	var moved int64
+	err := silentDB.Transaction(func(tx *gorm.DB) error {
+		match := idColumn + " = ?"
+		args := []interface{}{tenantID, retiredModelID}
+		if retiredTenantModelID != "" {
+			match += " OR " + tenantModelColumn + " = ?"
+			args = append(args, retiredTenantModelID)
+		}
+		query := tx.Where("tenant_id = ? AND ("+match+")", args...)
+		if tx.Dialector.Name() != "sqlite" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var members []rentity.UserTenant
+		if err := query.Find(&members).Error; err != nil {
+			return fmt.Errorf("failed to read the users of the retired default: %w", err)
+		}
+
+		now := time.Now().Local()
+		nowMilli := now.UnixMilli()
+		nowDate := now.Truncate(time.Second)
+		var tenantModelValue interface{}
+		if newTenantModelID != "" {
+			tenantModelValue = newTenantModelID
+		}
+		for _, m := range members {
+			if err := tx.Model(&rentity.UserTenant{}).Where("id = ?", m.ID).Updates(map[string]interface{}{
+				idColumn:          newModelID,
+				tenantModelColumn: tenantModelValue,
+				"update_time":     &nowMilli,
+				"update_date":     &nowDate,
+			}).Error; err != nil {
+				return fmt.Errorf("failed to replace the retired default of user %s: %w", m.UserID, err)
+			}
+
+			if newModelID == "" {
+				if err := tx.Where("tenant_id = ? AND user_id = ? AND model_type = ?", tenantID, m.UserID, modelType).
+					Delete(&mpentity.UserDefaultPreference{}).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			pref := mpentity.UserDefaultPreference{
+				ID:             generatePrefID(),
+				TenantID:       tenantID,
+				UserID:         m.UserID,
+				ModelType:      modelType,
+				Origin:         mpentity.OriginPlatformDefault,
+				CurrentModelID: newModelID,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "tenant_id"}, {Name: "user_id"}, {Name: "model_type"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"origin":           mpentity.OriginPlatformDefault,
+					"current_model_id": newModelID,
+				}),
+			}).Create(&pref).Error; err != nil {
+				return err
+			}
+		}
+		moved = int64(len(members))
+		return nil
+	})
+	return moved, err
+}
+
 // userTenantSlot returns the model reference and tenant model id a membership currently holds for a model type.
 func userTenantSlot(ut *rentity.UserTenant, modelType int) (modelID, tenantModelID string) {
 	deref := func(s *string) string {

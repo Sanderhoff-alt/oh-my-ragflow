@@ -41,7 +41,8 @@ func setupPublishAdminServer(t *testing.T, routed ...string) (*gin.Engine, *gorm
 	if err := migration.MigratePublishSchema(ctx, db); err != nil {
 		t.Fatalf("failed to migrate publish schema: %v", err)
 	}
-	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{}); err != nil {
+	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{},
+		&rentity.Knowledgebase{}, &rentity.Chat{}); err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
 	}
 
@@ -65,6 +66,82 @@ func doJSON(r *gin.Engine, method, path, body string) (int, map[string]interface
 	var out map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &out)
 	return w.Code, out
+}
+
+func TestPublishAPI_SetDefault(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m-active", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-retired", ModelName: "old-model", ModelType: 1, Status: entity.ManagedModelStatusRetired})
+
+	code, out := doJSON(r, http.MethodPut, "/admin/model-platform/models/m-active/default", "")
+	if code != http.StatusAccepted || out["data"].(map[string]interface{})["task_id"] == "" {
+		t.Fatalf("expected 202 with a task, got %d: %v", code, out)
+	}
+	var model entity.PlatformManagedModel
+	db.Where("id = ?", "m-active").First(&model)
+	if !model.IsDefault {
+		t.Error("expected the model to become the platform default")
+	}
+	if code, _ = doJSON(r, http.MethodPut, "/admin/model-platform/models/m-retired/default", ""); code != http.StatusConflict {
+		t.Errorf("expected 409 for a retired model, got %d", code)
+	}
+	if code, _ = doJSON(r, http.MethodPut, "/admin/model-platform/models/missing/default", ""); code != http.StatusNotFound {
+		t.Errorf("expected 404 for an unknown model, got %d", code)
+	}
+}
+
+func TestPublishAPI_RetireAndReactivate(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m-chat", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-default", ModelName: "gpt-4o-mini", ModelType: 1, IsDefault: true, Status: entity.ManagedModelStatusActive})
+
+	code, out := doJSON(r, http.MethodPost, "/admin/model-platform/models/m-chat/retire", "")
+	if code != http.StatusAccepted || out["data"].(map[string]interface{})["task_id"] == "" {
+		t.Fatalf("expected 202 with a task, got %d: %v", code, out)
+	}
+	var model entity.PlatformManagedModel
+	db.Where("id = ?", "m-chat").First(&model)
+	if model.Status != entity.ManagedModelStatusRetired {
+		t.Errorf("expected the catalog to be retired, got %s", model.Status)
+	}
+
+	code, out = doJSON(r, http.MethodPost, "/admin/model-platform/models/m-default/retire", "")
+	if code != http.StatusBadRequest || out["message"] == "" {
+		t.Errorf("expected 400 for the platform default, got %d: %v", code, out)
+	}
+	if code, _ = doJSON(r, http.MethodPost, "/admin/model-platform/models/missing/retire", ""); code != http.StatusNotFound {
+		t.Errorf("expected 404 for an unknown model, got %d", code)
+	}
+
+	if code, _ = doJSON(r, http.MethodPost, "/admin/model-platform/models/m-chat/reactivate", ""); code != http.StatusAccepted {
+		t.Errorf("expected 202 on reactivation, got %d", code)
+	}
+	db.Where("id = ?", "m-chat").First(&model)
+	if model.Status != entity.ManagedModelStatusActive {
+		t.Errorf("expected the catalog to be active again, got %s", model.Status)
+	}
+}
+
+func TestPublishAPI_ListCatalog(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m2", ModelName: "bge-m3", ModelType: 2, Status: entity.ManagedModelStatusRetired})
+
+	code, out := doJSON(r, http.MethodGet, "/admin/model-platform/models", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %v", code, out)
+	}
+	items := out["data"].([]interface{})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 catalog entries, got %v", items)
+	}
+	first := items[0].(map[string]interface{})
+	if first["model_name"] != "bge-m3" || first["status"] != "retired" {
+		t.Errorf("expected entries sorted by name with the derived status, got %v", first)
+	}
+	if _, ok := first["tenants"].(map[string]interface{}); !ok {
+		t.Errorf("expected the per-tenant state breakdown, got %v", first)
+	}
 }
 
 func TestPublishAPI_PublishAndProgress(t *testing.T) {
@@ -97,7 +174,7 @@ func TestPublishAPI_PublishAndProgress(t *testing.T) {
 
 func TestPublishAPI_ErrorMapping(t *testing.T) {
 	r, db := setupPublishAdminServer(t, "deepseek-v3")
-	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusDisabled})
+	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusRetired})
 
 	cases := []struct {
 		name string

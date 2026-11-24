@@ -83,6 +83,11 @@ func (c *litellmClient) GenerateKey(ctx context.Context, req *GenerateKeyRequest
 	if req.KeyAlias == "" && req.KeyName != "" {
 		req.KeyAlias = req.KeyName
 	}
+	if req.TeamID != "" {
+		if err := c.ensureTeam(ctx, req.TeamID); err != nil {
+			return nil, fmt.Errorf("failed to ensure the gateway team: %w", err)
+		}
+	}
 
 	var resp GenerateKeyResponse
 	if err := c.doRequest(ctx, http.MethodPost, "/key/generate", req, &resp); err != nil {
@@ -97,6 +102,17 @@ func (c *litellmClient) GenerateKey(ctx context.Context, req *GenerateKeyRequest
 	}
 
 	return &resp, nil
+}
+
+// ensureTeam creates the LiteLLM team that groups the keys of a tenant. LiteLLM accepts a team_id on
+// /key/generate without checking that the team exists, but /key/update then fails with "Team doesn't exist
+// in db", which would make every later whitelist change of the key fail. An existing team is not an error.
+func (c *litellmClient) ensureTeam(ctx context.Context, teamID string) error {
+	err := c.doRequest(ctx, http.MethodPost, "/team/new", TeamRequest{TeamID: teamID, TeamAlias: teamID}, nil)
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		return nil
+	}
+	return err
 }
 
 // UpdateKey updates configuration, model whitelist, or budgets on an existing virtual key.

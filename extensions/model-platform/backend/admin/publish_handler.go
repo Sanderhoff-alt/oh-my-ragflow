@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -40,16 +41,70 @@ func PublishModelHandler(pub *publisher.Publisher, customDB ...*gorm.DB) gin.Han
 
 func publishErrorResponse(err error) (int, string) {
 	switch {
-	case errors.Is(err, publisher.ErrInvalidModel):
+	case errors.Is(err, publisher.ErrInvalidModel), errors.Is(err, publisher.ErrRetireDefault):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, publisher.ErrModelNotFound):
+		return http.StatusNotFound, "model not found in the catalog"
 	case errors.Is(err, publisher.ErrModelNotInGateway):
 		return http.StatusUnprocessableEntity, err.Error()
-	case errors.Is(err, publisher.ErrModelConflict):
+	case errors.Is(err, publisher.ErrModelConflict), errors.Is(err, publisher.ErrModelNotActive):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, publisher.ErrGatewayUnavailable):
 		return http.StatusBadGateway, "gateway unavailable: could not verify the model route"
 	default:
 		return http.StatusInternalServerError, "failed to publish model"
+	}
+}
+
+// RetireModelHandler retires a catalog model and starts the rollout that converges every tenant.
+func RetireModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return lifecycleHandler(publisher.Retire, customDB...)
+}
+
+// ReactivateModelHandler reactivates a retired catalog model and starts the rollout that restores tenants.
+func ReactivateModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return lifecycleHandler(publisher.Reactivate, customDB...)
+}
+
+// SetDefaultModelHandler makes a catalog model the platform default of its type and starts the rollout that
+// moves platform_default users to it while keeping users who chose their own model.
+func SetDefaultModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return lifecycleHandler(publisher.SetDefault, customDB...)
+}
+
+func lifecycleHandler(action func(ctx context.Context, db *gorm.DB, modelID string) (*publisher.Result, error), customDB ...*gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		db := resolveDB(customDB...)
+		if db == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "database unavailable"})
+			return
+		}
+
+		res, err := action(c.Request.Context(), db, c.Param("id"))
+		if err != nil {
+			status, message := publishErrorResponse(err)
+			c.JSON(status, gin.H{"code": status, "message": message})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"code": http.StatusAccepted, "data": res})
+	}
+}
+
+// ListManagedModelsHandler returns the catalog with each model's derived tenant states and reference counts.
+func ListManagedModelsHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		db := resolveDB(customDB...)
+		if db == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "database unavailable"})
+			return
+		}
+
+		entries, err := publisher.ListCatalog(c.Request.Context(), db)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to query the model catalog"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "data": entries})
 	}
 }
 

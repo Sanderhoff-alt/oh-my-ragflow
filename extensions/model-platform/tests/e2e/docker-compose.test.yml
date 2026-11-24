@@ -32,7 +32,7 @@ services:
       - "--num_workers"
       - "2"
     volumes:
-      - ../../gateway/litellm-config.yaml:/app/config/litellm-config.yaml:ro
+      - ./litellm-config.test.yaml:/app/config/litellm-config.yaml:ro
     environment:
       DATABASE_URL: postgresql://litellm:test_secure_password@postgres-test:5432/litellm_test
       LITELLM_MASTER_KEY: sk-master-e2e-platform-test-key

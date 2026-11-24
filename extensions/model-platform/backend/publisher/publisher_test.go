@@ -82,7 +82,8 @@ func setupPublishDB(t *testing.T) *gorm.DB {
 	if err := migration.MigratePublishSchema(context.Background(), db); err != nil {
 		t.Fatalf("failed to migrate publish schema: %v", err)
 	}
-	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{}); err != nil {
+	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{},
+		&rentity.Knowledgebase{}, &rentity.Chat{}, &rentity.UserTenant{}, &entity.UserDefaultPreference{}); err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
 	}
 	return db
@@ -179,10 +180,44 @@ func TestPublish_CreatesItemsOnlyForReadyTenantsMissingModel(t *testing.T) {
 	}
 }
 
+func TestPublish_ConcurrentPublishesWithDifferentTypesLeaveOneCatalogRow(t *testing.T) {
+	db := setupPublishDB(t)
+	pub := New(newFakeGateway("deepseek-v3"))
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	types := []int{int(rentity.ModelTypeChat), int(rentity.ModelTypeEmbedding)}
+	for i := range types {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = pub.Publish(context.Background(), db, Request{ModelName: "deepseek-v3", ModelType: types[i]})
+		}(i)
+	}
+	wg.Wait()
+
+	conflicts := 0
+	for _, err := range errs {
+		if errors.Is(err, ErrModelConflict) {
+			conflicts++
+		} else if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if conflicts != 1 {
+		t.Errorf("expected exactly one publish to lose with ErrModelConflict, got %d (%v)", conflicts, errs)
+	}
+	var rows int64
+	db.Model(&entity.PlatformManagedModel{}).Where("model_name = ?", "deepseek-v3").Count(&rows)
+	if rows != 1 {
+		t.Errorf("expected a single catalog row for the name, got %d", rows)
+	}
+}
+
 func TestPublish_RejectsConflictingCatalogEntries(t *testing.T) {
 	db := setupPublishDB(t)
 	pub := New(newFakeGateway("deepseek-v3"))
-	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: int(rentity.ModelTypeChat), Status: entity.ManagedModelStatusDisabled})
+	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: int(rentity.ModelTypeChat), Status: entity.ManagedModelStatusRetired})
 
 	if _, err := pub.Publish(context.Background(), db, deepseek); !errors.Is(err, ErrModelConflict) {
 		t.Errorf("expected ErrModelConflict for a disabled model, got %v", err)
