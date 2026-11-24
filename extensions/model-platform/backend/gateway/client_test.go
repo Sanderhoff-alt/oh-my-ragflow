@@ -126,6 +126,69 @@ func TestClient_ListModels_GatewayError(t *testing.T) {
 	}
 }
 
+func TestClient_GenerateKey_CreatesTheTeamFirst(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		switch r.URL.Path {
+		case "/team/new":
+			var req TeamRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.TeamID != "tenant-1" {
+				t.Errorf("unexpected team: %+v", req)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		case "/key/generate":
+			_, _ = w.Write([]byte(`{"key":"sk-1"}`))
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+	if _, err := client.GenerateKey(context.Background(), &GenerateKeyRequest{KeyAlias: "a", TeamID: "tenant-1", Models: []string{"m"}}); err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	if len(calls) != 2 || calls[0] != "/team/new" || calls[1] != "/key/generate" {
+		t.Errorf("expected the team to be created before the key, got %v", calls)
+	}
+}
+
+func TestClient_GenerateKey_AcceptsAnExistingTeam(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/team/new" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"{'error': 'Team id = tenant-1 already exists. Please use a different team id.'}"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"key":"sk-1"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+	if _, err := client.GenerateKey(context.Background(), &GenerateKeyRequest{KeyAlias: "a", TeamID: "tenant-1", Models: []string{"m"}}); err != nil {
+		t.Fatalf("an existing team must not fail key generation: %v", err)
+	}
+}
+
+func TestClient_GenerateKey_TeamFailureStopsBeforeTheKey(t *testing.T) {
+	keyRequested := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/key/generate" {
+			keyRequested = true
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+	if _, err := client.GenerateKey(context.Background(), &GenerateKeyRequest{KeyAlias: "a", TeamID: "tenant-1", Models: []string{"m"}}); err == nil {
+		t.Fatal("expected the team failure to surface")
+	}
+	if keyRequested {
+		t.Error("no key may be generated when its team could not be ensured")
+	}
+}
+
 func TestClient_UpdateKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/key/update" {

@@ -28,6 +28,12 @@ type GenerateKeyRequest struct {
 	TPMLimit  *int                   `json:"tpm_limit,omitempty"`
 }
 
+// TeamRequest represents payload for LiteLLM /team/new endpoint.
+type TeamRequest struct {
+	TeamID    string `json:"team_id"`
+	TeamAlias string `json:"team_alias,omitempty"`
+}
+
 // GenerateKeyResponse represents response from LiteLLM /key/generate endpoint.
 type GenerateKeyResponse struct {
 	Key       string                 `json:"key"`
