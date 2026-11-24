@@ -620,7 +620,7 @@ func TestSecurityStability_MeteringDaemonWatermarkAndDowntimeRecovery(t *testing
 	collector := mpmetering.NewSpendLogCollector(db, mockClient)
 	pipeline := mpmetering.NewUsagePipeline(db)
 
-	daemon := mpmetering.NewMeteringDaemon(db, collector, pipeline,
+	daemon := mpmetering.NewMeteringDaemon(collector, pipeline,
 		mpmetering.WithPollInterval(25*time.Millisecond),
 		mpmetering.WithAggregationInterval(25*time.Millisecond),
 		mpmetering.WithOverlapWindow(5*time.Minute),

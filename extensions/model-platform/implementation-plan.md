@@ -492,16 +492,21 @@ ON DUPLICATE KEY UPDATE
 ```
 Overwriting instead of accumulating ensures mathematical idempotence across multiple reconciliation runs.
 
+`MeteringDaemon` coordinates Loop 1 (spend log ingestion) and Loop 2 (daily usage rollup) with three self-healing states:
+- **Cold Start (empty staging table)**: aligns the initial fetch boundary to `00:00:00` in `METERING_TIMEZONE` for the day `METERING_LOOKBACK_HOURS` (default `48`) earlier, matching Loop 2's full-day replacement boundaries.
+- **Online Operation (in-memory checkpoint active)**: advances `lastCheckedAt` after every successful poll (even when 0 logs arrive), keeping routine gateway queries strictly bounded to `[lastCheckedAt - METERING_FETCH_OVERLAP, Now]` (~10 minutes with defaults) and eliminating idle window dilation.
+- **Restart Recovery & Dynamic Catch-up (existing DB records)**: resumes from `MAX(request_time) - METERING_FETCH_OVERLAP` without any lookback truncation cap, streaming in `METERING_COLLECTOR_BATCH_SIZE` batches. Whenever a poll inserts new records whose earliest newly inserted `request_time` (`EarliestInsertedAt`) is earlier than `EndTime - METERING_LOOKBACK_HOURS`, Loop 1 immediately triggers `UsagePipeline.AggregateDailyUsage` over `[EarliestInsertedAt, EndTime]` (so re-scanning an old idle watermark without inserting historical rows never overwrites an already-purged historical day, while retaining pending catch-up retries in memory across cycles within the running process if aggregation or later collection pages fail transiently).
+
 ```mermaid
 flowchart TD
-    LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"Periodic Window Pull (48h Lookback)"| Collector["Spend Log Collector"]
+    LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"Checkpoint (~10m) / Uncapped Restart Replay / Day-Aligned Cold Start"| Collector["Spend Log Collector"]
 
     subgraph Tier1_Staging ["Tier 1: Raw Staging & Deduplication"]
         Collector -->|"INSERT IGNORE INTO spend_id"| SpendLogTable[("platform_gateway_spend_log<br>Primary Key: spend_id")]
     end
 
-    subgraph Tier2_Aggregation ["Tier 2: Deterministic Replacement Rollup"]
-        SpendLogTable -->|"GROUP BY tenant, model, usage_date<br>SUM(tokens), SUM(spend)"| RollupEngine["Rollup Engine"]
+    subgraph Tier2_Aggregation ["Tier 2: Deterministic Replacement Rollup & Dynamic Catch-up"]
+        SpendLogTable -->|"Routine Lookback + On-Demand Multi-Day Catch-up<br>GROUP BY tenant, model, usage_date"| RollupEngine["Rollup Engine"]
         RollupEngine -->|"ON DUPLICATE KEY UPDATE<br>call_count = VALUES(call_count)"| DailyTable[("platform_tenant_usage_daily<br>Primary Key: tenant_id, model, date")]
     end
 ```

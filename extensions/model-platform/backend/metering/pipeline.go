@@ -183,20 +183,37 @@ func parseNumericOffset(s string) (*time.Location, error) {
 	return time.FixedZone(zoneName, totalSeconds), nil
 }
 
+const defaultLookbackHours = 48
+
+// dayAlignedStart truncates t to 00:00:00 of its calendar day in loc, returning the instant in UTC.
+func dayAlignedStart(t time.Time, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	inLoc := t.In(loc)
+	return time.Date(inLoc.Year(), inLoc.Month(), inLoc.Day(), 0, 0, 0, 0, loc).UTC()
+}
+
+// dayAlignedLookbackStart returns 00:00:00 in loc for the calendar day lookbackHours before now (in UTC).
+func dayAlignedLookbackStart(now time.Time, lookbackHours int, loc *time.Location) time.Time {
+	if lookbackHours <= 0 {
+		lookbackHours = defaultLookbackHours
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	return dayAlignedStart(now.In(loc).Add(-time.Duration(lookbackHours)*time.Hour), loc)
+}
+
 // RunWindow executes daily billing aggregation for a rolling lookback window (default 48h).
 // Start time is automatically day-aligned to 00:00:00 in the configured business timezone
 // to prevent front-edge truncation of early-morning logs on the starting date during periodic runs.
 func (p *UsagePipeline) RunWindow(ctx context.Context, lookbackHours int) (*PipelineResult, error) {
-	if lookbackHours <= 0 {
-		lookbackHours = 48
-	}
-
 	loc := p.Location()
-	nowInLoc := time.Now().In(loc)
-	rawStartInLoc := nowInLoc.Add(-time.Duration(lookbackHours) * time.Hour)
-	alignedStartInLoc := time.Date(rawStartInLoc.Year(), rawStartInLoc.Month(), rawStartInLoc.Day(), 0, 0, 0, 0, loc)
+	now := time.Now().In(loc)
+	alignedStart := dayAlignedLookbackStart(now, lookbackHours, loc)
 
-	return p.AggregateDailyUsage(ctx, alignedStartInLoc, nowInLoc)
+	return p.AggregateDailyUsage(ctx, alignedStart, now)
 }
 
 // AggregateDailyUsage aggregates raw logs from platform_gateway_spend_log between
@@ -213,9 +230,7 @@ func (p *UsagePipeline) AggregateDailyUsage(ctx context.Context, startTime, endT
 	// Day-align startTime in the configured business timezone to ensure full calendar-day coverage
 	// and prevent partial replacement overwrite of earlier hours on the start day.
 	loc := p.Location()
-	stInLoc := startTime.In(loc)
-	alignedStartInLoc := time.Date(stInLoc.Year(), stInLoc.Month(), stInLoc.Day(), 0, 0, 0, 0, loc)
-	alignedStartTime := alignedStartInLoc.UTC()
+	alignedStartTime := dayAlignedStart(startTime, loc)
 	endUTC := endTime.UTC()
 
 	dateExpr := resolveDateExpression(p.db, loc)

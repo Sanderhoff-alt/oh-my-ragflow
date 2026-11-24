@@ -726,77 +726,296 @@ func TestSpendLogCollector_GetLatestRequestTime(t *testing.T) {
 	}
 }
 
-func TestSpendLogCollector_CollectIncremental(t *testing.T) {
+func TestSpendLogCollector_CollectIncremental_ColdStartDayAligned(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "")
+
+	// 1. Cold start in UTC: 2026-11-24 15:30:00 UTC with 48h lookback -> 2026-11-22 00:00:00 UTC
+	dbUTC := setupTestDB(t)
+	mockUTC := &mockSpendLogClient{}
+	fixedNow := time.Date(2026, 11, 24, 15, 30, 0, 0, time.UTC)
+
+	collectorUTC := NewSpendLogCollector(dbUTC, mockUTC, WithCollectorTimezone(time.UTC))
+	collectorUTC.nowFunc = func() time.Time { return fixedNow }
+
+	res, err := collectorUTC.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err != nil {
+		t.Fatalf("unexpected error during UTC cold-start collection: %v", err)
+	}
+	expectedUTC := time.Date(2026, 11, 22, 0, 0, 0, 0, time.UTC)
+	if !res.StartTime.Equal(expectedUTC) {
+		t.Fatalf("expected UTC cold start %v, got %v", expectedUTC, res.StartTime)
+	}
+	if mockUTC.lastReq.StartDate != "2026-11-22 00:00:00" {
+		t.Fatalf("expected gateway StartDate 2026-11-22 00:00:00, got %s", mockUTC.lastReq.StartDate)
+	}
+
+	// 2. Cold start in UTC+08:00: 2026-11-24 02:30:00 +08:00 (2026-11-23 18:30:00 UTC)
+	//    48h earlier in +08:00 is 2026-11-22 02:30:00 +08:00
+	//    day-aligned in +08:00 is 2026-11-22 00:00:00 +08:00 == 2026-11-21 16:00:00 UTC.
+	dbCST := setupTestDB(t)
+	mockCST := &mockSpendLogClient{}
+	cst := time.FixedZone("UTC+08:00", 8*3600)
+	fixedNowCST := time.Date(2026, 11, 24, 2, 30, 0, 0, cst)
+
+	collectorCST := NewSpendLogCollector(dbCST, mockCST, WithCollectorTimezone(cst))
+	collectorCST.nowFunc = func() time.Time { return fixedNowCST }
+
+	resCST, err := collectorCST.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err != nil {
+		t.Fatalf("unexpected error during CST cold-start collection: %v", err)
+	}
+	expectedCSTInUTC := time.Date(2026, 11, 21, 16, 0, 0, 0, time.UTC)
+	if !resCST.StartTime.Equal(expectedCSTInUTC) {
+		t.Fatalf("expected CST day-aligned cold start %v, got %v", expectedCSTInUTC, resCST.StartTime)
+	}
+	if mockCST.lastReq.StartDate != "2026-11-21 16:00:00" {
+		t.Fatalf("expected gateway StartDate 2026-11-21 16:00:00, got %s", mockCST.lastReq.StartDate)
+	}
+	startInCST := resCST.StartTime.In(cst)
+	if startInCST.Hour() != 0 || startInCST.Minute() != 0 || startInCST.Second() != 0 {
+		t.Fatalf("expected 00:00:00 in target timezone, got %v", startInCST)
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental_IdleWindowInvariant(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "")
 	db := setupTestDB(t)
-	mockClient := &mockSpendLogClient{}
-	collector := NewSpendLogCollector(db, mockClient)
+	mockClient := &mockSpendLogClient{} // always returns 0 entries
 
-	// 1. Cold start: empty table -> pulls from ~48h ago
-	beforeCold := time.Now().UTC().Add(-49 * time.Hour)
-	afterCold := time.Now().UTC().Add(-47 * time.Hour)
-	_, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
-	if err != nil {
-		t.Fatalf("unexpected error during cold-start collection: %v", err)
-	}
+	currentTime := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	collector := NewSpendLogCollector(db, mockClient, WithCollectorTimezone(time.UTC))
+	collector.nowFunc = func() time.Time { return currentTime }
 
-	parsedStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
-	if err != nil {
-		t.Fatalf("failed to parse start date: %v", err)
-	}
-	if parsedStart.Before(beforeCold) || parsedStart.After(afterCold) {
-		t.Fatalf("expected cold start around 48h ago, got %v", parsedStart)
-	}
-
-	// 1b. Cold start with small maxLookback (e.g. 6 hours) -> capped by maxLookback
-	beforeSmall := time.Now().UTC().Add(-7 * time.Hour)
-	afterSmall := time.Now().UTC().Add(-5 * time.Hour)
-	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 6*time.Hour)
-	if err != nil {
-		t.Fatalf("unexpected error during small lookback cold-start: %v", err)
-	}
-	parsedSmallStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
-	if err != nil {
-		t.Fatalf("failed to parse small lookback start date: %v", err)
-	}
-	if parsedSmallStart.Before(beforeSmall) || parsedSmallStart.After(afterSmall) {
-		t.Fatalf("expected cold start capped to 6h ago, got %v", parsedSmallStart)
-	}
-
-	// 2. Insert a record as watermark 2 hours ago
-	watermark := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	// Seed a single old log 10 hours ago so DB watermark stays frozen in the past.
 	db.Create(&entity.GatewaySpendLog{
-		SpendID:     "watermark-1",
-		TenantID:    "t-wm",
-		RequestTime: watermark,
+		SpendID:     "idle-seed-1",
+		TenantID:    "t-idle",
+		RequestTime: currentTime.Add(-10 * time.Hour),
 	})
 
-	// Incremental pull with 5-minute overlap window
-	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
+	// Cycle 1 (startup with existing DB record): starts at watermark - 5m and establishes checkpoint.
+	res1, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
 	if err != nil {
-		t.Fatalf("unexpected error during incremental collection: %v", err)
+		t.Fatalf("cycle 1 failed: %v", err)
+	}
+	if !res1.StartTime.Equal(currentTime.Add(-10*time.Hour - 5*time.Minute)) {
+		t.Fatalf("expected cycle 1 start at watermark-5m, got %v", res1.StartTime)
+	}
+	if !collector.lastCheckedAt.Equal(currentTime) {
+		t.Fatalf("expected checkpoint %v after cycle 1, got %v", currentTime, collector.lastCheckedAt)
 	}
 
-	expectedStart := watermark.Add(-5 * time.Minute).Format("2006-01-02 15:04:05")
-	if mockClient.lastReq.StartDate != expectedStart {
-		t.Fatalf("expected start date %s with 5m overlap window, got %s", expectedStart, mockClient.lastReq.StartDate)
+	// Cycles 2..6: advance clock by 5 minutes repeatedly with 0 new logs; window must stay bounded at 10m.
+	for i := 2; i <= 6; i++ {
+		prevTime := currentTime
+		currentTime = currentTime.Add(5 * time.Minute)
+
+		res, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
+		if err != nil {
+			t.Fatalf("cycle %d failed: %v", i, err)
+		}
+		expectedStart := prevTime.Add(-5 * time.Minute)
+		if !res.StartTime.Equal(expectedStart) {
+			t.Fatalf("cycle %d: expected start %v, got %v", i, expectedStart, res.StartTime)
+		}
+		windowSpan := res.EndTime.Sub(res.StartTime)
+		if windowSpan != 10*time.Minute {
+			t.Fatalf("cycle %d: expected bounded 10m window, got %v", i, windowSpan)
+		}
+		if !collector.lastCheckedAt.Equal(currentTime) {
+			t.Fatalf("cycle %d: expected checkpoint %v, got %v", i, currentTime, collector.lastCheckedAt)
+		}
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental_FailureDoesNotAdvanceCheckpoint(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "")
+	db := setupTestDB(t)
+	mockClient := &mockSpendLogClient{}
+
+	t0 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	currentTime := t0
+	collector := NewSpendLogCollector(db, mockClient, WithCollectorTimezone(time.UTC))
+	collector.nowFunc = func() time.Time { return currentTime }
+
+	if _, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48); err != nil {
+		t.Fatalf("initial poll failed: %v", err)
 	}
 
-	// 3. Ancient watermark (e.g. 60 days ago) -> capped by maxLookback (30 days)
-	ancientTime := time.Now().UTC().Add(-60 * 24 * time.Hour)
-	db.Model(&entity.GatewaySpendLog{}).Where("spend_id = ?", "watermark-1").Update("request_time", ancientTime)
+	// Simulate transient gateway failure 5 minutes later: checkpoint must remain t0.
+	currentTime = t0.Add(5 * time.Minute)
+	mockClient.err = errors.New("gateway timeout")
+	if _, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48); err == nil {
+		t.Fatalf("expected error on gateway timeout")
+	}
+	if !collector.lastCheckedAt.Equal(t0) {
+		t.Fatalf("checkpoint must not advance on failure: expected %v, got %v", t0, collector.lastCheckedAt)
+	}
 
-	_, err = collector.CollectIncremental(context.Background(), 5*time.Minute, 30*24*time.Hour)
+	// Recovery 15 minutes later: query must resume from t0 - 5m so nothing during outage is skipped.
+	currentTime = t0.Add(20 * time.Minute)
+	mockClient.err = nil
+	res, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
 	if err != nil {
-		t.Fatalf("unexpected error during capped collection: %v", err)
+		t.Fatalf("recovery poll failed: %v", err)
+	}
+	expectedStart := t0.Add(-5 * time.Minute)
+	if !res.StartTime.Equal(expectedStart) {
+		t.Fatalf("expected recovery start %v, got %v", expectedStart, res.StartTime)
+	}
+	if !collector.lastCheckedAt.Equal(currentTime) {
+		t.Fatalf("expected checkpoint %v after recovery, got %v", currentTime, collector.lastCheckedAt)
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental_BackwardClockRebasesCheckpoint(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "")
+	db := setupTestDB(t)
+	mockClient := &mockSpendLogClient{}
+
+	currentTime := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	collector := NewSpendLogCollector(db, mockClient, WithCollectorTimezone(time.UTC))
+	collector.nowFunc = func() time.Time { return currentTime }
+
+	if _, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48); err != nil {
+		t.Fatalf("initial poll failed: %v", err)
 	}
 
-	parsedCappedStart, err := time.Parse("2006-01-02 15:04:05", mockClient.lastReq.StartDate)
+	// Wall clock steps backward to 11:05: must query [11:00, 11:05] and rebase checkpoint to 11:05.
+	currentTime = time.Date(2026, 11, 24, 11, 5, 0, 0, time.UTC)
+	res1, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
 	if err != nil {
-		t.Fatalf("failed to parse capped start date: %v", err)
+		t.Fatalf("backward-clock poll failed: %v", err)
 	}
-	earliestExpected := time.Now().UTC().Add(-31 * 24 * time.Hour)
-	latestExpected := time.Now().UTC().Add(-29 * 24 * time.Hour)
-	if parsedCappedStart.Before(earliestExpected) || parsedCappedStart.After(latestExpected) {
-		t.Fatalf("expected start date to be capped within ~30 days, got %v", parsedCappedStart)
+	wantStart1 := time.Date(2026, 11, 24, 11, 0, 0, 0, time.UTC)
+	if !res1.StartTime.Equal(wantStart1) || !res1.EndTime.Equal(currentTime) {
+		t.Fatalf("expected backward-clock window [%v, %v], got [%v, %v]", wantStart1, currentTime, res1.StartTime, res1.EndTime)
+	}
+	if !collector.lastCheckedAt.Equal(currentTime) {
+		t.Fatalf("expected checkpoint rebased to %v, got %v", currentTime, collector.lastCheckedAt)
+	}
+
+	// Subsequent normal poll at 11:10 covers [11:00, 11:10].
+	currentTime = time.Date(2026, 11, 24, 11, 10, 0, 0, time.UTC)
+	res2, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err != nil {
+		t.Fatalf("follow-up poll failed: %v", err)
+	}
+	if !res2.StartTime.Equal(wantStart1) || !res2.EndTime.Equal(currentTime) {
+		t.Fatalf("expected follow-up window [%v, %v], got [%v, %v]", wantStart1, currentTime, res2.StartTime, res2.EndTime)
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental_UncappedReplayAfterRestart(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "")
+	db := setupTestDB(t)
+	mockClient := &mockSpendLogClient{}
+
+	now := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	// Seed a 60-day-old watermark (well past the deprecated 30-day cap).
+	ancientWatermark := now.Add(-60 * 24 * time.Hour)
+	db.Create(&entity.GatewaySpendLog{
+		SpendID:     "ancient-wm-1",
+		TenantID:    "t-ancient",
+		RequestTime: ancientWatermark,
+	})
+
+	// Fresh collector instance simulates process restart with zero in-memory checkpoint.
+	collector := NewSpendLogCollector(db, mockClient, WithCollectorTimezone(time.UTC))
+	collector.nowFunc = func() time.Time { return now }
+
+	res, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err != nil {
+		t.Fatalf("unexpected error during uncapped replay: %v", err)
+	}
+
+	expectedStart := ancientWatermark.Add(-5 * time.Minute)
+	if !res.StartTime.Equal(expectedStart) {
+		t.Fatalf("expected uncapped replay start %v, got %v", expectedStart, res.StartTime)
+	}
+	if mockClient.lastReq.StartDate != expectedStart.Format("2006-01-02 15:04:05") {
+		t.Fatalf("expected gateway StartDate %s, got %s", expectedStart.Format("2006-01-02 15:04:05"), mockClient.lastReq.StartDate)
+	}
+}
+
+func TestSpendLogCollector_CollectIncremental_PartialNewestFirstReplayPreservesLowerBound(t *testing.T) {
+	t.Setenv("METERING_TIMEZONE", "UTC")
+	db := setupTestDB(t)
+
+	restartTime := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	seedTime := time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+	db.Create(&entity.GatewaySpendLog{
+		SpendID:     "seed-oldest",
+		TenantID:    "t-replay",
+		RequestTime: seedTime,
+	})
+
+	// Simulate LiteLLM /spend/logs/v2 newest-first pagination:
+	// page 1 commits a Nov 24 record (advancing DB MAX(request_time)), then page 2 fails.
+	newestFirstEntries := []gateway.SpendLogEntry{
+		{
+			SpendID:     "newest-nov24",
+			TeamID:      "t-replay",
+			Model:       "gpt-4o",
+			TotalTokens: 100,
+			Spend:       0.01,
+			StartTime:   time.Date(2026, 11, 24, 14, 30, 0, 0, time.UTC).Format("2006-01-02 15:04:05"),
+		},
+		{
+			SpendID:     "older-nov20",
+			TeamID:      "t-replay",
+			Model:       "gpt-4o",
+			TotalTokens: 200,
+			Spend:       0.02,
+			StartTime:   time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC).Format("2006-01-02 15:04:05"),
+		},
+	}
+
+	client := &failOnPageClient{
+		entries:  newestFirstEntries,
+		failPage: 2,
+	}
+
+	currentTime := restartTime
+	collector := NewSpendLogCollector(db, client, WithBatchSize(1), WithCollectorTimezone(time.UTC))
+	collector.nowFunc = func() time.Time { return currentTime }
+
+	// Attempt 1: page 1 inserts newest-nov24, advancing DB MAX(request_time) to Nov 24 14:30,
+	// then page 2 fails before older-nov20 is fetched.
+	partialRes, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err == nil {
+		t.Fatalf("expected error on page 2 failure")
+	}
+	if partialRes == nil || partialRes.InsertedCount != 1 {
+		t.Fatalf("expected partial result with 1 inserted row, got %+v", partialRes)
+	}
+	if !collector.lastCheckedAt.IsZero() {
+		t.Fatalf("checkpoint must remain zero after failed startup replay")
+	}
+
+	// Attempt 2: page 2 succeeds; collector must keep the original lower bound (seedTime - 5m)
+	// instead of jumping to Nov 24 14:25 from the partially committed MAX(request_time).
+	client.failPage = 0
+	currentTime = currentTime.Add(5 * time.Minute)
+	retryRes, err := collector.CollectIncremental(context.Background(), 5*time.Minute, 48)
+	if err != nil {
+		t.Fatalf("retry CollectIncremental failed: %v", err)
+	}
+	expectedStart := seedTime.Add(-5 * time.Minute)
+	if !retryRes.StartTime.Equal(expectedStart) {
+		t.Fatalf("expected retry to preserve original replay lower bound %v, got %v", expectedStart, retryRes.StartTime)
+	}
+	if retryRes.InsertedCount != 1 {
+		t.Fatalf("expected older-nov20 to be inserted on retry, got %d", retryRes.InsertedCount)
+	}
+	if !collector.lastCheckedAt.Equal(currentTime) {
+		t.Fatalf("expected checkpoint %v after replay completed, got %v", currentTime, collector.lastCheckedAt)
+	}
+
+	// Verify older-nov20 actually landed in DB.
+	var count int64
+	db.Model(&entity.GatewaySpendLog{}).Where("spend_id = ?", "older-nov20").Count(&count)
+	if count != 1 {
+		t.Fatalf("expected older-nov20 in DB, got count=%d", count)
 	}
 }

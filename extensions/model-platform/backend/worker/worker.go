@@ -63,7 +63,7 @@ func Start(ctx context.Context) (*Workers, error) {
 	controller := reconciler.NewSelfHealingController(db, event.GetDefaultBus(), tenantReconciler)
 	controller.Start(ctx)
 
-	daemon := metering.NewMeteringDaemon(db, metering.NewSpendLogCollector(db, client), metering.NewUsagePipeline(db))
+	daemon := metering.NewMeteringDaemon(metering.NewSpendLogCollector(db, client), metering.NewUsagePipeline(db))
 	daemon.Start(ctx)
 
 	// The publish worker converges tenants toward the managed model catalog. Several replicas can run it

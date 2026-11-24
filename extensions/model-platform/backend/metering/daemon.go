@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"gorm.io/gorm"
 )
 
 // DaemonOption configures the MeteringDaemon.
@@ -43,16 +41,8 @@ func WithOverlapWindow(overlap time.Duration) DaemonOption {
 	}
 }
 
-// WithMaxLookback sets the maximum historical span allowed for cold-start or catch-up pulls.
-func WithMaxLookback(max time.Duration) DaemonOption {
-	return func(d *MeteringDaemon) {
-		if max > 0 {
-			d.maxLookback = max
-		}
-	}
-}
-
-// WithLookbackHours sets the rolling lookback window in hours for daily aggregation (default 48h).
+// WithLookbackHours sets the unified lookback window in hours for cold-start ingestion
+// and rolling daily aggregation (METERING_LOOKBACK_HOURS, default 48h).
 func WithLookbackHours(hours int) DaemonOption {
 	return func(d *MeteringDaemon) {
 		if hours > 0 {
@@ -68,11 +58,18 @@ func WithDaemonEnabled(enabled bool) DaemonOption {
 	}
 }
 
-// WithDaemonTimezone sets the business billing timezone for daily usage aggregation.
+// WithDaemonTimezone sets the business billing timezone for both cold-start ingestion
+// and daily usage aggregation.
 func WithDaemonTimezone(loc *time.Location) DaemonOption {
 	return func(d *MeteringDaemon) {
-		if loc != nil && d.pipeline != nil {
+		if loc == nil {
+			return
+		}
+		if d.pipeline != nil {
 			d.pipeline.SetLocation(loc)
+		}
+		if d.collector != nil {
+			d.collector.SetLocation(loc)
 		}
 	}
 }
@@ -106,19 +103,19 @@ type DaemonMetrics struct {
 }
 
 // MeteringDaemon coordinates periodic watermark-driven incremental spend log pulling,
-// decoupled periodic daily usage pipeline aggregation, and opt-in raw spend log retention sweeps.
+// dynamic multi-day catch-up aggregation, decoupled periodic daily usage rollup,
+// and opt-in raw spend log retention sweeps.
 type MeteringDaemon struct {
-	db                  *gorm.DB
 	collector           *SpendLogCollector
 	pipeline            *UsagePipeline
 	pollInterval        time.Duration
 	aggregationInterval time.Duration
 	overlapWindow       time.Duration
-	maxLookback         time.Duration
 	lookbackHours       int
 	retentionDays       int
 	purgeInterval       time.Duration
 	enabled             bool
+	nowFunc             func() time.Time
 
 	stopChan chan struct{}
 	stopOnce sync.Once
@@ -128,17 +125,27 @@ type MeteringDaemon struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 
-	// pipelineMu serializes daily usage aggregation and raw spend log purging within this daemon
-	// so a purge sweep cannot delete rows out from under an in-flight aggregation across midnight.
+	// When retention purging is enabled, block PurgeOnce until the first PollOnce
+	// has completed so an initial multi-day startup replay cannot have newly inserted
+	// historical rows deleted before catch-up aggregation runs.
+	initialPollDone chan struct{}
+	initialPollOnce sync.Once
+
+	// pipelineMu serializes daily usage aggregation (routine and dynamic catch-up)
+	// and raw spend log purging within this daemon so a purge sweep cannot delete
+	// rows out from under an in-flight aggregation and concurrent rollups cannot
+	// overwrite newer totals with an earlier end bound.
 	pipelineMu sync.Mutex
 
-	mu                sync.RWMutex
-	lastPollTime      time.Time
-	lastAggregateTime time.Time
-	lastPurgeTime     time.Time
-	lastPollErr       error
-	lastAggregateErr  error
-	lastPurgeErr      error
+	mu                  sync.RWMutex
+	lastPollTime        time.Time
+	lastAggregateTime   time.Time
+	lastPurgeTime       time.Time
+	lastPollErr         error
+	lastAggregateErr    error
+	lastPurgeErr        error
+	pendingCatchupStart time.Time
+	catchupGen          uint64
 
 	totalPolls             int64
 	successfulPolls        int64
@@ -154,20 +161,20 @@ type MeteringDaemon struct {
 
 // NewMeteringDaemon creates a new MeteringDaemon with decoupled poll, aggregation, and optional retention schedules.
 // Environment variables (METERING_*) serve as defaults, overridden by explicit DaemonOptions.
-func NewMeteringDaemon(db *gorm.DB, collector *SpendLogCollector, pipeline *UsagePipeline, opts ...DaemonOption) *MeteringDaemon {
+func NewMeteringDaemon(collector *SpendLogCollector, pipeline *UsagePipeline, opts ...DaemonOption) *MeteringDaemon {
 	d := &MeteringDaemon{
-		db:                  db,
 		collector:           collector,
 		pipeline:            pipeline,
 		pollInterval:        5 * time.Minute,
 		aggregationInterval: 1 * time.Hour,
-		overlapWindow:       5 * time.Minute,
-		maxLookback:         30 * 24 * time.Hour,
-		lookbackHours:       48,
+		overlapWindow:       defaultOverlapWindow,
+		lookbackHours:       defaultLookbackHours,
 		retentionDays:       0,
 		purgeInterval:       24 * time.Hour,
 		enabled:             true,
+		nowFunc:             time.Now,
 		stopChan:            make(chan struct{}),
+		initialPollDone:     make(chan struct{}),
 	}
 
 	// Load environment variable defaults if set
@@ -186,12 +193,7 @@ func NewMeteringDaemon(db *gorm.DB, collector *SpendLogCollector, pipeline *Usag
 			d.overlapWindow = dur
 		}
 	}
-	if v := os.Getenv("METERING_FETCH_MAX_LOOKBACK"); v != "" {
-		if dur, err := time.ParseDuration(v); err == nil && dur > 0 {
-			d.maxLookback = dur
-		}
-	}
-	if v := os.Getenv("METERING_AGGREGATION_LOOKBACK_HOURS"); v != "" {
+	if v := os.Getenv("METERING_LOOKBACK_HOURS"); v != "" {
 		if hours, err := strconv.Atoi(v); err == nil && hours > 0 {
 			d.lookbackHours = hours
 		}
@@ -209,6 +211,11 @@ func NewMeteringDaemon(db *gorm.DB, collector *SpendLogCollector, pipeline *Usag
 
 	for _, opt := range opts {
 		opt(d)
+	}
+	// Ensure collector cold-start alignment shares the pipeline billing timezone
+	// even when the caller configured a timezone on pipeline without WithDaemonTimezone.
+	if d.collector != nil && d.pipeline != nil {
+		d.collector.SetLocation(d.pipeline.Location())
 	}
 	return d
 }
@@ -248,8 +255,9 @@ func (d *MeteringDaemon) runIngestionWorker(ctx context.Context) {
 	pollTicker := time.NewTicker(d.pollInterval)
 	defer pollTicker.Stop()
 
-	// Run initial execution on startup
+	// Run initial execution on startup and unblock the retention worker once complete.
 	_, _ = d.PollOnce(ctx)
+	d.initialPollOnce.Do(func() { close(d.initialPollDone) })
 
 	for {
 		select {
@@ -285,6 +293,16 @@ func (d *MeteringDaemon) runAggregationWorker(ctx context.Context) {
 
 func (d *MeteringDaemon) runPurgeWorker(ctx context.Context) {
 	defer d.wg.Done()
+	// Wait for the initial PollOnce (which runs startup replay and registers/executes
+	// any multi-day catch-up) before starting the first retention sweep.
+	select {
+	case <-d.initialPollDone:
+	case <-ctx.Done():
+		return
+	case <-d.stopChan:
+		return
+	}
+
 	purgeTicker := time.NewTicker(d.purgeInterval)
 	defer purgeTicker.Stop()
 
@@ -320,9 +338,11 @@ func (d *MeteringDaemon) Stop() {
 }
 
 // PollOnce executes a single cycle of incremental spend log collection from gateway.
+// When newly ingested logs extend older than the routine lookback window, it dynamically
+// triggers a multi-day catch-up aggregation covering [StartTime, EndTime].
 func (d *MeteringDaemon) PollOnce(ctx context.Context) (*CollectResult, error) {
 	atomic.AddInt64(&d.totalPolls, 1)
-	now := time.Now().UTC()
+	now := d.now().UTC()
 
 	d.mu.Lock()
 	d.lastPollTime = now
@@ -334,60 +354,103 @@ func (d *MeteringDaemon) PollOnce(ctx context.Context) (*CollectResult, error) {
 		return nil, err
 	}
 
-	cRes, err := d.collector.CollectIncremental(ctx, d.overlapWindow, d.maxLookback)
+	lookbackHours := d.effectiveLookbackHours()
+	cRes, err := d.collector.CollectIncremental(ctx, d.overlapWindow, lookbackHours)
+	d.maybeRecordCatchup(cRes, lookbackHours)
 	if err != nil {
 		d.recordPollFailure(err)
 		return nil, fmt.Errorf("incremental spend log collection failed: %w", err)
 	}
 
 	d.recordPollSuccess()
+
+	if d.pipeline != nil {
+		_, _ = d.runPendingCatchup(ctx, cRes.EndTime)
+	}
+
 	return cRes, nil
 }
 
 // AggregateOnce executes a single cycle of daily usage aggregation.
+// If an earlier dynamic multi-day catch-up failed, its start boundary is folded into
+// this run so historical calendar days are still healed automatically.
 func (d *MeteringDaemon) AggregateOnce(ctx context.Context) (*PipelineResult, error) {
-	atomic.AddInt64(&d.totalAggregations, 1)
-	now := time.Now().UTC()
-
-	d.mu.Lock()
-	d.lastAggregateTime = now
-	d.mu.Unlock()
-
 	if d.pipeline == nil {
+		atomic.AddInt64(&d.totalAggregations, 1)
+		d.mu.Lock()
+		d.lastAggregateTime = d.now().UTC()
+		d.mu.Unlock()
 		err := errors.New("pipeline handle cannot be nil")
 		d.recordAggregateFailure(err)
 		return nil, err
 	}
 
-	lookbackHours := d.lookbackHours
-	if lookbackHours <= 0 {
-		lookbackHours = 48
+	d.pipelineMu.Lock()
+	defer d.pipelineMu.Unlock()
+
+	// Read pending catch-up state before sampling now so any catch-up registered
+	// prior to this scan is guaranteed to fall within [start, now] before clearing.
+	pending, gen := d.getPendingCatchup()
+	now := d.now().UTC()
+	start := dayAlignedLookbackStart(now, d.effectiveLookbackHours(), d.pipeline.Location())
+
+	clearCatchup := false
+	if !pending.IsZero() {
+		clearCatchup = true
+		if pending.Before(start) {
+			start = pending
+		}
 	}
 
+	return d.aggregateLocked(ctx, start, now, clearCatchup, gen)
+}
+
+func (d *MeteringDaemon) runPendingCatchup(ctx context.Context, minEnd time.Time) (*PipelineResult, error) {
 	d.pipelineMu.Lock()
-	pRes, err := d.pipeline.RunWindow(ctx, lookbackHours)
-	d.pipelineMu.Unlock()
+	defer d.pipelineMu.Unlock()
+
+	pending, gen := d.getPendingCatchup()
+	if pending.IsZero() {
+		return nil, nil
+	}
+	end := d.now().UTC()
+	if minEnd.After(end) {
+		end = minEnd
+	}
+	return d.aggregateLocked(ctx, pending, end, true, gen)
+}
+
+func (d *MeteringDaemon) aggregateLocked(ctx context.Context, startTime, endTime time.Time, clearCatchup bool, catchupGen uint64) (*PipelineResult, error) {
+	atomic.AddInt64(&d.totalAggregations, 1)
+	d.mu.Lock()
+	d.lastAggregateTime = d.now().UTC()
+	d.mu.Unlock()
+
+	pRes, err := d.pipeline.AggregateDailyUsage(ctx, startTime, endTime)
 	if err != nil {
 		d.recordAggregateFailure(err)
 		return nil, fmt.Errorf("daily usage aggregation failed: %w", err)
 	}
 
+	if clearCatchup {
+		d.clearPendingCatchup(catchupGen)
+	}
 	d.recordAggregateSuccess()
 	return pRes, nil
 }
 
 // PurgeOnce executes a single cycle of raw spend log retention cleanup.
 // When retentionDays <= 0, automated purging is disabled and it returns a skipped result with nil error.
-// To protect the financial ledger from partial-day overwrites during rolling recalculations,
-// purging is serialized with AggregateOnce and the effective cutoff never advances past the
-// day-aligned start of the aggregation lookback window.
+// To protect the financial ledger from partial-day overwrites during rolling recalculations or pending
+// catch-up aggregation, purging is serialized with aggregation via pipelineMu and never advances past
+// the earliest active aggregation boundary.
 func (d *MeteringDaemon) PurgeOnce(ctx context.Context) (*PurgeResult, error) {
 	if d.retentionDays <= 0 {
 		return &PurgeResult{Skipped: true}, nil
 	}
 
 	atomic.AddInt64(&d.totalPurges, 1)
-	now := time.Now().UTC()
+	now := d.now().UTC()
 
 	d.mu.Lock()
 	d.lastPurgeTime = now
@@ -400,7 +463,7 @@ func (d *MeteringDaemon) PurgeOnce(ctx context.Context) (*PurgeResult, error) {
 	}
 
 	d.pipelineMu.Lock()
-	cutoff := d.computeSafePurgeCutoff(time.Now().UTC())
+	cutoff := d.computeSafePurgeCutoff(d.now().UTC())
 	res, err := d.pipeline.PurgeExpiredSpendLogs(ctx, cutoff, DefaultPurgeBatchSize)
 	d.pipelineMu.Unlock()
 
@@ -417,28 +480,73 @@ func (d *MeteringDaemon) PurgeOnce(ctx context.Context) (*PurgeResult, error) {
 }
 
 // computeSafePurgeCutoff computes Now() - retentionDays*24h clamped so it never intrudes into
-// the active day-aligned aggregation lookback window (preventing replacement upserts from overwriting
-// daily financial totals with truncated raw logs).
+// the active day-aligned aggregation lookback window or any pending historical catch-up range.
 func (d *MeteringDaemon) computeSafePurgeCutoff(nowUTC time.Time) time.Time {
 	retentionCutoff := nowUTC.Add(-time.Duration(d.retentionDays) * 24 * time.Hour)
-
-	lookbackHours := d.lookbackHours
-	if lookbackHours <= 0 {
-		lookbackHours = 48
-	}
 
 	loc := time.UTC
 	if d.pipeline != nil {
 		loc = d.pipeline.Location()
 	}
-	nowInLoc := nowUTC.In(loc)
-	rawAggStart := nowInLoc.Add(-time.Duration(lookbackHours) * time.Hour)
-	aggWindowStartUTC := time.Date(rawAggStart.Year(), rawAggStart.Month(), rawAggStart.Day(), 0, 0, 0, 0, loc).UTC()
+	protectedStart := dayAlignedLookbackStart(nowUTC, d.effectiveLookbackHours(), loc)
+	if pending, _ := d.getPendingCatchup(); !pending.IsZero() {
+		pendingStart := dayAlignedStart(pending, loc)
+		if pendingStart.Before(protectedStart) {
+			protectedStart = pendingStart
+		}
+	}
 
-	if retentionCutoff.After(aggWindowStartUTC) {
-		return aggWindowStartUTC
+	if retentionCutoff.After(protectedStart) {
+		return protectedStart
 	}
 	return retentionCutoff
+}
+
+func (d *MeteringDaemon) effectiveLookbackHours() int {
+	if d.lookbackHours <= 0 {
+		return defaultLookbackHours
+	}
+	return d.lookbackHours
+}
+
+func (d *MeteringDaemon) now() time.Time {
+	if d.nowFunc != nil {
+		return d.nowFunc()
+	}
+	return time.Now()
+}
+
+func (d *MeteringDaemon) maybeRecordCatchup(cRes *CollectResult, lookbackHours int) {
+	if cRes == nil || cRes.InsertedCount <= 0 || cRes.EarliestInsertedAt.IsZero() {
+		return
+	}
+	cutoff := cRes.EndTime.Add(-time.Duration(lookbackHours) * time.Hour)
+	if cRes.EarliestInsertedAt.Before(cutoff) {
+		d.recordPendingCatchup(cRes.EarliestInsertedAt)
+	}
+}
+
+func (d *MeteringDaemon) recordPendingCatchup(start time.Time) {
+	d.mu.Lock()
+	if d.pendingCatchupStart.IsZero() || start.Before(d.pendingCatchupStart) {
+		d.pendingCatchupStart = start
+	}
+	d.catchupGen++
+	d.mu.Unlock()
+}
+
+func (d *MeteringDaemon) getPendingCatchup() (time.Time, uint64) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.pendingCatchupStart, d.catchupGen
+}
+
+func (d *MeteringDaemon) clearPendingCatchup(expectedGen uint64) {
+	d.mu.Lock()
+	if d.catchupGen == expectedGen {
+		d.pendingCatchupStart = time.Time{}
+	}
+	d.mu.Unlock()
 }
 
 // PollAndAggregate executes both log polling and daily usage aggregation in sequence.

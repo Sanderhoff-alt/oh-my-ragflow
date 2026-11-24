@@ -207,7 +207,7 @@ func TestE2E_Admin_FullBillingAndAuditClosedLoop(t *testing.T) {
 	// 4. Ingest and aggregate spend logs via MeteringDaemon
 	collector := mpmetering.NewSpendLogCollector(db, gwClient)
 	pipeline := mpmetering.NewUsagePipeline(db)
-	daemon := mpmetering.NewMeteringDaemon(db, collector, pipeline)
+	daemon := mpmetering.NewMeteringDaemon(collector, pipeline)
 
 	collectRes, err := daemon.PollOnce(ctx)
 	if err != nil {
