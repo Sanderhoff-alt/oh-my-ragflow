@@ -155,6 +155,111 @@ func (g *StickyGuard) SetUserExplicitPreference(
 	})
 }
 
+// userTenantSlot returns the model reference and tenant model id a membership currently holds for a model type.
+func userTenantSlot(ut *rentity.UserTenant, modelType int) (modelID, tenantModelID string) {
+	deref := func(s *string) string {
+		if s == nil {
+			return ""
+		}
+		return *s
+	}
+	switch modelType {
+	case int(rentity.ModelTypeChat):
+		return ut.LLMID, deref(ut.TenantLLMID)
+	case int(rentity.ModelTypeEmbedding):
+		return ut.EmbdID, deref(ut.TenantEmbdID)
+	case int(rentity.ModelTypeRerank):
+		return ut.RerankID, deref(ut.TenantRerankID)
+	case int(rentity.ModelTypeSpeech2Text):
+		return ut.ASRID, deref(ut.TenantASRID)
+	case int(rentity.ModelTypeImage2Text):
+		return ut.Img2TxtID, deref(ut.TenantImg2TxtID)
+	}
+	return "", ""
+}
+
+// RecordObservedUserChoice marks a default that a user changed through the upstream API as user_explicit.
+// Unlike SetUserExplicitPreference it never writes user_tenant: the value was observed after the upstream
+// handler committed it, so only the preference is recorded. Inside one transaction, with the membership row
+// locked, it records nothing and returns false when
+//   - the stored default is no longer the observed one, because a later write won and must be kept, or
+//   - the observed default is the value the platform itself assigned (origin platform_default), because the
+//     change then came from a platform upgrade and not from the user.
+func (g *StickyGuard) RecordObservedUserChoice(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	userID string,
+	modelType int,
+	observedModelID string,
+	observedTenantModelID string,
+) (bool, error) {
+	if db == nil {
+		return false, dao.ErrNilTransaction
+	}
+	if tenantID == "" {
+		return false, dao.ErrEmptyTenantID
+	}
+	if userID == "" || observedModelID == "" {
+		return false, errors.New("userID and observedModelID cannot be empty")
+	}
+	if !isSupportedModelType(modelType) {
+		return false, fmt.Errorf("unsupported model type: %d", modelType)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	silentDB := db.WithContext(ctx).Session(&gorm.Session{Logger: db.Logger.LogMode(logger.Silent)})
+	recorded := false
+	err := silentDB.Transaction(func(tx *gorm.DB) error {
+		memberQuery := tx.Where("tenant_id = ? AND user_id = ?", tenantID, userID)
+		if tx.Dialector.Name() != "sqlite" {
+			memberQuery = memberQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var members []rentity.UserTenant
+		if err := memberQuery.Limit(1).Find(&members).Error; err != nil {
+			return fmt.Errorf("failed to read user tenant membership: %w", err)
+		}
+		if len(members) == 0 {
+			return nil
+		}
+		if currentID, currentTenantID := userTenantSlot(&members[0], modelType); currentID != observedModelID || currentTenantID != observedTenantModelID {
+			return nil
+		}
+
+		var prefs []mpentity.UserDefaultPreference
+		if err := tx.Where("tenant_id = ? AND user_id = ? AND model_type = ?", tenantID, userID, modelType).
+			Limit(1).Find(&prefs).Error; err != nil {
+			return fmt.Errorf("failed to read user preference: %w", err)
+		}
+		if len(prefs) > 0 && prefs[0].Origin == mpentity.OriginPlatformDefault && prefs[0].CurrentModelID == observedModelID {
+			return nil
+		}
+
+		pref := mpentity.UserDefaultPreference{
+			ID:             generatePrefID(),
+			TenantID:       tenantID,
+			UserID:         userID,
+			ModelType:      modelType,
+			Origin:         mpentity.OriginUserExplicit,
+			CurrentModelID: observedModelID,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "tenant_id"}, {Name: "user_id"}, {Name: "model_type"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"origin":           mpentity.OriginUserExplicit,
+				"current_model_id": observedModelID,
+			}),
+		}).Create(&pref).Error; err != nil {
+			return err
+		}
+		recorded = true
+		return nil
+	})
+	return recorded, err
+}
+
 // RecordPlatformDefault records a platform-assigned default model in the preference tracking table.
 // If the user has already set an explicit choice (origin == 'user_explicit'), this is a NO-OP.
 // Uses ON CONFLICT to remain race-free under concurrent execution.
