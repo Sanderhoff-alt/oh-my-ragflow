@@ -273,6 +273,28 @@ func (d *ReconcileDAO) FindDueRetries(ctx context.Context, db *gorm.DB, now time
 	return records, nil
 }
 
+// ListByStatus returns one page of the records in the given status, ordered by tenant id, together with the
+// total number of such records.
+func (d *ReconcileDAO) ListByStatus(ctx context.Context, db *gorm.DB, status entity.ReconcileStatus, offset, limit int) ([]*entity.TenantReconcileRecord, int64, error) {
+	if db == nil {
+		return nil, 0, ErrNilTransaction
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).Where("status = ?", status)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var records []*entity.TenantReconcileRecord
+	if err := query.Order("tenant_id ASC").Offset(offset).Limit(limit).Find(&records).Error; err != nil {
+		return nil, 0, err
+	}
+	return records, total, nil
+}
+
 // MarkKeyDirty records that a key rotation is starting, so the gateway may hold keys of the tenant besides
 // the one named by key_hash. It is a compare-and-swap on a 'ready' record: a concurrent decommission or
 // rotation makes it fail with ErrOptimisticLockConflict. The status stays 'ready'.

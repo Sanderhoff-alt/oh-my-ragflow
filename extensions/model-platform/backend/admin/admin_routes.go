@@ -91,7 +91,8 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 		modelPlatform.GET("/models/publish/tasks/:id", GetPublishTaskHandler(customDB...))
 		modelPlatform.POST("/models/publish/tasks/:id/retry", RetryPublishTaskHandler(customDB...))
 
-		// Emergency credential rotation of a single tenant
+		// Emergency credential rotation of tenants
+		modelPlatform.GET("/tenants", ListTenantKeysHandler(customDB...))
 		modelPlatform.POST("/tenants/:tenant_id/rotate-key", RotateTenantKeyHandler(rotator, customDB...))
 
 		// Metering and billing management endpoints
