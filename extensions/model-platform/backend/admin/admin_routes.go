@@ -80,6 +80,7 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 		modelPlatform.GET("/health", AdminHealthHandler(gwClient))
 
 		// Model onboarding: catalog entry plus rollout to all tenants, with progress and retry
+		modelPlatform.GET("/models", ListManagedModelsHandler(customDB...))
 		modelPlatform.POST("/models", PublishModelHandler(pub, customDB...))
 		modelPlatform.GET("/models/publish/tasks/:id", GetPublishTaskHandler(customDB...))
 		modelPlatform.POST("/models/publish/tasks/:id/retry", RetryPublishTaskHandler(customDB...))

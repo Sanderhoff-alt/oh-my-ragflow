@@ -41,7 +41,8 @@ func setupPublishAdminServer(t *testing.T, routed ...string) (*gin.Engine, *gorm
 	if err := migration.MigratePublishSchema(ctx, db); err != nil {
 		t.Fatalf("failed to migrate publish schema: %v", err)
 	}
-	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{}); err != nil {
+	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{},
+		&rentity.Knowledgebase{}, &rentity.Chat{}); err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
 	}
 
@@ -65,6 +66,28 @@ func doJSON(r *gin.Engine, method, path, body string) (int, map[string]interface
 	var out map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &out)
 	return w.Code, out
+}
+
+func TestPublishAPI_ListCatalog(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m2", ModelName: "bge-m3", ModelType: 2, Status: entity.ManagedModelStatusRetired})
+
+	code, out := doJSON(r, http.MethodGet, "/admin/model-platform/models", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %v", code, out)
+	}
+	items := out["data"].([]interface{})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 catalog entries, got %v", items)
+	}
+	first := items[0].(map[string]interface{})
+	if first["model_name"] != "bge-m3" || first["status"] != "retired" {
+		t.Errorf("expected entries sorted by name with the derived status, got %v", first)
+	}
+	if _, ok := first["tenants"].(map[string]interface{}); !ok {
+		t.Errorf("expected the per-tenant state breakdown, got %v", first)
+	}
 }
 
 func TestPublishAPI_PublishAndProgress(t *testing.T) {

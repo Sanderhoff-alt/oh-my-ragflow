@@ -52,7 +52,10 @@ func migrateBillingSchemaEE(ctx context.Context, db *gorm.DB) error {
 	if err := mpmigration.MigrateUsageSchema(ctx, db); err != nil {
 		return err
 	}
-	return mpmigration.MigratePublishSchema(ctx, db)
+	if err := mpmigration.MigratePublishSchema(ctx, db); err != nil {
+		return err
+	}
+	return mpmigration.BackfillManagedCatalog(ctx, db)
 }
 
 // migratePermissionDataEE is a no-op in the community edition.

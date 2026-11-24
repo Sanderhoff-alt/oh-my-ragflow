@@ -82,7 +82,8 @@ func setupPublishDB(t *testing.T) *gorm.DB {
 	if err := migration.MigratePublishSchema(context.Background(), db); err != nil {
 		t.Fatalf("failed to migrate publish schema: %v", err)
 	}
-	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{}); err != nil {
+	if err := db.AutoMigrate(&rentity.TenantModelProvider{}, &rentity.TenantModelInstance{}, &rentity.TenantModel{},
+		&rentity.Knowledgebase{}, &rentity.Chat{}); err != nil {
 		t.Fatalf("failed to migrate tenant model tables: %v", err)
 	}
 	return db

@@ -53,6 +53,24 @@ func publishErrorResponse(err error) (int, string) {
 	}
 }
 
+// ListManagedModelsHandler returns the catalog with each model's derived tenant states and reference counts.
+func ListManagedModelsHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		db := resolveDB(customDB...)
+		if db == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "database unavailable"})
+			return
+		}
+
+		entries, err := publisher.ListCatalog(c.Request.Context(), db)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to query the model catalog"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "data": entries})
+	}
+}
+
 // GetPublishTaskHandler returns the rollout progress of a publish task and a page of failed tenants.
 func GetPublishTaskHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {

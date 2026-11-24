@@ -174,8 +174,15 @@ func (w *Worker) sweep(db *gorm.DB) {
 		var task entity.ModelPublishTask
 		res := db.Where("model_name = ? AND model_type = ?", m.ModelName, m.ModelType).
 			Order("created_at DESC").Limit(1).Find(&task)
-		if res.Error != nil || res.RowsAffected == 0 {
+		if res.Error != nil {
 			continue
+		}
+		if res.RowsAffected == 0 {
+			// Catalog rows adopted by the backfill have no task yet. The task is only a progress container.
+			task = entity.ModelPublishTask{ID: newID(), ModelName: m.ModelName, ModelType: m.ModelType}
+			if err := db.Create(&task).Error; err != nil {
+				continue
+			}
 		}
 		tenants, err := readyTenantsMissingModel(db, m.ModelName, m.ModelType, task.ID)
 		if err != nil || len(tenants) == 0 {
