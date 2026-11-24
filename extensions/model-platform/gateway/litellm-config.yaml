@@ -23,6 +23,11 @@ general_settings:
   # whitelist or a retired model keeps being honoured by a worker until its entry expires. This bounds the
   # delay of revocation at the gateway.
   user_api_key_cache_ttl: 5
+  # Optional: declarative gateway spend log retention (unset by default; LiteLLM retains LiteLLM_SpendLogs
+  # indefinitely until enabled). Uncomment to treat the gateway table as a transient ring buffer without
+  # affecting virtual key budget tracking (tracked separately on token.spend).
+  # When enabling retention on both layers, keep this shorter than RAGFlow's METERING_SPEND_LOG_RETENTION_DAYS.
+  # maximum_spend_logs_retention_period: "30d"
 
 litellm_settings:
   # Credential masking & log desensitization:

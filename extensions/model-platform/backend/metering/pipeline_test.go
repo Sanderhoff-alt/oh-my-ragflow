@@ -587,3 +587,153 @@ func TestUsagePipeline_ResolveDateExpression(t *testing.T) {
 		t.Errorf("unexpected MySQL CST expr: %s", exprMySQLCST)
 	}
 }
+
+func TestUsagePipeline_PurgeExpiredSpendLogs_BatchedAndPreservesLedger(t *testing.T) {
+	db := setupPipelineTestDB(t)
+	pipeline := NewUsagePipeline(db)
+
+	cutoff := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	// Seed 13 expired logs (< cutoff), 1 exact-boundary log (== cutoff), and 2 fresh logs (> cutoff).
+	for i := 0; i < 13; i++ {
+		log := entity.GatewaySpendLog{
+			SpendID:     fmt.Sprintf("expired-%02d", i),
+			TenantID:    "tenant-purge",
+			ModelName:   "gpt-4o",
+			TotalTokens: 100,
+			Spend:       0.001,
+			RequestTime: cutoff.Add(-time.Duration(i+1) * time.Hour),
+		}
+		if err := db.Create(&log).Error; err != nil {
+			t.Fatalf("failed to seed expired log %d: %v", i, err)
+		}
+	}
+
+	retained := []entity.GatewaySpendLog{
+		{
+			SpendID:     "boundary-exact",
+			TenantID:    "tenant-purge",
+			ModelName:   "gpt-4o",
+			TotalTokens: 200,
+			Spend:       0.002,
+			RequestTime: cutoff,
+		},
+		{
+			SpendID:     "fresh-1",
+			TenantID:    "tenant-purge",
+			ModelName:   "gpt-4o",
+			TotalTokens: 300,
+			Spend:       0.003,
+			RequestTime: cutoff.Add(1 * time.Hour),
+		},
+		{
+			SpendID:     "fresh-2",
+			TenantID:    "tenant-purge",
+			ModelName:   "gpt-4o",
+			TotalTokens: 400,
+			Spend:       0.004,
+			RequestTime: cutoff.Add(24 * time.Hour),
+		},
+	}
+	for _, l := range retained {
+		if err := db.Create(&l).Error; err != nil {
+			t.Fatalf("failed to seed retained log %s: %v", l.SpendID, err)
+		}
+	}
+
+	// Aggregate historical ledger before purging raw logs.
+	_, err := pipeline.AggregateDailyUsage(context.Background(), cutoff.Add(-48*time.Hour), cutoff.Add(48*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to aggregate before purge: %v", err)
+	}
+
+	var ledgerBefore []entity.TenantUsageDaily
+	if err := db.Order("usage_date ASC, model_name ASC").Find(&ledgerBefore).Error; err != nil {
+		t.Fatalf("failed to read ledger before purge: %v", err)
+	}
+	if len(ledgerBefore) == 0 {
+		t.Fatalf("expected aggregated ledger rows before purge")
+	}
+
+	// Purge in small batches of 5 -> 5 + 5 + 3 = 13 rows across 3 batches.
+	res, err := pipeline.PurgeExpiredSpendLogs(context.Background(), cutoff, 5)
+	if err != nil {
+		t.Fatalf("PurgeExpiredSpendLogs failed: %v", err)
+	}
+	if res.DeletedCount != 13 {
+		t.Fatalf("expected 13 deleted rows, got %d", res.DeletedCount)
+	}
+	if res.Batches != 3 {
+		t.Fatalf("expected 3 batches, got %d", res.Batches)
+	}
+
+	// Verify only the 3 non-expired rows remain (including exact cutoff boundary).
+	var remaining []entity.GatewaySpendLog
+	if err := db.Order("spend_id ASC").Find(&remaining).Error; err != nil {
+		t.Fatalf("failed to query remaining spend logs: %v", err)
+	}
+	if len(remaining) != 3 {
+		t.Fatalf("expected 3 remaining rows, got %d", len(remaining))
+	}
+	wantIDs := []string{"boundary-exact", "fresh-1", "fresh-2"}
+	for i, want := range wantIDs {
+		if remaining[i].SpendID != want {
+			t.Errorf("remaining[%d] = %s, want %s", i, remaining[i].SpendID, want)
+		}
+	}
+
+	// Financial ledger invariant: platform_tenant_usage_daily is completely untouched.
+	var ledgerAfter []entity.TenantUsageDaily
+	if err := db.Order("usage_date ASC, model_name ASC").Find(&ledgerAfter).Error; err != nil {
+		t.Fatalf("failed to read ledger after purge: %v", err)
+	}
+	if len(ledgerAfter) != len(ledgerBefore) {
+		t.Fatalf("ledger row count changed: before=%d after=%d", len(ledgerBefore), len(ledgerAfter))
+	}
+	for i := range ledgerBefore {
+		if ledgerBefore[i].UsageDate != ledgerAfter[i].UsageDate ||
+			ledgerBefore[i].CallCount != ledgerAfter[i].CallCount ||
+			ledgerBefore[i].TotalTokens != ledgerAfter[i].TotalTokens ||
+			math.Abs(ledgerBefore[i].TotalSpend-ledgerAfter[i].TotalSpend) > 1e-9 {
+			t.Errorf("ledger row %d mutated: before=%+v after=%+v", i, ledgerBefore[i], ledgerAfter[i])
+		}
+	}
+}
+
+func TestUsagePipeline_PurgeExpiredSpendLogs_ValidationAndCancel(t *testing.T) {
+	db := setupPipelineTestDB(t)
+	pipeline := NewUsagePipeline(db)
+
+	if _, err := NewUsagePipeline(nil).PurgeExpiredSpendLogs(context.Background(), time.Now().UTC(), 10); err == nil {
+		t.Fatal("expected error for nil DB")
+	}
+	if _, err := pipeline.PurgeExpiredSpendLogs(context.Background(), time.Time{}, 10); err == nil {
+		t.Fatal("expected error for zero cutoff")
+	}
+
+	cutoff := time.Now().UTC()
+	if err := db.Create(&entity.GatewaySpendLog{
+		SpendID:     "cancel-test-1",
+		TenantID:    "tenant-cancel",
+		ModelName:   "gpt-4o",
+		RequestTime: cutoff.Add(-48 * time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("failed to seed log: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := pipeline.PurgeExpiredSpendLogs(ctx, cutoff, 10)
+	if err == nil {
+		t.Fatal("expected context canceled error, got nil")
+	}
+	if res == nil || res.DeletedCount != 0 {
+		t.Fatalf("expected 0 deleted rows on canceled context, got %+v", res)
+	}
+
+	var count int64
+	db.Model(&entity.GatewaySpendLog{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("expected log to remain untouched on canceled context, got count=%d", count)
+	}
+}

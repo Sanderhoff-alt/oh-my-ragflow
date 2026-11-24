@@ -716,6 +716,18 @@ ON DUPLICATE KEY UPDATE
 ```
 **数学幂等保证**：即使对账流水线因网络崩溃反复执行 100 次，或回溯 48 小时覆盖处理迟到日志，日账单数据也绝对保持一致，杜绝任何形式的重叠计费。
 
+#### 声明式原始流水保留策略（默认关闭，按需开启）
+原始流水表（网关侧 `LiteLLM_SpendLogs` 与控制面 `platform_gateway_spend_log`）默认**永久保留**，避免升级后静默删除审计明细。运维可按需在两层分别声明启用，互不跨库、不依赖 DDL 分区：
+
+- **网关层（`extensions/model-platform/gateway/litellm-config.yaml`）**：取消注释 `general_settings` 下的 `maximum_spend_logs_retention_period: "30d"`。LiteLLM 自治清理原始流水，不影响虚拟 Key 预算累计（`token.spend`）。
+- **控制面层（RAGFlow 服务环境变量）**：配置 `METERING_SPEND_LOG_RETENTION_DAYS` 启用 `MeteringDaemon` 的每日主键分批清理任务；清理仅作用于 `platform_gateway_spend_log`，绝不修改或删除 `platform_tenant_usage_daily`，且清理截止时间自动受聚合回溯窗口保护：
+
+```dotenv
+# 可选：启用控制面原始 spend log 自动清理（默认 0，永久保留不删除）。
+# 当网关层与控制面同时启用时，建议保持此值大于网关层的 maximum_spend_logs_retention_period。
+# METERING_SPEND_LOG_RETENTION_DAYS=90
+```
+
 ---
 
 ### 6.4 管理端用量统计与 CSV 导出 API

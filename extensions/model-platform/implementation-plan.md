@@ -506,6 +506,18 @@ flowchart TD
     end
 ```
 
+### 6.2.1 Declarative Spend Log Retention Policy (Opt-In)
+Raw spend log tables (`LiteLLM_SpendLogs` on the gateway and `platform_gateway_spend_log` on the control plane) are retained indefinitely by default so no historical audit data is silently pruned. Operators can opt in independently at each layer without cross-database access or DDL partitioning:
+
+- **Gateway layer (`extensions/model-platform/gateway/litellm-config.yaml`)**: uncomment `maximum_spend_logs_retention_period` (for example `"30d"`) under `general_settings`. LiteLLM autonomously purges `LiteLLM_SpendLogs` without affecting virtual key budget tracking (`token.spend`).
+- **Control plane layer (RAGFlow server environment)**: set `METERING_SPEND_LOG_RETENTION_DAYS` to enable bounded primary-key batch cleanup in `MeteringDaemon`. `platform_tenant_usage_daily` is never modified or deleted by the sweep, and the effective cutoff is clamped so it never intrudes into the active aggregation lookback window.
+
+```dotenv
+# Optional: enable automated control-plane raw spend log purging (disabled by default: 0 = retain indefinitely).
+# Keep this longer than LiteLLM's maximum_spend_logs_retention_period when both layers are enabled.
+# METERING_SPEND_LOG_RETENTION_DAYS=90
+```
+
 ### 6.3 Physical Zero-Billing Isolation for Self-Owned Models
 Tenant self-owned models connect directly to third-party endpoints. They completely bypass the LiteLLM gateway, generating 0 gateway spend logs and strictly $0.00 platform spend.
 
