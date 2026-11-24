@@ -15,6 +15,17 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// DefaultPurgeBatchSize is the default number of raw spend log rows deleted per batch.
+const DefaultPurgeBatchSize = 1000
+
+// PurgeResult captures metrics produced by a raw spend log retention sweep.
+type PurgeResult struct {
+	CutoffTime   time.Time `json:"cutoff_time"`
+	DeletedCount int64     `json:"deleted_count"`
+	Batches      int       `json:"batches"`
+	Skipped      bool      `json:"skipped"`
+}
+
 // PipelineResult captures metrics produced by a daily billing aggregation run.
 type PipelineResult struct {
 	StartTime         time.Time `json:"start_time"`
@@ -470,4 +481,62 @@ func calculateUsageSummary(ctx context.Context, db *gorm.DB, tenantID string, st
 	}
 
 	return summary, nil
+}
+
+// PurgeExpiredSpendLogs deletes raw spend logs strictly older than cutoff (request_time < cutoff)
+// from platform_gateway_spend_log in bounded primary-key batches to avoid long table locks and
+// remain portable across MySQL, PostgreSQL, and SQLite.
+// It never mutates or deletes rows from platform_tenant_usage_daily.
+func (p *UsagePipeline) PurgeExpiredSpendLogs(ctx context.Context, cutoff time.Time, batchSize int) (*PurgeResult, error) {
+	if p.db == nil {
+		return nil, errors.New("database handle cannot be nil")
+	}
+	if cutoff.IsZero() {
+		return nil, errors.New("cutoff time cannot be zero")
+	}
+	if batchSize <= 0 {
+		batchSize = DefaultPurgeBatchSize
+	}
+
+	cutoffUTC := cutoff.UTC()
+	result := &PurgeResult{
+		CutoffTime: cutoffUTC,
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+
+		var ids []string
+		err := p.db.WithContext(ctx).
+			Model(&entity.GatewaySpendLog{}).
+			Where("request_time < ?", cutoffUTC).
+			Order("request_time ASC, spend_id ASC").
+			Limit(batchSize).
+			Pluck("spend_id", &ids).Error
+		if err != nil {
+			return result, fmt.Errorf("failed to select expired spend logs: %w", err)
+		}
+
+		if len(ids) == 0 {
+			break
+		}
+
+		res := p.db.WithContext(ctx).
+			Where("spend_id IN ?", ids).
+			Delete(&entity.GatewaySpendLog{})
+		if res.Error != nil {
+			return result, fmt.Errorf("failed to delete expired spend logs batch: %w", res.Error)
+		}
+
+		result.Batches++
+		result.DeletedCount += res.RowsAffected
+
+		if len(ids) < batchSize {
+			break
+		}
+	}
+
+	return result, nil
 }
