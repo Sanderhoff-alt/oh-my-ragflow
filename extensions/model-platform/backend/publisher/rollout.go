@@ -80,7 +80,7 @@ ORDER BY r.tenant_id`, entity.StatusReady, taskID).Scan(&tenants).Error
 func SetDefault(ctx context.Context, db *gorm.DB, modelID string) (*Result, error) {
 	var result *Result
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		model, err := lockCatalogModel(tx, modelID)
+		model, err := lockDefaultSlot(tx, modelID)
 		if err != nil {
 			return err
 		}
@@ -163,6 +163,33 @@ func lockCatalogModel(tx *gorm.DB, modelID string) (*entity.PlatformManagedModel
 		return nil, ErrModelNotFound
 	}
 	return &models[0], nil
+}
+
+// lockDefaultSlot locks every catalog row of the model's type in id order and returns the model. The default
+// is a property of the whole type, so two concurrent switches must queue on the type, not on their own
+// target rows: otherwise each clears the other's old default while neither sees the other's new one.
+func lockDefaultSlot(tx *gorm.DB, modelID string) (*entity.PlatformManagedModel, error) {
+	var probe []entity.PlatformManagedModel
+	if err := tx.Where("id = ?", modelID).Limit(1).Find(&probe).Error; err != nil {
+		return nil, err
+	}
+	if len(probe) == 0 {
+		return nil, ErrModelNotFound
+	}
+	query := tx.Order("id ASC")
+	if tx.Dialector.Name() != "sqlite" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var rows []entity.PlatformManagedModel
+	if err := query.Where("model_type = ?", probe[0].ModelType).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		if rows[i].ID == modelID {
+			return &rows[i], nil
+		}
+	}
+	return nil, ErrModelNotFound
 }
 
 // Retire marks a catalog model retired and starts the rollout that converges every tenant: embedding models

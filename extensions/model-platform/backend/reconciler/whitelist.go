@@ -49,11 +49,15 @@ func WithInstanceRowLock(ctx context.Context, db *gorm.DB, instanceID string, fn
 }
 
 // WithInstanceWhitelistLock is WithInstanceRowLock plus the in-process mutex, which also serializes the
-// goroutines of one replica without a database round trip.
+// goroutines of one replica and makes SQLite, which has no row locks, behave the same in tests. The order
+// is always row lock first, mutex second: the lifecycle managers take the mutex inside a caller that
+// already holds the row lock, so the reverse order here would deadlock against them.
 func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
-	unlock := LockInstanceWhitelist(instanceID)
-	defer unlock()
-	return WithInstanceRowLock(ctx, db, instanceID, fn)
+	return WithInstanceRowLock(ctx, db, instanceID, func() error {
+		unlock := LockInstanceWhitelist(instanceID)
+		defer unlock()
+		return fn()
+	})
 }
 
 // RetirementFlags reports the per-tenant retirement state recorded in a tenant_model extra value:

@@ -102,6 +102,13 @@ func setupMockLiteLLMGateway(t *testing.T) (*httptest.Server, *mockGatewayState)
 			return
 		}
 
+		// Team creation, which the gateway client does before it generates a key that names a team
+		if path == "/team/new" && r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{}`))
+			return
+		}
+
 		// Virtual Key generation
 		if path == "/key/generate" && r.Method == http.MethodPost {
 			var req gateway.GenerateKeyRequest

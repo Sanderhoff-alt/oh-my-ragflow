@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"testing"
@@ -55,6 +56,10 @@ func chatStatus(t *testing.T, baseURL, key, model string) int {
 		t.Fatalf("chat completion request failed: %v", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+		t.Logf("chat completion of %s answered 429: %s", model, raw)
+	}
 	return resp.StatusCode
 }
 
@@ -169,7 +174,21 @@ func TestE2E_LiveGateway_KeyWhitelistSemantics(t *testing.T) {
 	if _, err := client.UpdateKey(ctx, &gateway.UpdateKeyRequest{Key: denied.Key, Models: []string{"gpt-4o-mini"}}); err != nil {
 		t.Fatalf("failed to update the whitelist: %v", err)
 	}
-	if status := chatStatus(t, baseURL, denied.Key, "gpt-4o-mini"); status == http.StatusForbidden {
-		t.Errorf("a key whose whitelist names the model must be allowed, got HTTP %d", status)
+	// LiteLLM caches the key object, so a changed whitelist is visible after a short propagation delay.
+	if status := settledStatus(func() int { return chatStatus(t, baseURL, denied.Key, "gpt-4o-mini") }, false); status == http.StatusForbidden {
+		info, infoErr := client.GetKeyInfo(ctx, denied.Key)
+		t.Errorf("a key whose whitelist names the model must be allowed within 15s, still HTTP %d (gateway view: %+v, %v)", status, info, infoErr)
 	}
+}
+
+// settledStatus polls until the gateway answers 403 (wantForbidden) or anything else, or 15s pass, and returns
+// the last status. It absorbs LiteLLM's key cache delay after a whitelist change.
+func settledStatus(call func() int, wantForbidden bool) int {
+	status := call()
+	deadline := time.Now().Add(15 * time.Second)
+	for (status == http.StatusForbidden) != wantForbidden && time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		status = call()
+	}
+	return status
 }

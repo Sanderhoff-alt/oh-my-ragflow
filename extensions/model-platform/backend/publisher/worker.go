@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -58,6 +59,8 @@ type Worker struct {
 	concurrency  int
 	maxRetries   int
 	leaseTimeout time.Duration
+
+	sweepAfter string // tenant the next deprecated-model sweep batch resumes after
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -204,33 +207,54 @@ func (w *Worker) sweep(ctx context.Context, db *gorm.DB) {
 // sweepDeprecated finalizes the deprecated embedding rows of retired models once the tenant's knowledge bases
 // that kept them readable are gone.
 func (w *Worker) sweepDeprecated(ctx context.Context, db *gorm.DB) {
-	var candidates []struct {
-		TenantID   string
-		InstanceID string
-	}
-	if err := db.Raw(`
-SELECT DISTINCT p.tenant_id AS tenant_id, i.id AS instance_id FROM tenant_model_provider p
-JOIN tenant_model_instance i ON i.provider_id = p.id AND i.instance_name = ?
-JOIN tenant_model m ON m.instance_id = i.id AND m.model_type = ? AND m.status = 'active'
-	AND COALESCE(m.extra, '') LIKE '%"deprecated":true%'
-JOIN platform_managed_model c ON c.model_name = m.model_name AND c.status = ?
-WHERE p.provider_name = ?
-ORDER BY p.tenant_id LIMIT ?`,
-		reconciler.PlatformInstanceName, int(rentity.ModelTypeEmbedding), entity.ManagedModelStatusRetired,
-		reconciler.ProviderOpenAIAPICompatible, dueBatchSize).Scan(&candidates).Error; err != nil {
+	candidates, err := w.deprecatedCandidates(db, w.sweepAfter)
+	if err != nil {
 		return
+	}
+	if len(candidates) == 0 && w.sweepAfter != "" {
+		w.sweepAfter = ""
+		if candidates, err = w.deprecatedCandidates(db, ""); err != nil {
+			return
+		}
+	}
+	// Tenants that keep reading a deprecated model stay candidates for a long time. Resuming after the last
+	// tenant of the previous batch keeps them from occupying every batch and starving the tenants behind them.
+	w.sweepAfter = ""
+	if len(candidates) == dueBatchSize {
+		w.sweepAfter = candidates[len(candidates)-1].TenantID
 	}
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return
 		}
 		_ = reconciler.WithInstanceRowLock(ctx, db, c.InstanceID, func() error {
-			if _, err := w.embedding.SweepTombstoneCandidates(ctx, db, c.TenantID); err != nil {
-				return err
-			}
-			return w.replaceTombstonedEmbeddingDefaults(ctx, db, c.TenantID, c.InstanceID)
+			_, sweepErr := w.embedding.SweepTombstoneCandidates(ctx, db, c.TenantID)
+			// A partial sweep still tombstoned some models, whose users must not wait for the others.
+			return errors.Join(sweepErr, w.replaceTombstonedEmbeddingDefaults(ctx, db, c.TenantID, c.InstanceID))
 		})
 	}
+}
+
+type deprecatedCandidate struct {
+	TenantID   string
+	InstanceID string
+}
+
+// deprecatedCandidates returns up to one batch of tenants after afterTenant that hold a deprecated embedding
+// row of a retired catalog model.
+func (w *Worker) deprecatedCandidates(db *gorm.DB, afterTenant string) ([]deprecatedCandidate, error) {
+	var candidates []deprecatedCandidate
+	err := db.Raw(`
+SELECT DISTINCT p.tenant_id AS tenant_id, i.id AS instance_id FROM tenant_model_provider p
+JOIN tenant_model_instance i ON i.provider_id = p.id AND i.instance_name = ?
+JOIN tenant_model m ON m.instance_id = i.id AND m.model_type = ? AND m.status = 'active'
+	AND COALESCE(m.extra, '') LIKE '%"deprecated":true%'
+JOIN platform_managed_model c ON c.model_name = m.model_name AND c.status = ?
+WHERE p.provider_name = ? AND p.tenant_id > ?
+ORDER BY p.tenant_id LIMIT ?`,
+		reconciler.PlatformInstanceName, int(rentity.ModelTypeEmbedding), entity.ManagedModelStatusRetired,
+		reconciler.ProviderOpenAIAPICompatible, afterTenant, dueBatchSize).Scan(&candidates).Error
+	return candidates, err
 }
 
 // replaceTombstonedEmbeddingDefaults moves the users of the tenant off every retired embedding model that the
@@ -241,12 +265,13 @@ func (w *Worker) replaceTombstonedEmbeddingDefaults(ctx context.Context, db *gor
 		Find(&retired).Error; err != nil {
 		return err
 	}
+	var errs []error
 	for i := range retired {
 		if err := w.replaceRetiredDefaults(ctx, db, tenantID, instanceID, &retired[i]); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // process claims one item, applies it, and records the outcome.

@@ -55,19 +55,28 @@ func (r *TenantReconciler) activeCatalogModels(ctx context.Context, db *gorm.DB)
 
 // initialWhitelist is the model list of a new tenant's virtual key. LiteLLM treats an empty list as
 // unrestricted and the gateway client rejects it, so an empty catalog yields the deny-all placeholder.
-func initialWhitelist(catalog []entity.PlatformManagedModel) []string {
-	if len(catalog) == 0 {
-		return []string{RevokedModelPlaceholder}
+// The two platform aliases follow allowedModels like every other name, the same as in the whitelist rebuild.
+func initialWhitelist(catalog []entity.PlatformManagedModel, allowedModels []string) []string {
+	permitted := func(model string) bool {
+		return len(allowedModels) == 0 || isModelPermitted(model, allowedModels)
 	}
-	whitelist := []string{"platform/chat"}
+	var whitelist []string
+	if len(catalog) > 0 && permitted("platform/chat") {
+		whitelist = append(whitelist, "platform/chat")
+	}
 	for _, m := range catalog {
 		if m.ModelType == int(rentity.ModelTypeEmbedding) {
-			whitelist = append(whitelist, "platform/embedding")
+			if permitted("platform/embedding") {
+				whitelist = append(whitelist, "platform/embedding")
+			}
 			break
 		}
 	}
 	for _, m := range catalog {
 		whitelist = append(whitelist, m.ModelName)
+	}
+	if len(whitelist) == 0 {
+		return []string{RevokedModelPlaceholder}
 	}
 	return whitelist
 }
@@ -205,7 +214,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		KeyName: keyAlias,
 		TeamID:  tenantID,
 		UserID:  tenantID,
-		Models:  initialWhitelist(catalog),
+		Models:  initialWhitelist(catalog, r.allowedModels),
 	}
 
 	genResp, err := r.gatewayClient.GenerateKey(ctx, genReq)
