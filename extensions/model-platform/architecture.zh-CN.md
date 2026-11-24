@@ -43,7 +43,7 @@ flowchart LR
 
 1. **绝对非侵入（Non-Invasive Extensibility）**：`upstream/ragflow` 差异严格为空。所有增强均基于工作区 Overlay、Go 构建标签桩与外部服务解耦实现。
 2. **凭据零泄露（Zero-Leakage Credential Boundary）**：根供应商真实 API Key 仅存在于网关环境。租户仅获取白名单受限的虚拟 Key（`sk-tenant-...`）。
-3. **事务强解耦（Transaction Decoupled Events）**：严禁在 DB 事务内发起网络 RPC。租户生命周期钩子基于事务提交后回调机制（`RegisterPostCommitHook`）与异步事件总线（`event.EventBus`）解耦分发。
+3. **事务强解耦（Transaction Decoupled Events）**：严禁在 DB 事务内发起网络 RPC。租户生命周期钩子在事务提交可见后（`event.PreFlightCheck`）通过异步事件总线（`event.EventBus`）解耦分发。
 4. **向量空间不可变（Vector Space Immutability）**：已有分块的数据集向量模型永久冻结，API 强制拦截篡改请求并返回 HTTP 400。
 5. **自有模型零计费（Zero-Billing Bypass）**：租户自有模型直接连接外部端点，物理绕开网关，平台账单恒为 0.00 元。
 
