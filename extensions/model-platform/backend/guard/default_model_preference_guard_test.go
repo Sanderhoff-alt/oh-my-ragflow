@@ -207,3 +207,43 @@ func TestDefaultModelPreference_MultiTypeUpdateRecordsEachChangedType(t *testing
 		t.Error("unchanged rerank default must not get a preference row")
 	}
 }
+
+func TestDefaultModelPreference_TTSAndDecisionObservedAsExplicit(t *testing.T) {
+	db := setupPreferenceTestDB(t)
+	seedPlatformDefaultUser(t, db, "alice")
+
+	const (
+		customTTS      = "tts-1-hd@custom@OpenAI-API-Compatible"
+		customDecision = "deepseek-v3@custom@OpenAI-API-Compatible"
+	)
+	r := setupPreferenceServer(db, func(db *gorm.DB, userID string) {
+		db.Model(&rentity.UserTenant{}).Where("user_id = ?", userID).
+			Updates(map[string]interface{}{
+				"tts_id":      customTTS,
+				"decision_id": customDecision,
+			})
+	})
+
+	doRequest(r, http.MethodPatch, "/api/v1/models/default", "alice")
+
+	for modelType, want := range map[rentity.ModelType]string{
+		rentity.ModelTypeTTS:      customTTS,
+		rentity.ModelTypeDecision: customDecision,
+	} {
+		pref, ok := loadPref(t, db, "alice", modelType)
+		if !ok || pref.Origin != mpentity.OriginUserExplicit || pref.CurrentModelID != want {
+			t.Errorf("model type %d: expected user_explicit %s, got ok=%v pref=%+v", modelType, want, ok, pref)
+		}
+
+		// Subsequent platform upgrade must preserve the explicit TTS/Decision choice
+		res, err := reconciler.NewStickyGuard().UpgradeDefaultModel(
+			context.Background(), db, prefTenantID, int(modelType), "platform-next@platform@OpenAI-API-Compatible", "tm-next",
+		)
+		if err != nil {
+			t.Fatalf("UpgradeDefaultModel failed for %d: %v", modelType, err)
+		}
+		if res.PreservedCount != 1 || res.UpgradedCount != 0 {
+			t.Errorf("model type %d: expected sticky preservation, got %+v", modelType, res)
+		}
+	}
+}

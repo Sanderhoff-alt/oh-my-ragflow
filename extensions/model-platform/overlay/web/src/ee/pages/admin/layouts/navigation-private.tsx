@@ -1,5 +1,7 @@
+import { LucideBarChart3, LucideBox } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { LucideBox, LucideBarChart3 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
 import { PrivateRoutes } from '@/ee/private-routes';
 
 export type AdminNavItem = {
@@ -18,16 +20,18 @@ export type AdminNavExtension = {
  * Appends Model Providers and Model Usage Statistics to the admin navigation sidebar.
  */
 export function useEnterpriseAdminNav(): AdminNavExtension {
+  const { t } = useTranslation();
+
   return {
     items: [
       {
         path: PrivateRoutes.AdminModelProviders,
-        name: 'Model Providers',
+        name: t('modelPlatform.nav.modelProviders'),
         icon: <LucideBox className="size-[1em]" />,
       },
       {
         path: PrivateRoutes.AdminModelUsageStatistics,
-        name: 'Model Usage',
+        name: t('modelPlatform.nav.modelUsage'),
         icon: <LucideBarChart3 className="size-[1em]" />,
       },
     ],

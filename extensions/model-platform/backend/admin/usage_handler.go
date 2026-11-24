@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,6 +21,18 @@ func resolveDB(customDB ...*gorm.DB) *gorm.DB {
 	return dao.DB
 }
 
+func parseModelTypeQuery(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	mt, err := strconv.Atoi(raw)
+	if err != nil || !entity.IsManagedModelType(mt) {
+		return 0, fmt.Errorf("invalid model_type %q: must be one of %s", raw, entity.ManagedModelTypesDescription())
+	}
+	return mt, nil
+}
+
 // GetDailyUsageHandler retrieves paginated daily model usage records with filtering.
 func GetDailyUsageHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -29,10 +42,11 @@ func GetDailyUsageHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		tenantID := c.Query("tenant_id")
-		modelName := c.Query("model_name")
-		startDate := c.Query("start_date")
-		endDate := c.Query("end_date")
+		modelType, err := parseModelTypeQuery(c.Query("model_type"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": http.StatusBadRequest, "message": err.Error()})
+			return
+		}
 
 		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 		if page < 1 {
@@ -45,32 +59,15 @@ func GetDailyUsageHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 			pageSize = 100
 		}
 
-		query := db.WithContext(c.Request.Context()).Model(&entity.TenantUsageDaily{})
-		if tenantID != "" {
-			query = query.Where("tenant_id = ?", tenantID)
-		}
-		if modelName != "" {
-			query = query.Where("model_name = ?", modelName)
-		}
-		if startDate != "" {
-			query = query.Where("usage_date >= ?", startDate)
-		}
-		if endDate != "" {
-			query = query.Where("usage_date <= ?", endDate)
+		filter := metering.UsageFilter{
+			TenantID:  strings.TrimSpace(c.Query("tenant_id")),
+			ModelName: strings.TrimSpace(c.Query("model_name")),
+			ModelType: modelType,
+			StartDate: strings.TrimSpace(c.Query("start_date")),
+			EndDate:   strings.TrimSpace(c.Query("end_date")),
 		}
 
-		var total int64
-		if err := query.Count(&total).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to count records"})
-			return
-		}
-
-		offset := (page - 1) * pageSize
-		items := make([]entity.TenantUsageDaily, 0)
-		err := query.Order("usage_date DESC, tenant_id ASC, model_name ASC").
-			Limit(pageSize).
-			Offset(offset).
-			Find(&items).Error
+		items, total, err := metering.QueryDailyUsagePage(c.Request.Context(), db, filter, page, pageSize)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to query daily usage"})
 			return
@@ -97,19 +94,21 @@ func GetUsageSummaryHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		tenantID := c.Query("tenant_id")
-		startDate := c.Query("start_date")
-		endDate := c.Query("end_date")
-
-		var summary *metering.UsageSummary
-		var err error
-
-		if strings.TrimSpace(tenantID) != "" {
-			summary, err = metering.QueryUsageSummary(c.Request.Context(), db, tenantID, startDate, endDate)
-		} else {
-			summary, err = metering.QueryGlobalUsageSummary(c.Request.Context(), db, startDate, endDate)
+		modelType, err := parseModelTypeQuery(c.Query("model_type"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": http.StatusBadRequest, "message": err.Error()})
+			return
 		}
 
+		filter := metering.UsageFilter{
+			TenantID:  strings.TrimSpace(c.Query("tenant_id")),
+			ModelName: strings.TrimSpace(c.Query("model_name")),
+			ModelType: modelType,
+			StartDate: strings.TrimSpace(c.Query("start_date")),
+			EndDate:   strings.TrimSpace(c.Query("end_date")),
+		}
+
+		summary, err := metering.QueryUsageSummaryFiltered(c.Request.Context(), db, filter)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 			return

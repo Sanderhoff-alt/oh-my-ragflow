@@ -15,8 +15,12 @@ func TestListCatalog_DerivedTenantStatesAndReferences(t *testing.T) {
 	}
 	embedding := int(rentity.ModelTypeEmbedding)
 	chat := int(rentity.ModelTypeChat)
+	decision := int(rentity.ModelTypeDecision)
+	tts := int(rentity.ModelTypeTTS)
 	db.Create(&entity.PlatformManagedModel{ID: "m-emb", ModelName: "bge-m3", ModelType: embedding, Status: entity.ManagedModelStatusRetired})
 	db.Create(&entity.PlatformManagedModel{ID: "m-chat", ModelName: "deepseek-v3", ModelType: chat, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-dec", ModelName: "qwen-router", ModelType: decision, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-tts", ModelName: "tts-1", ModelType: tts, Status: entity.ManagedModelStatusActive})
 
 	add := func(tenant, name string, modelType int, status, extra string) {
 		db.Create(&rentity.TenantModel{ID: "tm-" + tenant + name, ModelName: name, ProviderID: "prov-" + tenant, InstanceID: "inst-" + tenant, ModelType: modelType, Status: status, Extra: extra})
@@ -25,10 +29,13 @@ func TestListCatalog_DerivedTenantStatesAndReferences(t *testing.T) {
 	add("b", "bge-m3", embedding, "active", `{"deprecated":true,"is_managed":true,"read_only":true}`)
 	add("c", "bge-m3", embedding, "disabled", `{"deprecated":true,"is_managed":true,"tombstoned":true}`)
 	add("a", "deepseek-v3", chat, "active", `{"is_managed":true}`)
+	add("a", "qwen-router", decision, "active", `{"is_managed":true}`)
+	add("a", "tts-1", tts, "active", `{"is_managed":true}`)
 
 	db.Create(&rentity.Knowledgebase{ID: "kb1", TenantID: "b", Name: "kb1", EmbdID: "bge-m3@platform@OpenAI-API-Compatible"})
 	db.Create(&rentity.Knowledgebase{ID: "kb2", TenantID: "a", Name: "kb2", EmbdID: "someone-elses-model"})
-	db.Create(&rentity.Chat{ID: "d1", TenantID: "a", LLMID: "deepseek-v3", LLMSetting: rentity.JSONMap{}, PromptConfig: rentity.JSONMap{}, KBIDs: rentity.JSONSlice{}})
+	decRef := "qwen-router@platform@OpenAI-API-Compatible"
+	db.Create(&rentity.Chat{ID: "d1", TenantID: "a", LLMID: "deepseek-v3", DecisionID: &decRef, LLMSetting: rentity.JSONMap{}, PromptConfig: rentity.JSONMap{}, KBIDs: rentity.JSONSlice{}})
 
 	entries, err := ListCatalog(context.Background(), db)
 	if err != nil {
@@ -50,7 +57,15 @@ func TestListCatalog_DerivedTenantStatesAndReferences(t *testing.T) {
 	if cm.Tenants.Active != 1 || !cm.IsDefault || cm.ActiveDialogCount != 1 || cm.ActiveKBCount != 0 {
 		t.Errorf("unexpected chat model entry: %+v", cm)
 	}
-	if len(entries) != 2 || entries[0].ModelName != "bge-m3" {
+	dm := byName["qwen-router"]
+	if dm.Tenants.Active != 1 || !dm.IsDefault || dm.ActiveDialogCount != 1 || dm.ActiveKBCount != 0 {
+		t.Errorf("unexpected decision model entry: %+v", dm)
+	}
+	tm := byName["tts-1"]
+	if tm.Tenants.Active != 1 || tm.ActiveDialogCount != 0 || tm.ActiveKBCount != 0 {
+		t.Errorf("unexpected tts model entry: %+v", tm)
+	}
+	if len(entries) != 4 || entries[0].ModelName != "bge-m3" {
 		t.Errorf("expected entries sorted by name, got %+v", entries)
 	}
 }

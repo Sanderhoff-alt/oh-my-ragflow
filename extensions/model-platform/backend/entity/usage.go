@@ -15,6 +15,7 @@ type TenantUsageDaily struct {
 	CachedTokens     int64     `gorm:"column:cached_tokens;default:0" json:"cached_tokens"`
 	CacheWriteTokens int64     `gorm:"column:cache_write_tokens;default:0" json:"cache_write_tokens"`
 	ReasoningTokens  int64     `gorm:"column:reasoning_tokens;default:0" json:"reasoning_tokens"`
+	Characters       int64     `gorm:"column:characters;default:0" json:"characters"`
 	TotalSpend       float64   `gorm:"column:total_spend;type:decimal(14,6);default:0.000000" json:"total_spend"`
 	PromptSpend      float64   `gorm:"column:prompt_spend;type:decimal(14,6);default:0.000000" json:"prompt_spend"`
 	CompletionSpend  float64   `gorm:"column:completion_spend;type:decimal(14,6);default:0.000000" json:"completion_spend"`

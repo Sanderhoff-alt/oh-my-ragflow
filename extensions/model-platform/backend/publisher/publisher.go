@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"ragflow/extensions/model-platform/backend/entity"
-	rentity "ragflow/internal/entity"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -67,11 +66,7 @@ func newID() string {
 }
 
 func isPublishableType(modelType int) bool {
-	switch modelType {
-	case int(rentity.ModelTypeChat), int(rentity.ModelTypeEmbedding), int(rentity.ModelTypeRerank):
-		return true
-	}
-	return false
+	return entity.IsManagedModelType(modelType)
 }
 
 // Publish validates the request, checks the gateway route, and in one transaction upserts the catalog
@@ -83,8 +78,7 @@ func (p *Publisher) Publish(ctx context.Context, db *gorm.DB, req Request) (*Res
 		return nil, fmt.Errorf("%w: model_name must match %s", ErrInvalidModel, modelNamePattern)
 	}
 	if !isPublishableType(req.ModelType) {
-		return nil, fmt.Errorf("%w: model_type must be chat (%d), embedding (%d) or rerank (%d)", ErrInvalidModel,
-			int(rentity.ModelTypeChat), int(rentity.ModelTypeEmbedding), int(rentity.ModelTypeRerank))
+		return nil, fmt.Errorf("%w: model_type must be one of %s", ErrInvalidModel, entity.ManagedModelTypesDescription())
 	}
 
 	names, err := p.lister.ListModels(ctx)

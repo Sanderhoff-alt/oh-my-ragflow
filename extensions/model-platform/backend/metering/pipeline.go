@@ -231,6 +231,7 @@ func (p *UsagePipeline) AggregateDailyUsage(ctx context.Context, startTime, endT
 		CachedTokens     int64   `gorm:"column:cached_tokens"`
 		CacheWriteTokens int64   `gorm:"column:cache_write_tokens"`
 		ReasoningTokens  int64   `gorm:"column:reasoning_tokens"`
+		Characters       int64   `gorm:"column:characters"`
 		TotalSpend       float64 `gorm:"column:total_spend"`
 		PromptSpend      float64 `gorm:"column:prompt_spend"`
 		CompletionSpend  float64 `gorm:"column:completion_spend"`
@@ -242,6 +243,7 @@ func (p *UsagePipeline) AggregateDailyUsage(ctx context.Context, startTime, endT
 			"SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, "+
 			"SUM(total_tokens) AS total_tokens, SUM(cached_tokens) AS cached_tokens, "+
 			"SUM(cache_write_tokens) AS cache_write_tokens, SUM(reasoning_tokens) AS reasoning_tokens, "+
+			"SUM(characters) AS characters, "+
 			"SUM(spend) AS total_spend, SUM(prompt_spend) AS prompt_spend, "+
 			"SUM(completion_spend) AS completion_spend, SUM(cache_savings) AS cache_savings",
 		dateExpr,
@@ -285,6 +287,7 @@ func (p *UsagePipeline) AggregateDailyUsage(ctx context.Context, startTime, endT
 			CachedTokens:     item.CachedTokens,
 			CacheWriteTokens: item.CacheWriteTokens,
 			ReasoningTokens:  item.ReasoningTokens,
+			Characters:       item.Characters,
 			TotalSpend:       item.TotalSpend,
 			PromptSpend:      item.PromptSpend,
 			CompletionSpend:  item.CompletionSpend,
@@ -324,6 +327,7 @@ func (p *UsagePipeline) AggregateDailyUsage(ctx context.Context, startTime, endT
 					"cached_tokens",
 					"cache_write_tokens",
 					"reasoning_tokens",
+					"characters",
 					"total_spend",
 					"prompt_spend",
 					"completion_spend",
@@ -392,25 +396,107 @@ func resolveDateExpression(db *gorm.DB, loc *time.Location) string {
 	}
 }
 
+// UsageFilter restricts usage queries by tenant, model name, model type, and date range.
+type UsageFilter struct {
+	TenantID  string
+	ModelName string
+	ModelType int
+	StartDate string
+	EndDate   string
+}
+
+// DailyUsageEntry enriches TenantUsageDaily with the model's catalog model_type when known.
+type DailyUsageEntry struct {
+	entity.TenantUsageDaily
+	ModelType int `json:"model_type"`
+}
+
+// ModelTypeUsageBreakdown aggregates consumption metrics for one model type.
+type ModelTypeUsageBreakdown struct {
+	ModelType        int     `json:"model_type"`
+	CallCount        int64   `json:"call_count"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Characters       int64   `json:"characters"`
+	TotalSpend       float64 `json:"total_spend"`
+}
+
 // QueryDailyUsage retrieves daily usage breakdown for a tenant within [startDate, endDate].
 func QueryDailyUsage(ctx context.Context, db *gorm.DB, tenantID string, startDate, endDate string) ([]entity.TenantUsageDaily, error) {
+	return queryDailyUsageRows(ctx, db, UsageFilter{
+		TenantID:  tenantID,
+		StartDate: startDate,
+		EndDate:   endDate,
+	})
+}
+
+// LoadCatalogModelTypes returns model_name -> model_type from platform_managed_model when the table exists.
+func LoadCatalogModelTypes(ctx context.Context, db *gorm.DB) (map[string]int, error) {
+	result := make(map[string]int)
+	if db == nil || !db.WithContext(ctx).Migrator().HasTable(&entity.PlatformManagedModel{}) {
+		return result, nil
+	}
+	var rows []struct {
+		ModelName string
+		ModelType int
+	}
+	if err := db.WithContext(ctx).Model(&entity.PlatformManagedModel{}).
+		Select("model_name, model_type").Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("failed to load catalog model types: %w", err)
+	}
+	for _, r := range rows {
+		result[r.ModelName] = r.ModelType
+	}
+	return result, nil
+}
+
+func applyUsageFilter(ctx context.Context, db *gorm.DB, filter UsageFilter) (*gorm.DB, bool, error) {
+	query := db.WithContext(ctx).Model(&entity.TenantUsageDaily{})
+	if filter.TenantID != "" {
+		query = query.Where("tenant_id = ?", filter.TenantID)
+	}
+	if filter.ModelName != "" {
+		query = query.Where("model_name = ?", filter.ModelName)
+	}
+	if filter.StartDate != "" {
+		query = query.Where("usage_date >= ?", filter.StartDate)
+	}
+	if filter.EndDate != "" {
+		query = query.Where("usage_date <= ?", filter.EndDate)
+	}
+	if filter.ModelType > 0 {
+		if !db.WithContext(ctx).Migrator().HasTable(&entity.PlatformManagedModel{}) {
+			return query, true, nil
+		}
+		var names []string
+		if err := db.WithContext(ctx).Model(&entity.PlatformManagedModel{}).
+			Where("model_type = ?", filter.ModelType).
+			Pluck("model_name", &names).Error; err != nil {
+			return nil, false, fmt.Errorf("failed to resolve models for model_type %d: %w", filter.ModelType, err)
+		}
+		if len(names) == 0 {
+			return query, true, nil
+		}
+		query = query.Where("model_name IN ?", names)
+	}
+	return query, false, nil
+}
+
+func queryDailyUsageRows(ctx context.Context, db *gorm.DB, filter UsageFilter) ([]entity.TenantUsageDaily, error) {
 	if db == nil {
 		return nil, errors.New("database handle cannot be nil")
 	}
-
-	query := db.WithContext(ctx).Model(&entity.TenantUsageDaily{})
-	if tenantID != "" {
-		query = query.Where("tenant_id = ?", tenantID)
+	query, empty, err := applyUsageFilter(ctx, db, filter)
+	if err != nil {
+		return nil, err
 	}
-	if startDate != "" {
-		query = query.Where("usage_date >= ?", startDate)
-	}
-	if endDate != "" {
-		query = query.Where("usage_date <= ?", endDate)
+	if empty {
+		return []entity.TenantUsageDaily{}, nil
 	}
 
 	var results []entity.TenantUsageDaily
-	err := query.Order("usage_date ASC, model_name ASC").Find(&results).Error
+	err = query.Order("usage_date ASC, model_name ASC").Find(&results).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query daily usage: %w", err)
 	}
@@ -418,23 +504,67 @@ func QueryDailyUsage(ctx context.Context, db *gorm.DB, tenantID string, startDat
 	return results, nil
 }
 
+// QueryDailyUsagePage retrieves a paginated list of daily usage records enriched with catalog model_type.
+func QueryDailyUsagePage(ctx context.Context, db *gorm.DB, filter UsageFilter, page, pageSize int) ([]DailyUsageEntry, int64, error) {
+	if db == nil {
+		return nil, 0, errors.New("database handle cannot be nil")
+	}
+	query, empty, err := applyUsageFilter(ctx, db, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	if empty {
+		return []DailyUsageEntry{}, 0, nil
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("failed to count daily usage records: %w", err)
+	}
+
+	offset := (page - 1) * pageSize
+	raw := make([]entity.TenantUsageDaily, 0)
+	if err := query.Order("usage_date DESC, tenant_id ASC, model_name ASC").
+		Limit(pageSize).
+		Offset(offset).
+		Find(&raw).Error; err != nil {
+		return nil, 0, fmt.Errorf("failed to query daily usage: %w", err)
+	}
+
+	typeByModel, err := LoadCatalogModelTypes(ctx, db)
+	if err != nil {
+		return nil, 0, err
+	}
+	items := make([]DailyUsageEntry, 0, len(raw))
+	for _, r := range raw {
+		items = append(items, DailyUsageEntry{
+			TenantUsageDaily: r,
+			ModelType:        typeByModel[r.ModelName],
+		})
+	}
+	return items, total, nil
+}
+
 // UsageSummary aggregates total consumption metrics over an arbitrary period.
 type UsageSummary struct {
-	TenantID              string           `json:"tenant_id"`
-	TotalCalls            int64            `json:"total_calls"`
-	TotalPromptTokens     int64            `json:"total_prompt_tokens"`
-	TotalCompletionTokens int64            `json:"total_completion_tokens"`
-	TotalTokens           int64            `json:"total_tokens"`
-	TotalCachedTokens     int64            `json:"total_cached_tokens"`
-	TotalCacheWriteTokens int64            `json:"total_cache_write_tokens"`
-	TotalReasoningTokens  int64            `json:"total_reasoning_tokens"`
-	TotalSpend            float64          `json:"total_spend"`
-	TotalPromptSpend      float64          `json:"total_prompt_spend"`
-	TotalCompletionSpend  float64          `json:"total_completion_spend"`
-	TotalCacheSavings     float64          `json:"total_cache_savings"`
-	ModelTokens           map[string]int64 `json:"model_tokens"`
-	StartDate             string           `json:"start_date,omitempty"`
-	EndDate               string           `json:"end_date,omitempty"`
+	TenantID              string                           `json:"tenant_id"`
+	TotalCalls            int64                            `json:"total_calls"`
+	TotalPromptTokens     int64                            `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64                            `json:"total_completion_tokens"`
+	TotalTokens           int64                            `json:"total_tokens"`
+	TotalCachedTokens     int64                            `json:"total_cached_tokens"`
+	TotalCacheWriteTokens int64                            `json:"total_cache_write_tokens"`
+	TotalReasoningTokens  int64                            `json:"total_reasoning_tokens"`
+	TotalCharacters       int64                            `json:"total_characters"`
+	TotalSpend            float64                          `json:"total_spend"`
+	TotalPromptSpend      float64                          `json:"total_prompt_spend"`
+	TotalCompletionSpend  float64                          `json:"total_completion_spend"`
+	TotalCacheSavings     float64                          `json:"total_cache_savings"`
+	ModelTokens           map[string]int64                 `json:"model_tokens"`
+	ModelCharacters       map[string]int64                 `json:"model_characters,omitempty"`
+	ByModelType           map[int]*ModelTypeUsageBreakdown `json:"by_model_type,omitempty"`
+	StartDate             string                           `json:"start_date,omitempty"`
+	EndDate               string                           `json:"end_date,omitempty"`
 }
 
 // QueryUsageSummary calculates total usage and per-model token breakdown for a specific tenant.
@@ -444,25 +574,39 @@ func QueryUsageSummary(ctx context.Context, db *gorm.DB, tenantID string, startD
 		return nil, errors.New("tenantID cannot be empty for tenant usage summary")
 	}
 
-	return calculateUsageSummary(ctx, db, tenantID, startDate, endDate)
+	return QueryUsageSummaryFiltered(ctx, db, UsageFilter{
+		TenantID:  tenantID,
+		StartDate: startDate,
+		EndDate:   endDate,
+	})
 }
 
 // QueryGlobalUsageSummary calculates total platform-wide usage across all tenants (for admin metrics).
 func QueryGlobalUsageSummary(ctx context.Context, db *gorm.DB, startDate, endDate string) (*UsageSummary, error) {
-	return calculateUsageSummary(ctx, db, "", startDate, endDate)
+	return QueryUsageSummaryFiltered(ctx, db, UsageFilter{
+		StartDate: startDate,
+		EndDate:   endDate,
+	})
 }
 
-func calculateUsageSummary(ctx context.Context, db *gorm.DB, tenantID string, startDate, endDate string) (*UsageSummary, error) {
-	dailyList, err := QueryDailyUsage(ctx, db, tenantID, startDate, endDate)
+// QueryUsageSummaryFiltered calculates total usage and breakdowns matching filter.
+func QueryUsageSummaryFiltered(ctx context.Context, db *gorm.DB, filter UsageFilter) (*UsageSummary, error) {
+	dailyList, err := queryDailyUsageRows(ctx, db, filter)
+	if err != nil {
+		return nil, err
+	}
+	typeByModel, err := LoadCatalogModelTypes(ctx, db)
 	if err != nil {
 		return nil, err
 	}
 
 	summary := &UsageSummary{
-		TenantID:    tenantID,
-		ModelTokens: make(map[string]int64),
-		StartDate:   startDate,
-		EndDate:     endDate,
+		TenantID:        filter.TenantID,
+		ModelTokens:     make(map[string]int64),
+		ModelCharacters: make(map[string]int64),
+		ByModelType:     make(map[int]*ModelTypeUsageBreakdown),
+		StartDate:       filter.StartDate,
+		EndDate:         filter.EndDate,
 	}
 
 	for _, d := range dailyList {
@@ -473,11 +617,29 @@ func calculateUsageSummary(ctx context.Context, db *gorm.DB, tenantID string, st
 		summary.TotalCachedTokens += d.CachedTokens
 		summary.TotalCacheWriteTokens += d.CacheWriteTokens
 		summary.TotalReasoningTokens += d.ReasoningTokens
+		summary.TotalCharacters += d.Characters
 		summary.TotalSpend += d.TotalSpend
 		summary.TotalPromptSpend += d.PromptSpend
 		summary.TotalCompletionSpend += d.CompletionSpend
 		summary.TotalCacheSavings += d.CacheSavings
 		summary.ModelTokens[d.ModelName] += d.TotalTokens
+		if d.Characters > 0 {
+			summary.ModelCharacters[d.ModelName] += d.Characters
+		}
+
+		if mt := typeByModel[d.ModelName]; mt > 0 {
+			b, ok := summary.ByModelType[mt]
+			if !ok {
+				b = &ModelTypeUsageBreakdown{ModelType: mt}
+				summary.ByModelType[mt] = b
+			}
+			b.CallCount += d.CallCount
+			b.PromptTokens += d.PromptTokens
+			b.CompletionTokens += d.CompletionTokens
+			b.TotalTokens += d.TotalTokens
+			b.Characters += d.Characters
+			b.TotalSpend += d.TotalSpend
+		}
 	}
 
 	return summary, nil

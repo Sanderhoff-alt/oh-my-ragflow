@@ -195,6 +195,7 @@ func ConvertEntryToSpendLog(entry gateway.SpendLogEntry) entity.GatewaySpendLog 
 	}
 
 	cachedTokens, cacheWriteTokens, reasoningTokens, promptSpend, completionSpend, cacheSavings := ExtractTokenDetails(entry)
+	characters := ExtractCharacters(entry)
 
 	return entity.GatewaySpendLog{
 		SpendID:          spendID,
@@ -209,6 +210,7 @@ func ConvertEntryToSpendLog(entry gateway.SpendLogEntry) entity.GatewaySpendLog 
 		CachedTokens:     cachedTokens,
 		CacheWriteTokens: cacheWriteTokens,
 		ReasoningTokens:  reasoningTokens,
+		Characters:       characters,
 		Spend:            entry.Spend,
 		PromptSpend:      promptSpend,
 		CompletionSpend:  completionSpend,
@@ -216,6 +218,36 @@ func ConvertEntryToSpendLog(entry gateway.SpendLogEntry) entity.GatewaySpendLog 
 		RequestTime:      reqTime,
 		RawPayload:       rawPayload,
 	}
+}
+
+// ExtractCharacters extracts character-based usage metrics for TTS speech synthesis calls.
+// It inspects known LiteLLM metadata fields first and falls back to prompt/total tokens when
+// call_type identifies a speech synthesis call (e.g. speech, aspeech, audio_speech).
+func ExtractCharacters(entry gateway.SpendLogEntry) int64 {
+	if entry.Metadata != nil {
+		for _, path := range [][]string{
+			{"characters"},
+			{"input_characters"},
+			{"additional_usage_values", "characters"},
+			{"usage_object", "characters"},
+			{"usage_object", "input_characters"},
+		} {
+			if n := extractNestedInt(entry.Metadata, path...); n > 0 {
+				return int64(n)
+			}
+		}
+	}
+
+	callType := strings.ToLower(strings.TrimSpace(entry.CallType))
+	if callType == "speech" || callType == "aspeech" || strings.Contains(callType, "speech") || callType == "tts" {
+		if entry.PromptTokens > 0 {
+			return int64(entry.PromptTokens)
+		}
+		if entry.TotalTokens > 0 {
+			return int64(entry.TotalTokens)
+		}
+	}
+	return 0
 }
 
 // ExtractTokenDetails normalizes cache and reasoning token metrics and pricing from LiteLLM.

@@ -119,16 +119,27 @@ var deepseek = Request{ModelName: "deepseek-v3", ModelType: int(rentity.ModelTyp
 
 func TestPublish_ValidatesRequest(t *testing.T) {
 	db := setupPublishDB(t)
-	pub := New(newFakeGateway("deepseek-v3"))
+	pub := New(newFakeGateway("deepseek-v3", "tts-1", "qwen-router", "deepdoc-ocr"))
 
 	for _, req := range []Request{
 		{ModelName: "", ModelType: int(rentity.ModelTypeChat)},
 		{ModelName: "bad name!", ModelType: int(rentity.ModelTypeChat)},
 		{ModelName: "deepseek-v3", ModelType: 0},
-		{ModelName: "deepseek-v3", ModelType: int(rentity.ModelTypeImage2Text)},
+		{ModelName: "deepdoc-ocr", ModelType: int(rentity.ModelTypeOCR)},
+		{ModelName: "deepseek-v3", ModelType: int(rentity.ModelTypeChat | rentity.ModelTypeTTS)},
 	} {
 		if _, err := pub.Publish(context.Background(), db, req); !errors.Is(err, ErrInvalidModel) {
 			t.Errorf("expected ErrInvalidModel for %+v, got %v", req, err)
+		}
+	}
+
+	// TTS (32) and Decision (128) are accepted and onboarded into the catalog
+	for _, req := range []Request{
+		{ModelName: "tts-1", ModelType: int(rentity.ModelTypeTTS)},
+		{ModelName: "qwen-router", ModelType: int(rentity.ModelTypeDecision)},
+	} {
+		if _, err := pub.Publish(context.Background(), db, req); err != nil {
+			t.Errorf("expected Publish to accept %+v, got %v", req, err)
 		}
 	}
 }
