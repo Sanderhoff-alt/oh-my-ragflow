@@ -62,7 +62,7 @@ func ManagedProviderGuardMiddleware() gin.HandlerFunc {
 		}
 
 		if prov := extractProviderTarget(c); prov != "" {
-			if isManagedProviderTarget(prov, c.GetString("tenant_id")) {
+			if isManagedProviderTarget(prov, resolveRequestTenantID(c)) {
 				blockManagedMutation(c)
 				return
 			}
@@ -286,7 +286,7 @@ func hasManagedSingleBodyTarget(c *gin.Context, rawMap map[string]interface{}) b
 	if target == "" {
 		return false
 	}
-	tenantID := c.GetString("tenant_id")
+	tenantID := resolveRequestTenantID(c)
 	return isManagedProviderTarget(target, tenantID) || isManagedInstanceTarget(target, tenantID, "")
 }
 
@@ -309,7 +309,7 @@ func evalInstanceRoute(c *gin.Context) {
 		c.Next()
 		return
 	}
-	tenantID := c.GetString("tenant_id")
+	tenantID := resolveRequestTenantID(c)
 	providerParam := extractProviderTarget(c)
 	if isManagedInstanceTarget(inst, tenantID, providerParam) {
 		blockManagedMutation(c)
@@ -357,7 +357,7 @@ func handleBatchDropBody(c *gin.Context, body []byte, rawMap map[string]interfac
 		return
 	}
 
-	tenantID := c.GetString("tenant_id")
+	tenantID := resolveRequestTenantID(c)
 	providerParam := extractProviderTarget(c)
 	if hasAnyManagedInstance(targets, tenantID, providerParam) {
 		blockManagedMutation(c)

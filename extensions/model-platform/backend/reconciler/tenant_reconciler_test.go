@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,6 +18,7 @@ import (
 	"ragflow/extensions/model-platform/backend/migration"
 	"ragflow/extensions/model-platform/backend/testenv"
 	rentity "ragflow/internal/entity"
+	"ragflow/internal/permission"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -187,11 +189,14 @@ func TestTenantReconciler_SuccessfulProvisioning(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	// 1. Verify TenantModelProvider
+	// 1. Verify TenantModelProvider (must populate UserID for upstream permission checks)
 	var provider rentity.TenantModelProvider
 	err = db.Where("tenant_id = ? AND provider_name = ?", tenantID, ProviderOpenAIAPICompatible).First(&provider).Error
 	if err != nil {
 		t.Fatalf("expected TenantModelProvider to exist: %v", err)
+	}
+	if provider.UserID != tenantID {
+		t.Errorf("expected provider.UserID to fall back to tenantID %q, got %q", tenantID, provider.UserID)
 	}
 
 	// 2. Verify TenantModelInstance
@@ -203,8 +208,15 @@ func TestTenantReconciler_SuccessfulProvisioning(t *testing.T) {
 	if !strings.HasPrefix(instance.APIKey, "sk-litellm-vk-") {
 		t.Errorf("expected virtual key, got %q", instance.APIKey)
 	}
-	if !strings.Contains(instance.Extra, "is_managed") || !strings.Contains(instance.Extra, "http://127.0.0.1:4000") {
-		t.Errorf("expected instance extra to contain managed flags and baseURL, got %s", instance.Extra)
+	var extraStrings map[string]string
+	if err := json.Unmarshal([]byte(instance.Extra), &extraStrings); err != nil {
+		t.Fatalf("instance.Extra must unmarshal as map[string]string for upstream compatibility: %v (raw=%s)", err, instance.Extra)
+	}
+	if extraStrings["is_managed"] != "true" {
+		t.Errorf("expected extra is_managed=\"true\", got %q", extraStrings["is_managed"])
+	}
+	if extraStrings["base_url"] != "http://127.0.0.1:4000/v1" {
+		t.Errorf("expected normalized base_url \"http://127.0.0.1:4000/v1\", got %q", extraStrings["base_url"])
 	}
 
 	// 3. Verify TenantModel records
@@ -512,5 +524,71 @@ func TestTenantReconciler_OptimisticLockConflict_DeleteKeySuccessReturnsNil(t *t
 	err := rec.Reconcile(ctx, db, tenantID)
 	if err != nil {
 		t.Fatalf("expected nil on successful compensation during conflict, got: %v", err)
+	}
+}
+
+func TestTenantReconciler_UpstreamPermissionAndOwnerWiring(t *testing.T) {
+	db := setupTestDB(t)
+	mockClient := newMockGatewayClient()
+	// Verify already-versioned base_url is not double-suffixed with /v1/v1.
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000/v1/", nil)
+
+	ctx := context.Background()
+	tenantID := "tenant-perm-1"
+	ownerID := "owner-user-1"
+	statusValid := "1"
+	if err := db.Create(&rentity.Tenant{ID: tenantID, Status: &statusValid}).Error; err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if err := db.Create(&rentity.UserTenant{
+		ID:       "ut-owner-1",
+		UserID:   ownerID,
+		TenantID: tenantID,
+		Role:     "owner",
+		Status:   &statusValid,
+	}).Error; err != nil {
+		t.Fatalf("seed owner membership: %v", err)
+	}
+
+	if err := rec.Reconcile(ctx, db, tenantID); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	var provider rentity.TenantModelProvider
+	if err := db.Where("tenant_id = ? AND provider_name = ?", tenantID, ProviderOpenAIAPICompatible).First(&provider).Error; err != nil {
+		t.Fatalf("load provider: %v", err)
+	}
+	if provider.UserID != ownerID {
+		t.Fatalf("provider.UserID = %q, want owner %q", provider.UserID, ownerID)
+	}
+
+	var instance rentity.TenantModelInstance
+	if err := db.Where("provider_id = ? AND instance_name = ?", provider.ID, PlatformInstanceName).First(&instance).Error; err != nil {
+		t.Fatalf("load instance: %v", err)
+	}
+	var extra map[string]string
+	if err := json.Unmarshal([]byte(instance.Extra), &extra); err != nil {
+		t.Fatalf("instance.Extra failed map[string]string unmarshal: %v", err)
+	}
+	if extra["base_url"] != "http://127.0.0.1:4000/v1" {
+		t.Fatalf("base_url = %q, want http://127.0.0.1:4000/v1", extra["base_url"])
+	}
+
+	var model rentity.TenantModel
+	if err := db.Where("instance_id = ? AND model_name = ?", instance.ID, DefaultChatModelName).First(&model).Error; err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+
+	// Verify real upstream permission.NewDatabaseChecker authorizes the owner on provider, instance, and model.
+	permCtx := permission.WithIdentity(ctx, ownerID, tenantID)
+	checker := permission.NewDatabaseChecker(db)
+	if err := checker.CheckResource(permCtx, permission.ResourceRef{Kind: permission.ResourceKindModelProvider, ID: provider.ID}, permission.OperationRead); err != nil {
+		t.Fatalf("upstream permission check for provider failed: %v", err)
+	}
+	if err := checker.CheckResource(permCtx, permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID}, permission.OperationUse); err != nil {
+		t.Fatalf("upstream permission check for instance failed: %v", err)
+	}
+	if err := checker.CheckResource(permCtx, permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID}, permission.OperationUse); err != nil {
+		t.Fatalf("upstream permission check for model failed: %v", err)
 	}
 }

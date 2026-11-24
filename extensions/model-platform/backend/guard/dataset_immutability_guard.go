@@ -77,10 +77,7 @@ func DatasetEmbeddingGuardMiddleware(customDB ...*gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		tenantID := strings.TrimSpace(c.GetString("tenant_id"))
-		if tenantID == "" {
-			tenantID = strings.TrimSpace(c.GetString("user_id"))
-		}
+		tenantID := resolveRequestTenantID(c)
 
 		var payload map[string]interface{}
 		if len(bodyBytes) > 0 {

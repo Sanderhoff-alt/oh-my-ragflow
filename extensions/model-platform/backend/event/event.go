@@ -11,8 +11,6 @@ type EventType string
 const (
 	// TenantCreated indicates a new tenant has been committed and needs model platform provisioning.
 	TenantCreated EventType = "tenant.created"
-	// TenantDeleted indicates a tenant was removed and its virtual key should be revoked.
-	TenantDeleted EventType = "tenant.deleted"
 	// TenantReconcileRequest indicates an explicit reconcile request (e.g. from background poller).
 	TenantReconcileRequest EventType = "tenant.reconcile"
 )
@@ -30,16 +28,6 @@ func NewTenantCreatedEvent(tenantID string) TenantLifecycleEvent {
 	return TenantLifecycleEvent{
 		ID:        fmt.Sprintf("evt-created-%s-%d", tenantID, time.Now().UnixNano()),
 		Type:      TenantCreated,
-		TenantID:  tenantID,
-		Timestamp: time.Now(),
-	}
-}
-
-// NewTenantDeletedEvent constructs a new TenantDeleted event.
-func NewTenantDeletedEvent(tenantID string) TenantLifecycleEvent {
-	return TenantLifecycleEvent{
-		ID:        fmt.Sprintf("evt-deleted-%s-%d", tenantID, time.Now().UnixNano()),
-		Type:      TenantDeleted,
 		TenantID:  tenantID,
 		Timestamp: time.Now(),
 	}
