@@ -90,9 +90,15 @@ type TenantReconcileRecord struct {
 	LastError       string          `gorm:"column:last_error;type:text" json:"last_error,omitempty"`
 	GatewayKeyAlias string          `gorm:"column:gateway_key_alias;size:128" json:"gateway_key_alias"`
 	KeyHash         string          `gorm:"column:key_hash;size:128" json:"key_hash"`
-	Version         int64           `gorm:"column:version;not null;default:1" json:"version"`
-	CreatedAt       time.Time       `gorm:"column:created_at;autoCreateTime" json:"created_at"`
-	UpdatedAt       time.Time       `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
+	// KeyDirtySince marks that the gateway may hold keys of the tenant other than the one named by KeyHash,
+	// because a rotation started and has not converged yet. It is set before a new key is issued and only
+	// cleared once every other key of the tenant's gateway team is revoked.
+	KeyDirtySince *time.Time `gorm:"column:key_dirty_since;index:idx_key_dirty" json:"key_dirty_since,omitempty"`
+	KeyRotatedAt  *time.Time `gorm:"column:key_rotated_at" json:"key_rotated_at,omitempty"`
+	KeyRotatedBy  string     `gorm:"column:key_rotated_by;size:128" json:"key_rotated_by,omitempty"`
+	Version       int64      `gorm:"column:version;not null;default:1" json:"version"`
+	CreatedAt     time.Time  `gorm:"column:created_at;autoCreateTime" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 }
 
 // TableName returns the physical table name for TenantReconcileRecord.

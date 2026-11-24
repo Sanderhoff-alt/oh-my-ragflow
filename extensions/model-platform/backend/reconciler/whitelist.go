@@ -75,20 +75,19 @@ const (
 	gatewayOverrideExclude
 )
 
-// rebuildGatewayWhitelist rewrites the tenant virtual key whitelist from the active tenant_model rows
-// of the instance. LiteLLM /key/update replaces the whole models list, so the full set is always sent.
-// overrideType is the model type of overrideModel and decides whether the embedding alias is required.
-// An empty allowedModels permits every model. The caller must hold the instance whitelist lock.
-func rebuildGatewayWhitelist(
+// gatewayWhitelist computes the tenant virtual key whitelist from the active tenant_model rows of the
+// instance. overrideType is the model type of overrideModel and decides whether the embedding alias is
+// required. An empty allowedModels permits every model. An empty result becomes the deny-all placeholder,
+// because LiteLLM treats an empty models list as unrestricted.
+func gatewayWhitelist(
 	ctx context.Context,
 	db *gorm.DB,
-	client GatewayKeyClient,
 	allowedModels []string,
 	instance *rentity.TenantModelInstance,
 	overrideModel string,
 	overrideType int,
 	overrideMode gatewayOverride,
-) error {
+) ([]string, error) {
 	isPermitted := func(model string) bool {
 		return len(allowedModels) == 0 || isModelPermitted(model, allowedModels)
 	}
@@ -96,7 +95,7 @@ func rebuildGatewayWhitelist(
 	var activeModels []rentity.TenantModel
 	if err := db.WithContext(ctx).Where("instance_id = ? AND status = ?", instance.ID, "active").
 		Find(&activeModels).Error; err != nil {
-		return fmt.Errorf("failed to query active models for gateway key update: %w", err)
+		return nil, fmt.Errorf("failed to query active models for gateway key update: %w", err)
 	}
 
 	modelSet := make(map[string]struct{})
@@ -132,6 +131,26 @@ func rebuildGatewayWhitelist(
 
 	if len(whitelist) == 0 {
 		whitelist = []string{RevokedModelPlaceholder}
+	}
+	return whitelist, nil
+}
+
+// rebuildGatewayWhitelist rewrites the tenant virtual key whitelist from the active tenant_model rows
+// of the instance. LiteLLM /key/update replaces the whole models list, so the full set is always sent.
+// The caller must hold the instance whitelist lock.
+func rebuildGatewayWhitelist(
+	ctx context.Context,
+	db *gorm.DB,
+	client GatewayKeyClient,
+	allowedModels []string,
+	instance *rentity.TenantModelInstance,
+	overrideModel string,
+	overrideType int,
+	overrideMode gatewayOverride,
+) error {
+	whitelist, err := gatewayWhitelist(ctx, db, allowedModels, instance, overrideModel, overrideType, overrideMode)
+	if err != nil {
+		return err
 	}
 
 	updateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
