@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
+	"time"
 
 	"ragflow/extensions/model-platform/backend/event"
 	"ragflow/extensions/model-platform/backend/gateway"
@@ -22,6 +24,8 @@ var (
 
 var dbProvider func() *gorm.DB
 
+const orphanScanInterval = time.Hour
+
 // SetDBProvider registers how the workers obtain the process database handle.
 // The upstream server package cannot import its dao package, so the dao seam registers it.
 func SetDBProvider(provider func() *gorm.DB) {
@@ -32,6 +36,8 @@ func SetDBProvider(provider func() *gorm.DB) {
 type Workers struct {
 	controller *reconciler.SelfHealingController
 	daemon     *metering.MeteringDaemon
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // Start launches the background workers. Without a configured gateway nothing is started,
@@ -58,11 +64,34 @@ func Start(ctx context.Context) (*Workers, error) {
 	daemon := metering.NewMeteringDaemon(db, metering.NewSpendLogCollector(db, client), metering.NewUsagePipeline(db))
 	daemon.Start(ctx)
 
-	return &Workers{controller: controller, daemon: daemon}, nil
+	scanCtx, cancel := context.WithCancel(ctx)
+	w := &Workers{controller: controller, daemon: daemon, cancel: cancel}
+	w.wg.Add(1)
+	go w.scanOrphanedTenants(scanCtx, db, reconciler.NewTenantDecommissioner(client))
+
+	return w, nil
+}
+
+// scanOrphanedTenants revokes the gateway keys of tenants removed from the upstream tenant table.
+// The scan is idempotent, and failures are retried on the next tick.
+func (w *Workers) scanOrphanedTenants(ctx context.Context, db *gorm.DB, decommissioner *reconciler.TenantDecommissioner) {
+	defer w.wg.Done()
+	ticker := time.NewTicker(orphanScanInterval)
+	defer ticker.Stop()
+	for {
+		_, _ = decommissioner.ScanAndDecommissionOrphanedTenants(ctx, db)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // Stop terminates the background workers and waits for in-flight work to finish.
 func (w *Workers) Stop() {
+	w.cancel()
+	w.wg.Wait()
 	w.daemon.Stop()
 	w.controller.Stop()
 }
