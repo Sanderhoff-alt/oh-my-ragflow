@@ -1,28 +1,15 @@
 package admin
 
 import (
-	"context"
 	"net/http"
 	"os"
-	"sync"
 
 	"ragflow/extensions/model-platform/backend/gateway"
 	"ragflow/extensions/model-platform/backend/publisher"
-	"ragflow/internal/dao"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
-
-var publishWorkerOnce sync.Once
-
-// startPublishWorker runs the tenant fan-out worker for the lifetime of the process, against the
-// shared RAGFlow database. Replicas are safe because items are claimed with an optimistic lock.
-func startPublishWorker(client gateway.Client) {
-	publishWorkerOnce.Do(func() {
-		publisher.NewWorker(func() *gorm.DB { return dao.DB }, client).Start(context.Background())
-	})
-}
 
 // SetupModelPlatformAdminMiddleware configures model-platform specific middleware for the admin engine.
 func SetupModelPlatformAdminMiddleware(engine *gin.Engine) {
@@ -86,9 +73,6 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 	var pub *publisher.Publisher
 	if client != nil {
 		pub = publisher.New(client)
-		if len(customDB) == 0 {
-			startPublishWorker(client)
-		}
 	}
 
 	modelPlatform := protected.Group("/model-platform")

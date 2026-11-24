@@ -10,6 +10,7 @@ import (
 	"ragflow/extensions/model-platform/backend/event"
 	"ragflow/extensions/model-platform/backend/gateway"
 	"ragflow/extensions/model-platform/backend/metering"
+	"ragflow/extensions/model-platform/backend/publisher"
 	"ragflow/extensions/model-platform/backend/reconciler"
 
 	"gorm.io/gorm"
@@ -36,6 +37,7 @@ func SetDBProvider(provider func() *gorm.DB) {
 type Workers struct {
 	controller *reconciler.SelfHealingController
 	daemon     *metering.MeteringDaemon
+	publisher  *publisher.Worker
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 }
@@ -64,8 +66,13 @@ func Start(ctx context.Context) (*Workers, error) {
 	daemon := metering.NewMeteringDaemon(db, metering.NewSpendLogCollector(db, client), metering.NewUsagePipeline(db))
 	daemon.Start(ctx)
 
+	// The publish worker converges tenants toward the managed model catalog. Several replicas can run it
+	// because every item is claimed with an optimistic lock.
+	publishWorker := publisher.NewWorker(func() *gorm.DB { return db }, client)
+	publishWorker.Start(ctx)
+
 	scanCtx, cancel := context.WithCancel(ctx)
-	w := &Workers{controller: controller, daemon: daemon, cancel: cancel}
+	w := &Workers{controller: controller, daemon: daemon, publisher: publishWorker, cancel: cancel}
 	w.wg.Add(1)
 	go w.scanOrphanedTenants(scanCtx, db, reconciler.NewTenantDecommissioner(client))
 
@@ -92,6 +99,7 @@ func (w *Workers) scanOrphanedTenants(ctx context.Context, db *gorm.DB, decommis
 func (w *Workers) Stop() {
 	w.cancel()
 	w.wg.Wait()
+	w.publisher.Stop()
 	w.daemon.Stop()
 	w.controller.Stop()
 }
