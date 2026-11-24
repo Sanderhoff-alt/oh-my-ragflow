@@ -8,10 +8,15 @@ import (
 	mpdao "ragflow/extensions/model-platform/backend/dao"
 	mpentity "ragflow/extensions/model-platform/backend/entity"
 	mpmigration "ragflow/extensions/model-platform/backend/migration"
+	mpworker "ragflow/extensions/model-platform/backend/worker"
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
 )
+
+func init() {
+	mpworker.SetDBProvider(GetDB)
+}
 
 // tenantDAOTestExtraModels registers platform_tenant_reconcile in test migrations.
 func tenantDAOTestExtraModels() []interface{} {

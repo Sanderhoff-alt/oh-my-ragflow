@@ -36,7 +36,7 @@ const (
 type GatewayKeyClient interface {
 	GenerateKey(ctx context.Context, req *gateway.GenerateKeyRequest) (*gateway.GenerateKeyResponse, error)
 	UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error)
-	DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error)
+	DeleteKeyByAlias(ctx context.Context, alias string) error
 }
 
 // TenantReconciler handles idempotent provisioning of tenant models and virtual keys.
@@ -161,7 +161,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 	rec = claimedRec
 
 	// 4. Request virtual key from LiteLLM Gateway
-	keyAlias := fmt.Sprintf("tenant_%s", tenantID)
+	keyAlias := tenantKeyAlias(tenantID)
 	genReq := &gateway.GenerateKeyRequest{
 		KeyName: keyAlias,
 		TeamID:  tenantID,
@@ -339,7 +339,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		}
 
 		// Immediately revoke the issued virtual key to prevent orphaned credentials
-		_, delErr := r.gatewayClient.DeleteKey(rollbackCtx, []string{virtualKey})
+		delErr := r.gatewayClient.DeleteKeyByAlias(rollbackCtx, keyAlias)
 
 		if errors.Is(persistErr, entity.ErrOptimisticLockConflict) {
 			if delErr != nil {
@@ -387,6 +387,12 @@ func (r *TenantReconciler) calculateBackoff(retries int) time.Duration {
 		return intervals[retries]
 	}
 	return 30 * time.Second
+}
+
+// tenantKeyAlias is the canonical gateway key_alias of a tenant and the single
+// identity used to issue and revoke its virtual key.
+func tenantKeyAlias(tenantID string) string {
+	return fmt.Sprintf("tenant_%s", tenantID)
 }
 
 func hashKey(key string) string {

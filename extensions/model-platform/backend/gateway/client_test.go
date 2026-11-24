@@ -175,41 +175,56 @@ func TestClient_UpdateKey(t *testing.T) {
 	}
 }
 
-func TestClient_DeleteKey(t *testing.T) {
+func TestClient_DeleteKeyByAlias(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/key/delete" {
 			t.Errorf("expected /key/delete, got %s", r.URL.Path)
 		}
 
-		var req DeleteKeyRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		var payload map[string]json.RawMessage
+		json.NewDecoder(r.Body).Decode(&payload)
 
-		if len(req.Keys) != 1 || req.Keys[0] != "sk-to-delete" {
-			t.Errorf("unexpected keys: %v", req.Keys)
+		if _, hasKeys := payload["keys"]; hasKeys {
+			t.Errorf("payload must not carry raw keys, got %v", payload)
+		}
+		var aliases []string
+		json.Unmarshal(payload["key_aliases"], &aliases)
+		if len(aliases) != 1 || aliases[0] != "tenant_t1" {
+			t.Errorf("unexpected key_aliases: %v", aliases)
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(DeleteKeyResponse{
-			DeletedKeys: req.Keys,
-		})
+		w.Write([]byte(`{"deleted_keys":["tenant_t1"]}`))
 	}))
 	defer server.Close()
 
 	cfg := GatewayConfig{BaseURL: server.URL}
 	client := NewClient(cfg)
 
-	// Test validation error when keys empty
-	_, err := client.DeleteKey(context.Background(), []string{})
-	if err == nil {
-		t.Fatal("expected error for empty keys list, got nil")
+	if err := client.DeleteKeyByAlias(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty alias, got nil")
 	}
 
-	resp, err := client.DeleteKey(context.Background(), []string{"sk-to-delete"})
-	if err != nil {
+	if err := client.DeleteKeyByAlias(context.Background(), "tenant_t1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(resp.DeletedKeys) != 1 || resp.DeletedKeys[0] != "sk-to-delete" {
-		t.Errorf("unexpected deleted keys: %v", resp.DeletedKeys)
+}
+
+func TestClient_DeleteKeyByAlias_NotFoundReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"detail":{"error":"No keys found"}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	err := client.DeleteKeyByAlias(context.Background(), "tenant_missing")
+	if err == nil {
+		t.Fatal("expected error when gateway returns 404, got nil")
+	}
+	if !strings.Contains(err.Error(), "status 404") {
+		t.Errorf("expected error to carry 404 status, got %v", err)
 	}
 }
 

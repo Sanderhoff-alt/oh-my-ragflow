@@ -18,7 +18,7 @@ import (
 type Client interface {
 	GenerateKey(ctx context.Context, req *GenerateKeyRequest) (*GenerateKeyResponse, error)
 	UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*UpdateKeyResponse, error)
-	DeleteKey(ctx context.Context, keys []string) (*DeleteKeyResponse, error)
+	DeleteKeyByAlias(ctx context.Context, alias string) error
 	GetKeyInfo(ctx context.Context, key string) (*KeyInfoResponse, error)
 	ListModels(ctx context.Context) ([]string, error)
 	GetSpendLogs(ctx context.Context, params SpendLogQueryParams) ([]SpendLogEntry, error)
@@ -116,19 +116,18 @@ func (c *litellmClient) UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*
 	return &resp, nil
 }
 
-// DeleteKey revokes one or more virtual keys from the LiteLLM proxy.
-func (c *litellmClient) DeleteKey(ctx context.Context, keys []string) (*DeleteKeyResponse, error) {
-	if len(keys) == 0 {
-		return nil, fmt.Errorf("keys list cannot be empty")
+// DeleteKeyByAlias revokes the virtual key identified by its unique key_alias from the LiteLLM proxy.
+func (c *litellmClient) DeleteKeyByAlias(ctx context.Context, alias string) error {
+	if alias == "" {
+		return fmt.Errorf("key alias cannot be empty")
 	}
 
-	req := DeleteKeyRequest{Keys: keys}
-	var resp DeleteKeyResponse
-	if err := c.doRequest(ctx, http.MethodPost, "/key/delete", req, &resp); err != nil {
-		return nil, fmt.Errorf("failed to delete virtual key: %w", err)
+	req := DeleteKeyRequest{KeyAliases: []string{alias}}
+	if err := c.doRequest(ctx, http.MethodPost, "/key/delete", req, nil); err != nil {
+		return fmt.Errorf("failed to delete virtual key by alias: %w", err)
 	}
 
-	return &resp, nil
+	return nil
 }
 
 // GetKeyInfo retrieves metadata and usage metrics for a given virtual key.

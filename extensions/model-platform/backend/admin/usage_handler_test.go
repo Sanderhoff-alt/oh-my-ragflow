@@ -112,8 +112,8 @@ func (m *mockAdminGatewayClient) GenerateKey(ctx context.Context, req *gateway.G
 func (m *mockAdminGatewayClient) UpdateKey(ctx context.Context, req *gateway.UpdateKeyRequest) (*gateway.UpdateKeyResponse, error) {
 	return nil, nil
 }
-func (m *mockAdminGatewayClient) DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error) {
-	return nil, nil
+func (m *mockAdminGatewayClient) DeleteKeyByAlias(ctx context.Context, alias string) error {
+	return nil
 }
 func (m *mockAdminGatewayClient) GetKeyInfo(ctx context.Context, key string) (*gateway.KeyInfoResponse, error) {
 	return nil, nil

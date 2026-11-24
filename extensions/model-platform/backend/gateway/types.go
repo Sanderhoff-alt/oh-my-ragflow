@@ -62,14 +62,9 @@ type UpdateKeyResponse struct {
 }
 
 // DeleteKeyRequest represents payload for LiteLLM /key/delete endpoint.
+// Keys are addressed by alias; the platform never handles raw virtual key tokens for revocation.
 type DeleteKeyRequest struct {
-	Keys []string `json:"keys"`
-}
-
-// DeleteKeyResponse represents response from LiteLLM /key/delete endpoint.
-type DeleteKeyResponse struct {
-	DeletedKeys []string `json:"deleted_keys,omitempty"`
-	Detail      string   `json:"detail,omitempty"`
+	KeyAliases []string `json:"key_aliases"`
 }
 
 // KeyInfoResponse represents response from LiteLLM /key/info endpoint.
