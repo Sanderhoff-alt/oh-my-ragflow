@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"ragflow/extensions/model-platform/backend/entity"
-	"ragflow/extensions/model-platform/backend/reconciler"
 	rentity "ragflow/internal/entity"
 
 	"github.com/google/uuid"
@@ -48,8 +47,9 @@ type Request struct {
 
 // Result is returned once the publish task has been recorded.
 type Result struct {
-	TaskID string `json:"task_id"`
-	Total  int    `json:"total"`
+	TaskID        string `json:"task_id"`
+	Total         int    `json:"total"`
+	AffectedUsers int64  `json:"affected_users_count,omitempty"`
 }
 
 // Publisher records models in the catalog and creates the per-tenant rollout items.
@@ -102,26 +102,14 @@ func (p *Publisher) Publish(ctx context.Context, db *gorm.DB, req Request) (*Res
 		return nil, fmt.Errorf("%w: %q", ErrModelNotInGateway, req.ModelName)
 	}
 
-	result := &Result{TaskID: newID()}
+	var result *Result
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := ensureCatalogEntry(tx, req); err != nil {
-			return err
-		}
-
-		task := entity.ModelPublishTask{ID: result.TaskID, ModelName: req.ModelName, ModelType: req.ModelType}
-		if err := tx.Create(&task).Error; err != nil {
-			return err
-		}
-
-		tenants, err := readyTenantsMissingModel(tx, req.ModelName, req.ModelType, task.ID)
+		model, err := ensureCatalogEntry(tx, req)
 		if err != nil {
 			return err
 		}
-		if err := insertItems(tx, task.ID, tenants); err != nil {
-			return err
-		}
-		result.Total = len(tenants)
-		return nil
+		result, err = startRollout(tx, model)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -131,7 +119,7 @@ func (p *Publisher) Publish(ctx context.Context, db *gorm.DB, req Request) (*Res
 
 // ensureCatalogEntry creates the active catalog row, or accepts an existing active one with the same type.
 // model_name is unique, so a concurrent publish of the same name loses the insert and re-reads the winner.
-func ensureCatalogEntry(tx *gorm.DB, req Request) error {
+func ensureCatalogEntry(tx *gorm.DB, req Request) (*entity.PlatformManagedModel, error) {
 	row := entity.PlatformManagedModel{
 		ID:        newID(),
 		ModelName: req.ModelName,
@@ -139,43 +127,20 @@ func ensureCatalogEntry(tx *gorm.DB, req Request) error {
 		Status:    entity.ManagedModelStatusActive,
 	}
 	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
-		return err
+		return nil, err
 	}
 
 	var current entity.PlatformManagedModel
 	if err := tx.Where("model_name = ?", req.ModelName).First(&current).Error; err != nil {
-		return err
+		return nil, err
 	}
 	if current.ModelType != req.ModelType {
-		return fmt.Errorf("%w: %q is already published with model_type %d", ErrModelConflict, req.ModelName, current.ModelType)
+		return nil, fmt.Errorf("%w: %q is already published with model_type %d", ErrModelConflict, req.ModelName, current.ModelType)
 	}
 	if current.Status != entity.ManagedModelStatusActive {
-		return fmt.Errorf("%w: %q is %s and must be reactivated instead of published", ErrModelConflict, req.ModelName, current.Status)
+		return nil, fmt.Errorf("%w: %q is %s and must be reactivated instead of published", ErrModelConflict, req.ModelName, current.Status)
 	}
-	return nil
-}
-
-// readyTenantsMissingModel returns Ready tenants that have no tenant_model row (in any status, so a
-// retired model is never resurrected) for the model on their platform instance and no item in taskID.
-func readyTenantsMissingModel(db *gorm.DB, modelName string, modelType int, taskID string) ([]string, error) {
-	var tenants []string
-	err := db.Raw(`
-SELECT r.tenant_id FROM platform_tenant_reconcile r
-WHERE r.status = ?
-AND NOT EXISTS (
-	SELECT 1 FROM tenant_model_provider p
-	JOIN tenant_model_instance i ON i.provider_id = p.id AND i.instance_name = ?
-	JOIN tenant_model m ON m.instance_id = i.id AND m.model_name = ? AND m.model_type = ?
-	WHERE p.tenant_id = r.tenant_id AND p.provider_name = ?
-)
-AND NOT EXISTS (
-	SELECT 1 FROM platform_model_publish_item it WHERE it.task_id = ? AND it.tenant_id = r.tenant_id
-)
-ORDER BY r.tenant_id`,
-		entity.StatusReady, reconciler.PlatformInstanceName, modelName, modelType,
-		reconciler.ProviderOpenAIAPICompatible, taskID,
-	).Scan(&tenants).Error
-	return tenants, err
+	return &current, nil
 }
 
 func insertItems(db *gorm.DB, taskID string, tenants []string) error {

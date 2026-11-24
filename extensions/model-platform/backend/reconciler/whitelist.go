@@ -30,14 +30,11 @@ func LockInstanceWhitelist(instanceID string) (unlock func()) {
 	return mu.Unlock
 }
 
-// WithInstanceWhitelistLock runs fn as the only writer of an instance's whitelist and tenant_model rows,
-// across goroutines (in-process mutex) and across replicas (row lock on the tenant_model_instance row,
-// held in a separate transaction while fn runs on its own connection). SQLite has no row locks and is
-// only used by tests, so it relies on the in-process mutex alone.
-func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
-	unlock := LockInstanceWhitelist(instanceID)
-	defer unlock()
-
+// WithInstanceRowLock runs fn as the only writer of an instance's whitelist and tenant_model rows across
+// replicas, using a row lock on the tenant_model_instance row held in a separate transaction while fn
+// runs on its own connection. It does not take the in-process mutex, so it is meant for callers such as
+// the lifecycle managers that take that mutex themselves. SQLite has no row locks and only runs tests.
+func WithInstanceRowLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
 	if db.Dialector.Name() == "sqlite" {
 		return fn()
 	}
@@ -49,6 +46,21 @@ func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID stri
 		}
 		return fn()
 	})
+}
+
+// WithInstanceWhitelistLock is WithInstanceRowLock plus the in-process mutex, which also serializes the
+// goroutines of one replica without a database round trip.
+func WithInstanceWhitelistLock(ctx context.Context, db *gorm.DB, instanceID string, fn func() error) error {
+	unlock := LockInstanceWhitelist(instanceID)
+	defer unlock()
+	return WithInstanceRowLock(ctx, db, instanceID, fn)
+}
+
+// RetirementFlags reports the per-tenant retirement state recorded in a tenant_model extra value:
+// deprecated (read-only but still authorized) and tombstoned (disabled and removed from the whitelist).
+func RetirementFlags(extraJSON string) (deprecated, tombstoned bool) {
+	extra := parseExtraMap(extraJSON)
+	return extra["deprecated"] == true, extra["tombstoned"] == true
 }
 
 type gatewayOverride int

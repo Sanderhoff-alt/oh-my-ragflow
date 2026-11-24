@@ -44,11 +44,13 @@ func WithBackoffPolicy(p reconciler.BackoffPolicy) WorkerOption {
 	return func(w *Worker) { w.policy = p }
 }
 
-// Worker converges tenants toward the catalog: it sweeps for Ready tenants missing an active model
+// Worker converges tenants toward the catalog: it sweeps for tenants that differ from a model's catalog status
 // and applies due items. Several replicas can run it because every item is claimed with an optimistic lock.
 type Worker struct {
 	dbFn         func() *gorm.DB
 	client       reconciler.GatewayKeyClient
+	embedding    *reconciler.EmbeddingLifecycleManager
+	nonEmbedding *reconciler.NonEmbeddingLifecycleManager
 	policy       reconciler.BackoffPolicy
 	interval     time.Duration
 	concurrency  int
@@ -66,6 +68,8 @@ func NewWorker(dbFn func() *gorm.DB, client reconciler.GatewayKeyClient, opts ..
 	w := &Worker{
 		dbFn:         dbFn,
 		client:       client,
+		embedding:    reconciler.NewEmbeddingLifecycleManager(client),
+		nonEmbedding: reconciler.NewNonEmbeddingLifecycleManager(client),
 		policy:       reconciler.DefaultBackoffPolicy,
 		interval:     defaultInterval,
 		concurrency:  defaultConcurrency,
@@ -127,7 +131,7 @@ func (w *Worker) RunOnce(ctx context.Context) {
 	db := base.WithContext(ctx).Session(&gorm.Session{Logger: base.Logger.LogMode(logger.Silent)})
 
 	w.recoverStaleLeases(db)
-	w.sweep(db)
+	w.sweep(ctx, db)
 
 	var due []entity.ModelPublishItem
 	if err := db.Where("status = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)", entity.PublishItemPending, time.Now()).
@@ -163,11 +167,12 @@ func (w *Worker) recoverStaleLeases(db *gorm.DB) {
 		}).Error
 }
 
-// sweep adds items to the latest task of every active catalog model for Ready tenants that still lack it.
-// This is what covers tenants that became Ready after the publish request.
-func (w *Worker) sweep(db *gorm.DB) {
+// sweep adds items to the latest task of every catalog model for the tenants that still differ from the
+// catalog status: Ready tenants missing an active model, and tenants still holding a retired one. This is
+// what covers tenants that became Ready after a request, and anything a failed item left behind.
+func (w *Worker) sweep(ctx context.Context, db *gorm.DB) {
 	var models []entity.PlatformManagedModel
-	if err := db.Where("status = ?", entity.ManagedModelStatusActive).Find(&models).Error; err != nil {
+	if err := db.Find(&models).Error; err != nil {
 		return
 	}
 	for _, m := range models {
@@ -184,11 +189,42 @@ func (w *Worker) sweep(db *gorm.DB) {
 				continue
 			}
 		}
-		tenants, err := readyTenantsMissingModel(db, m.ModelName, m.ModelType, task.ID)
+		tenants, err := tenantsToConverge(db, &m, task.ID)
 		if err != nil || len(tenants) == 0 {
 			continue
 		}
 		_ = insertItems(db, task.ID, tenants)
+	}
+	w.sweepDeprecated(ctx, db)
+}
+
+// sweepDeprecated finalizes the deprecated embedding rows of retired models once the tenant's knowledge bases
+// that kept them readable are gone.
+func (w *Worker) sweepDeprecated(ctx context.Context, db *gorm.DB) {
+	var candidates []struct {
+		TenantID   string
+		InstanceID string
+	}
+	if err := db.Raw(`
+SELECT DISTINCT p.tenant_id AS tenant_id, i.id AS instance_id FROM tenant_model_provider p
+JOIN tenant_model_instance i ON i.provider_id = p.id AND i.instance_name = ?
+JOIN tenant_model m ON m.instance_id = i.id AND m.model_type = ? AND m.status = 'active'
+	AND COALESCE(m.extra, '') LIKE '%"deprecated":true%'
+JOIN platform_managed_model c ON c.model_name = m.model_name AND c.status = ?
+WHERE p.provider_name = ?
+ORDER BY p.tenant_id LIMIT ?`,
+		reconciler.PlatformInstanceName, int(rentity.ModelTypeEmbedding), entity.ManagedModelStatusRetired,
+		reconciler.ProviderOpenAIAPICompatible, dueBatchSize).Scan(&candidates).Error; err != nil {
+		return
+	}
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = reconciler.WithInstanceRowLock(ctx, db, c.InstanceID, func() error {
+			_, err := w.embedding.SweepTombstoneCandidates(ctx, db, c.TenantID)
+			return err
+		})
 	}
 }
 
@@ -238,13 +274,22 @@ func (w *Worker) process(ctx context.Context, db *gorm.DB, item entity.ModelPubl
 	_ = finish.Updates(updates).Error
 }
 
-// apply makes the model available to one tenant: gateway whitelist first, then the tenant_model row.
-// It is idempotent, so a crash after the gateway call is repaired by the next attempt.
+// apply converges one tenant toward the catalog status of the task's model. The status is read now, not when
+// the task was created, so an item always chases the latest intent. Every step is idempotent, and the gateway
+// whitelist is always changed before the tenant_model row, so a crash in between is repaired by the next attempt.
 func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublishItem) error {
 	var task entity.ModelPublishTask
 	if err := db.Where("id = ?", item.TaskID).First(&task).Error; err != nil {
 		return fmt.Errorf("publish task unavailable: %w", err)
 	}
+	var catalog []entity.PlatformManagedModel
+	if err := db.Where("model_name = ?", task.ModelName).Limit(1).Find(&catalog).Error; err != nil {
+		return err
+	}
+	if len(catalog) == 0 {
+		return fmt.Errorf("model %q is not in the catalog", task.ModelName)
+	}
+	model := catalog[0]
 
 	var provider rentity.TenantModelProvider
 	if err := db.Where("tenant_id = ? AND provider_name = ?", item.TenantID, reconciler.ProviderOpenAIAPICompatible).
@@ -257,9 +302,45 @@ func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublis
 		return fmt.Errorf("managed platform instance unavailable: %w", err)
 	}
 
+	var rows []rentity.TenantModel
+	if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, model.ModelName, model.ModelType).
+		Limit(1).Find(&rows).Error; err != nil {
+		return err
+	}
+
+	if model.Status == entity.ManagedModelStatusRetired {
+		return w.ensureRetired(ctx, db, item.TenantID, &model, &instance, rows)
+	}
+	return w.ensureActive(ctx, db, item.TenantID, &model, &provider, &instance, rows)
+}
+
+// ensureActive onboards the model into a tenant that lacks it, or reactivates a row retired earlier.
+func (w *Worker) ensureActive(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	model *entity.PlatformManagedModel,
+	provider *rentity.TenantModelProvider,
+	instance *rentity.TenantModelInstance,
+	rows []rentity.TenantModel,
+) error {
+	if len(rows) > 0 {
+		deprecated, tombstoned := reconciler.RetirementFlags(rows[0].Extra)
+		if !deprecated && !tombstoned {
+			return nil
+		}
+		return reconciler.WithInstanceRowLock(ctx, db, instance.ID, func() error {
+			if model.ModelType == int(rentity.ModelTypeEmbedding) {
+				return w.embedding.ReactivateEmbeddingModel(ctx, db, tenantID, model.ModelName)
+			}
+			_, err := w.nonEmbedding.ReactivateModel(ctx, db, tenantID, model.ModelName, model.ModelType)
+			return err
+		})
+	}
+
 	return reconciler.WithInstanceWhitelistLock(ctx, db, instance.ID, func() error {
 		var existing []rentity.TenantModel
-		if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, task.ModelName, task.ModelType).
+		if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, model.ModelName, model.ModelType).
 			Limit(1).Find(&existing).Error; err != nil {
 			return err
 		}
@@ -267,20 +348,46 @@ func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublis
 			return nil
 		}
 
-		if err := reconciler.IncludeModelInWhitelist(ctx, db, w.client, &instance, task.ModelName, task.ModelType); err != nil {
+		if err := reconciler.IncludeModelInWhitelist(ctx, db, w.client, instance, model.ModelName, model.ModelType); err != nil {
 			return err
 		}
 
 		extra, _ := json.Marshal(map[string]interface{}{"is_managed": true})
 		return db.Create(&rentity.TenantModel{
 			ID:         newID(),
-			ModelName:  task.ModelName,
+			ModelName:  model.ModelName,
 			ProviderID: provider.ID,
 			InstanceID: instance.ID,
-			ModelType:  task.ModelType,
+			ModelType:  model.ModelType,
 			Status:     "active",
 			Extra:      string(extra),
 		}).Error
+	})
+}
+
+// ensureRetired retires a tenant row that is still fully active. An embedding model becomes deprecated while
+// the tenant has knowledge bases bound to it and tombstoned otherwise. Other models are tombstoned directly.
+func (w *Worker) ensureRetired(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	model *entity.PlatformManagedModel,
+	instance *rentity.TenantModelInstance,
+	rows []rentity.TenantModel,
+) error {
+	if len(rows) == 0 || rows[0].Status != "active" {
+		return nil
+	}
+	if deprecated, tombstoned := reconciler.RetirementFlags(rows[0].Extra); deprecated || tombstoned {
+		return nil
+	}
+	return reconciler.WithInstanceRowLock(ctx, db, instance.ID, func() error {
+		if model.ModelType == int(rentity.ModelTypeEmbedding) {
+			_, err := w.embedding.RetireEmbeddingModel(ctx, db, tenantID, model.ModelName)
+			return err
+		}
+		_, err := w.nonEmbedding.RetireModel(ctx, db, tenantID, model.ModelName, model.ModelType)
+		return err
 	})
 }
 

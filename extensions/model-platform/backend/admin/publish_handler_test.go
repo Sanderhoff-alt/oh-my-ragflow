@@ -68,6 +68,38 @@ func doJSON(r *gin.Engine, method, path, body string) (int, map[string]interface
 	return w.Code, out
 }
 
+func TestPublishAPI_RetireAndReactivate(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m-chat", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-default", ModelName: "gpt-4o-mini", ModelType: 1, IsDefault: true, Status: entity.ManagedModelStatusActive})
+
+	code, out := doJSON(r, http.MethodPost, "/admin/model-platform/models/m-chat/retire", "")
+	if code != http.StatusAccepted || out["data"].(map[string]interface{})["task_id"] == "" {
+		t.Fatalf("expected 202 with a task, got %d: %v", code, out)
+	}
+	var model entity.PlatformManagedModel
+	db.Where("id = ?", "m-chat").First(&model)
+	if model.Status != entity.ManagedModelStatusRetired {
+		t.Errorf("expected the catalog to be retired, got %s", model.Status)
+	}
+
+	code, out = doJSON(r, http.MethodPost, "/admin/model-platform/models/m-default/retire", "")
+	if code != http.StatusBadRequest || out["message"] == "" {
+		t.Errorf("expected 400 for the platform default, got %d: %v", code, out)
+	}
+	if code, _ = doJSON(r, http.MethodPost, "/admin/model-platform/models/missing/retire", ""); code != http.StatusNotFound {
+		t.Errorf("expected 404 for an unknown model, got %d", code)
+	}
+
+	if code, _ = doJSON(r, http.MethodPost, "/admin/model-platform/models/m-chat/reactivate", ""); code != http.StatusAccepted {
+		t.Errorf("expected 202 on reactivation, got %d", code)
+	}
+	db.Where("id = ?", "m-chat").First(&model)
+	if model.Status != entity.ManagedModelStatusActive {
+		t.Errorf("expected the catalog to be active again, got %s", model.Status)
+	}
+}
+
 func TestPublishAPI_ListCatalog(t *testing.T) {
 	r, db := setupPublishAdminServer(t, "deepseek-v3")
 	db.Create(&entity.PlatformManagedModel{ID: "m1", ModelName: "deepseek-v3", ModelType: 1, IsDefault: true, Status: entity.ManagedModelStatusActive})
