@@ -273,9 +273,11 @@ func (d *ReconcileDAO) FindDueRetries(ctx context.Context, db *gorm.DB, now time
 	return records, nil
 }
 
-// ListByStatus returns one page of the records in the given status, ordered by tenant id, together with the
-// total number of such records.
-func (d *ReconcileDAO) ListByStatus(ctx context.Context, db *gorm.DB, status entity.ReconcileStatus, offset, limit int) ([]*entity.TenantReconcileRecord, int64, error) {
+// ListByStatus returns a page of the records in the given status, ordered by tenant id, that follow
+// afterTenantID (empty for the first page), together with the total number of such records. Paging by cursor
+// instead of by offset means a record that leaves the status between two pages cannot make the walk skip
+// another one. It is not a snapshot: a record that enters the status behind the cursor is not returned.
+func (d *ReconcileDAO) ListByStatus(ctx context.Context, db *gorm.DB, status entity.ReconcileStatus, afterTenantID string, limit int) ([]*entity.TenantReconcileRecord, int64, error) {
 	if db == nil {
 		return nil, 0, ErrNilTransaction
 	}
@@ -289,7 +291,7 @@ func (d *ReconcileDAO) ListByStatus(ctx context.Context, db *gorm.DB, status ent
 		return nil, 0, err
 	}
 	var records []*entity.TenantReconcileRecord
-	if err := query.Order("tenant_id ASC").Offset(offset).Limit(limit).Find(&records).Error; err != nil {
+	if err := query.Where("tenant_id > ?", afterTenantID).Order("tenant_id ASC").Limit(limit).Find(&records).Error; err != nil {
 		return nil, 0, err
 	}
 	return records, total, nil

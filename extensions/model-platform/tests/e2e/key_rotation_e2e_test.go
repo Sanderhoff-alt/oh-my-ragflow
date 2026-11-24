@@ -137,7 +137,25 @@ func assertSpendOfBothKeysIsOneUsageRow(t *testing.T, env *catalogEnv, tenantID,
 	}
 	var rows []mpentity.TenantUsageDaily
 	env.db.Where("tenant_id = ?", tenantID).Find(&rows)
-	if len(rows) != 1 || rows[0].CallCount < 2 {
-		t.Fatalf("both keys must roll up into one usage row, got %+v", rows)
+	// The key never splits a day: each (tenant, model, date) has one row. The two calls are seconds apart, but
+	// they may straddle midnight of the metering day, so the check is on the calls counted, not on one row.
+	var calls int64
+	dates := map[string]bool{}
+	for _, row := range rows {
+		calls += row.CallCount
+		key := row.ModelName + "/" + row.UsageDate
+		if dates[key] {
+			t.Fatalf("a model must have one usage row per day, got %+v", rows)
+		}
+		dates[key] = true
+	}
+	// Nothing is collected between the aggregation and this count, so the aggregated calls must equal the
+	// spend rows of the tenant exactly. The loop above showed that rows of both keys are among them, so a
+	// total that matches proves the aggregation counted both keys. The count itself is not fixed: polling the
+	// old key while the gateway cache still honours it adds calls.
+	var logged int64
+	env.db.Model(&mpentity.GatewaySpendLog{}).Where("tenant_id = ?", tenantID).Count(&logged)
+	if calls != logged || calls < 2 {
+		t.Fatalf("the usage must count every spend row of both keys: %d calls aggregated, %d rows collected, %+v", calls, logged, rows)
 	}
 }

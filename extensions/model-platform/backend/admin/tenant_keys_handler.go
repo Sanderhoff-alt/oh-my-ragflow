@@ -41,10 +41,7 @@ func ListTenantKeysHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 		}
 
 		status := entity.ReconcileStatus(c.DefaultQuery("status", string(entity.StatusReady)))
-		page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-		if page < 1 {
-			page = 1
-		}
+		after := c.Query("after")
 		pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", strconv.Itoa(defaultTenantPageSize)))
 		if pageSize < 1 {
 			pageSize = defaultTenantPageSize
@@ -53,7 +50,7 @@ func ListTenantKeysHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 			pageSize = maxTenantPageSize
 		}
 
-		records, total, err := dao.NewReconcileDAO().ListByStatus(c.Request.Context(), db, status, (page-1)*pageSize, pageSize)
+		records, total, err := dao.NewReconcileDAO().ListByStatus(c.Request.Context(), db, status, after, pageSize)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to list tenants"})
 			return
@@ -75,6 +72,6 @@ func ListTenantKeysHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 				KeyDirtySince:  rec.KeyDirtySince,
 			})
 		}
-		c.JSON(http.StatusOK, gin.H{"code": 200, "data": gin.H{"total": total, "page": page, "page_size": pageSize, "items": items}})
+		c.JSON(http.StatusOK, gin.H{"code": 200, "data": gin.H{"total": total, "page_size": pageSize, "items": items}})
 	}
 }

@@ -25,8 +25,9 @@
 #   ADMIN_URL     Admin API base URL (default http://127.0.0.1:9381/api/v1/admin).
 #
 # Exit status: 0 when every tenant was rotated and its old key revoked, 1 when some tenant failed or
-# still has a superseded key that may be valid (HTTP 202; the platform keeps revoking it and a rerun
-# with --resume finishes it), 2 for invalid usage.
+# still has a superseded key that may be valid (HTTP 202; the platform keeps revoking it in the
+# background, and a rerun with --resume rotates the tenant once more, which also revokes it), 2 for
+# invalid usage.
 set -euo pipefail
 
 ADMIN_URL="${ADMIN_URL:-http://127.0.0.1:9381/api/v1/admin}"
@@ -65,27 +66,31 @@ rotate_one() {
     line="$(jq -cn --arg id "${id}" --argjson code "${code}" --arg body "${body}" \
         '{tenant_id: $id, http_status: $code, response: $body}')"
     printf '%s\n' "${line}" >> "${OUTPUT}"
+    printf '%s\n' "${line}" >> "${RUN_OUTPUT}"
 }
 
+# Tenants are read with a cursor on the tenant id, not by page number: a tenant that leaves the ready set while
+# the list is being read would shift every later tenant down by one and an offset would skip it.
 list_ready_tenants() {
-    local page=1 raw code body total seen=0
+    local after="" raw code body ids
     while :; do
-        raw="$(api GET "${API}/tenants?status=ready&page=${page}&page_size=${PAGE_SIZE}")" ||
+        raw="$(api GET "${API}/tenants?status=ready&page_size=${PAGE_SIZE}&after=${after}")" ||
             die "could not reach the admin API"
         code="${raw##*$'\n'}"
         body="${raw%$'\n'*}"
         [[ "${code}" == 200 ]] || die "listing tenants failed with HTTP ${code}: ${body}"
-        jq -r '.data.items[].tenant_id' <<<"${body}"
-        total="$(jq -r '.data.total' <<<"${body}")"
-        seen=$((seen + $(jq -r '.data.items | length' <<<"${body}")))
-        if [[ "${seen}" -ge "${total}" || "$(jq -r '.data.items | length' <<<"${body}")" -eq 0 ]]; then
-            return 0
-        fi
-        page=$((page + 1))
+        ids="$(jq -r '.data.items[].tenant_id' <<<"${body}")"
+        [[ -n "${ids}" ]] || return 0
+        printf '%s\n' "${ids}"
+        after="$(tail -n 1 <<<"${ids}")"
     done
 }
 
 while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tenant|--concurrency|--rate-limit|--output|--resume|--worker)
+            [[ $# -ge 2 ]] || die "$1 requires a value (see --help)" ;;
+    esac
     case "$1" in
         --tenant) TENANT="${2:-}"; shift 2 ;;
         --all) ALL=true; shift ;;
@@ -107,8 +112,19 @@ command -v jq >/dev/null || die "jq is required"
 
 if [[ -n "${WORKER}" ]]; then
     OUTPUT="${ROTATE_OUTPUT:?}"
+    RUN_OUTPUT="${ROTATE_RUN_OUTPUT:?}"
+    # Wait for a start token: the gate hands out one every 1/rate-limit seconds to all workers together.
+    # A worker that sees the pipe closed without a token (read fails) simply waits again.
+    until read -r _ < "${ROTATE_GATE:?}"; do :; done
     rotate_one "${WORKER}"
     exit 0
+fi
+
+if [[ "${ADMIN_URL}" =~ ^http://(\[::1\]|[^/:]+) ]]; then
+    case "${BASH_REMATCH[1]}" in
+        127.0.0.1|localhost|"[::1]") ;;
+        *) echo "warning: ADMIN_URL is plain HTTP to ${BASH_REMATCH[1]}, the admin token is sent unencrypted" >&2 ;;
+    esac
 fi
 
 [[ -n "${TENANT}" || "${ALL}" == true ]] || die "choose --tenant <id> or --all"
@@ -122,7 +138,12 @@ fi
 [[ -z "${RESUME}" || -r "${RESUME}" ]] || die "cannot read the resume file: ${RESUME}"
 
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "${WORK_DIR}"' EXIT
+GATE_PID=""
+cleanup() {
+    [[ -z "${GATE_PID}" ]] || kill "${GATE_PID}" 2>/dev/null || true
+    rm -rf "${WORK_DIR}"
+}
+trap cleanup EXIT
 TENANT_FILE="${WORK_DIR}/tenants"
 
 if [[ -n "${TENANT}" ]]; then
@@ -146,26 +167,34 @@ fi
 
 OUTPUT="${OUTPUT:-./rotate-keys-$(date +%Y%m%d-%H%M%S).ndjson}"
 : >> "${OUTPUT}"
-export ADMIN_URL ADMIN_TOKEN ROTATE_OUTPUT="${OUTPUT}"
+# The summary and the exit status describe this run only, while OUTPUT keeps the history of earlier runs
+RUN_OUTPUT="${WORK_DIR}/run.ndjson"
+: > "${RUN_OUTPUT}"
 echo "rotating ${COUNT} tenant(s), concurrency ${CONCURRENCY}, at most ${RATE_LIMIT} per second, results in ${OUTPUT}"
 
-INTERVAL="$(awk -v r="${RATE_LIMIT}" 'BEGIN { printf "%.3f", 1 / r }')"
+INTERVAL="$(awk -v r="${RATE_LIMIT}" 'BEGIN { printf "%.6f", 1 / r }')"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-while IFS= read -r id; do
-    printf '%s\n' "${id}"
-    sleep "${INTERVAL}"
-done < "${TENANT_FILE}" | xargs -P "${CONCURRENCY}" -I{} bash "${SELF}" --worker {}
 
-# Only the tenants of this run count, so a reused output file does not distort the summary
-jq -s --rawfile run "${TENANT_FILE}" '
-    ($run | split("\n") | map(select(. != ""))) as $ids
-    | map(select(.tenant_id as $t | $ids | index($t)))
-    | {rotated: map(select(.http_status == 200)) | length,
-       pending_revocation: map(select(.http_status == 202)) | length,
-       failed: map(select(.http_status != 200 and .http_status != 202)) | length}' "${OUTPUT}" > "${WORK_DIR}/summary"
+# The rate limit is enforced where requests start. The gate writes a token only while a worker waits for one
+# (opening the pipe for writing blocks until a reader is there) and then sleeps, so the starts of all workers
+# together are at least INTERVAL apart, however long a rotation takes and however many tokens would have queued.
+GATE="${WORK_DIR}/gate"
+mkfifo "${GATE}"
+while :; do echo tick > "${GATE}"; sleep "${INTERVAL}"; done &
+GATE_PID=$!
+disown "${GATE_PID}"
+export ADMIN_URL ADMIN_TOKEN ROTATE_OUTPUT="${OUTPUT}" ROTATE_RUN_OUTPUT="${RUN_OUTPUT}" ROTATE_GATE="${GATE}"
+xargs -P "${CONCURRENCY}" -I{} bash "${SELF}" --worker {} < "${TENANT_FILE}"
+kill "${GATE_PID}" 2>/dev/null || true
+GATE_PID=""
+
+jq -s --argjson count "${COUNT}" '
+    {rotated: map(select(.http_status == 200)) | length,
+     pending_revocation: map(select(.http_status == 202)) | length}
+    | . + {failed: ($count - .rotated - .pending_revocation)}' "${RUN_OUTPUT}" > "${WORK_DIR}/summary"
 cat "${WORK_DIR}/summary"
 if [[ "$(jq '.pending_revocation + .failed' "${WORK_DIR}/summary")" -gt 0 ]]; then
     echo "some tenants need attention, rerun with --resume ${OUTPUT} after checking them:" >&2
-    jq -r 'select(.http_status != 200) | "  \(.tenant_id): HTTP \(.http_status)"' "${OUTPUT}" >&2
+    jq -r 'select(.http_status != 200) | "  \(.tenant_id): HTTP \(.http_status)"' "${RUN_OUTPUT}" >&2
     exit 1
 fi

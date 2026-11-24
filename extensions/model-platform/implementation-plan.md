@@ -240,22 +240,24 @@ When a tenant is deleted, `TenantDecommissioner` asynchronously revokes every vi
 #### Key identity and revocation
 A tenant's keys are identified by the gateway **team**, not by `key_alias`. The team id equals the tenant id and groups every key the platform issues for the tenant. A single key is addressed by its token, the sha256 hex digest of the key, which LiteLLM stores, accepts in `POST /key/delete`, and writes as `api_key` into spend logs. The reconcile record keeps that digest as `key_hash`, so the platform can revoke without storing raw tokens.
 
-- `GET /key/list?team_id=<tenant>&return_full_object=true` lists the keys of a tenant. `ConvergeTenantKeys` revokes all of them except the one named by `key_hash`, and `RevokeTenantKeys` revokes all. Both are idempotent, and revoking a key that is already gone is not an error.
+- `GET /key/list?team_id=<tenant>&return_full_object=true` lists the keys of a tenant. `ConvergeTenantKeys` revokes all of them except the one named by `key_hash`, and `RevokeTenantKeys` revokes all. Both are idempotent, and revoking a key that is already gone is not an error. `ConvergeTenantKeys` refuses to revoke anything when the gateway does not list the key the record names, so a stale record can never leave a tenant without a credential.
 - `key_alias` is only a human readable label of the form `tenant_<id>_<8 hex>`. LiteLLM enforces alias uniqueness in application code only, so concurrent requests can create duplicates, and `POST /key/delete` with `key_aliases` removes every match.
 - Tenant attribution in spend logs uses the team id, never the alias.
 
 ### 3.6 Emergency Key Rotation
-Administrators replace the gateway key of a tenant, for example after a leak, without interrupting the tenant:
+Administrators replace the gateway key of a tenant, for example after a leak. The tenant stays `ready` and new requests use the new key from the database commit on, so the tenant is not taken out of service. Requests that are still running on the old key fail once it is revoked:
 
 ```
 POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key
-GET  /api/v1/admin/model-platform/tenants?status=ready&page=1&page_size=100
+GET  /api/v1/admin/model-platform/tenants?status=ready&after=<tenant_id>&page_size=100
 ```
 
-`KeyRotator.Rotate` runs for a `ready` tenant under the instance whitelist lock (row lock plus in-process mutex), so it cannot interleave with a model going live or retiring:
+The list is read with a cursor on the tenant id (`after`) instead of a page number, so a tenant that leaves the ready set between two pages cannot make the walk skip another one. The walk is not a snapshot: a tenant that becomes ready behind the cursor is not part of it, so operators repeat the selection to include such tenants.
+
+`KeyRotator.Rotate` runs for a `ready` tenant under the instance whitelist lock (a row lock on the provider the instance belongs to, plus an in-process mutex), so it cannot interleave with a model going live or retiring. The row locked is the provider's, not the instance's, because the rotation itself writes the instance row (`api_key`) while the lock is held in a separate transaction:
 1. Mark the record dirty (`key_dirty_since`) with a compare-and-swap on `version`. The marker is written before anything changes at the gateway.
 2. Issue the new key with the whitelist rebuilt from the tenant's active models (never empty, so the rotation keeps what the tenant may call).
-3. In one transaction, point the managed `tenant_model_instance` at the new key and record `key_hash`, `gateway_key_alias`, `key_rotated_at` and `key_rotated_by`. If this fails the new key is revoked by its hash and the old key stays.
+3. In one transaction, point the managed `tenant_model_instance` at the new key and record `key_hash`, `gateway_key_alias`, `key_rotated_at` and `key_rotated_by`. If this fails, the record is read back. Only when that read succeeds and shows another key is the new key revoked by its hash and the old key kept. A failed read proves nothing (a dropped connection makes it likely, and the commit may have gone through), so the new key and the dirty marker stay and the sweeper converges on whatever the record names.
 4. Converge the tenant's gateway team on the new key, which revokes the old one, and clear the marker.
 
 The record stays `ready` during the rotation. A `provisioning` status would make the poller treat an interrupted rotation as an abandoned provisioning and issue another key.
@@ -263,10 +265,10 @@ The record stays `ready` during the rotation. A `provisioning` status would make
 | HTTP | Meaning |
 |---|---|
 | 200 | New key in use, old key revoked |
-| 202 | New key in use, a superseded key may still be valid (`old_keys_revoked: false`). The key sweeper keeps revoking it, and calling the endpoint again resumes it |
+| 202 | New key in use, a superseded key may still be valid (`old_keys_revoked: false`). The key sweeper keeps revoking it. Calling the endpoint again does not resume that revocation, it rotates the tenant once more: a new key is issued, the key of the first call is replaced and revoked too, and every superseded key is revoked |
 | 400 / 404 | Tenant id cannot be a gateway team id / tenant not managed by the platform |
 | 409 | Tenant not ready, or its record changed during the rotation |
-| 502 | The gateway could not issue a key, nothing changed |
+| 502 | The gateway could not issue a key. The current key is kept and stays valid. The tenant stays marked dirty, and if the gateway created a key before the failure (for example when only the response was lost), the key sweeper revokes it |
 | 503 | Gateway or database not configured |
 
 The response carries a fingerprint (first 8 digits of the key hash), never the key. The operator is the authenticated administrator and each rotation is logged with the old and new key hashes.
@@ -332,10 +334,14 @@ CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
     last_error TEXT NULL,
     gateway_key_alias VARCHAR(128) NULL,
     key_hash VARCHAR(128) NULL,
+    key_dirty_since DATETIME NULL, -- set while a rotation has not revoked the superseded keys yet
+    key_rotated_at DATETIME NULL,
+    key_rotated_by VARCHAR(128) NULL,
     version BIGINT NOT NULL DEFAULT 1,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
-    INDEX idx_status_retry (status, next_retry_at)
+    INDEX idx_status_retry (status, next_retry_at),
+    INDEX idx_key_dirty (key_dirty_since)
 );
 ```
 
@@ -908,7 +914,7 @@ sequenceDiagram
 | Gateway down during tenant registration | Delayed model provisioning | Tenant registration commits locally without blocking. Event enqueues for retry; Tier 1 retries 5 times, then transitions to `degraded`. Tier 2 background poller auto-heals tenant to `ready` once gateway returns. |
 | Database failure after virtual key issued | Orphaned gateway credentials | Compensating rollback revokes the issued virtual key by its hash immediately, preventing orphaned tokens. |
 | Tenant account deleted or decommissioned | Residual token usage | Decommissioning listener triggers `TenantDecommissioner`, which revokes every key of the tenant's gateway team physically. |
-| Tenant key leaked | Unauthorized spend until the key is replaced | An administrator calls `POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key` (or the batch script). The tenant switches to a new key without downtime and the old key is revoked, see section 3.6. |
+| Tenant key leaked | Unauthorized spend until the key is replaced | An administrator calls `POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key` (or the batch script). The tenant switches to a new key at the database commit, without taking it out of service, and the old key is revoked, so requests still running on the old key fail. See section 3.6. |
 | Upstream provider 5xx or network timeout | Active inference fails | LiteLLM performs transparent retry or returns standard error codes. RAGFlow driver handles errors gracefully; gateway charges only for actual tokens consumed. |
 | Administrator deprecates embedding model | Existing KB vector search | 3-stage lifecycle keeps model in `Deprecated/Read-Only` status. Gateway whitelist retains model, ensuring vector search continues uninterrupted while hiding it from new KBs. |
 | Network delay causes 48h rollup replay | Billing aggregates | Raw staging table uses `spend_id` unique key (`INSERT IGNORE`). Rollup performs replacement upsert (`call_count = VALUES(call_count)`), guaranteeing mathematical idempotence. |

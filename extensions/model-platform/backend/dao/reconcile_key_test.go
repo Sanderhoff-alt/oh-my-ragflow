@@ -61,6 +61,27 @@ func TestReconcileDAO_KeyUpdatesRequireAReadyRecord(t *testing.T) {
 	}
 }
 
+func TestReconcileDAO_ListByStatusKeepsTheWalkCompleteWhenRecordsLeave(t *testing.T) {
+	db := setupReconcileTestDB(t)
+	d := NewReconcileDAO()
+	ctx := context.Background()
+	for _, id := range []string{"t-a", "t-b", "t-c", "t-d"} {
+		db.Create(&entity.TenantReconcileRecord{TenantID: id, Status: entity.StatusReady, Version: 1})
+	}
+
+	first, _, err := d.ListByStatus(ctx, db, entity.StatusReady, "", 2)
+	if err != nil || len(first) != 2 || first[1].TenantID != "t-b" {
+		t.Fatalf("expected the first two tenants, got %v (err=%v)", first, err)
+	}
+	// A tenant that was already listed is decommissioned before the next page is read
+	db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", "t-a").Update("status", entity.StatusDeleted)
+
+	next, total, err := d.ListByStatus(ctx, db, entity.StatusReady, first[1].TenantID, 2)
+	if err != nil || len(next) != 2 || next[0].TenantID != "t-c" || next[1].TenantID != "t-d" || total != 3 {
+		t.Fatalf("the walk must continue with t-c and t-d, got %v total=%d (err=%v)", next, total, err)
+	}
+}
+
 func TestReconcileDAO_FindDirtyKeyTenants(t *testing.T) {
 	db := setupReconcileTestDB(t)
 	d := NewReconcileDAO()

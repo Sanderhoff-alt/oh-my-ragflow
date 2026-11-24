@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 type tenantListEnvelope struct {
 	Data struct {
 		Total    int64           `json:"total"`
-		Page     int             `json:"page"`
 		PageSize int             `json:"page_size"`
 		Items    []tenantKeyItem `json:"items"`
 	} `json:"data"`
@@ -58,15 +58,36 @@ func TestListTenantKeysHandler_ListsReadyTenantsByDefault(t *testing.T) {
 	}
 }
 
-func TestListTenantKeysHandler_FiltersAndPaginates(t *testing.T) {
+func TestListTenantKeysHandler_FiltersAndFollowsTheCursor(t *testing.T) {
 	_, out, _ := listTenants(t, "?status=degraded")
 	if out.Data.Total != 1 || out.Data.Items[0].TenantID != "tenant-c" {
 		t.Errorf("expected only the degraded tenant, got %+v", out.Data)
 	}
 
-	_, out, _ = listTenants(t, "?page=2&page_size=2")
-	if out.Data.Total != 5 || len(out.Data.Items) != 2 || out.Data.Page != 2 || out.Data.PageSize != 2 {
-		t.Errorf("expected the second page of two items, got %+v", out.Data)
+	ids := func(items []tenantKeyItem) []string {
+		var out []string
+		for _, i := range items {
+			out = append(out, i.TenantID)
+		}
+		return out
+	}
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{"?page_size=2", []string{rotationTenant, "tenant-b"}},
+		{"?after=tenant-b&page_size=2", []string{"tenant-z0", "tenant-z1"}},
+		{"?after=tenant-z1&page_size=2", []string{"tenant-z2"}},
+		{"?after=tenant-z2&page_size=2", nil},
+	}
+	for _, tc := range cases {
+		_, out, _ = listTenants(t, tc.query)
+		if got := ids(out.Data.Items); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("%s: expected %v, got %v", tc.query, tc.want, got)
+		}
+		if out.Data.Total != 5 {
+			t.Errorf("%s: the total counts every ready tenant, got %d", tc.query, out.Data.Total)
+		}
 	}
 
 	_, out, _ = listTenants(t, "?page_size=100000")

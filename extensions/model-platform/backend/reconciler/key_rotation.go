@@ -161,7 +161,14 @@ func (r *KeyRotator) rotateLocked(ctx context.Context, db *gorm.DB, tenantID, op
 		// the record already names the new key and revoking it would leave the tenant on a dead credential.
 		verifyCtx, cancelVerify := context.WithTimeout(context.Background(), rotationCleanupTimeout)
 		defer cancelVerify()
-		if committed, getErr := r.reconcileDAO.GetByTenantID(verifyCtx, db, tenantID); getErr == nil && committed.KeyHash == newHash {
+		committed, getErr := r.reconcileDAO.GetByTenantID(verifyCtx, db, tenantID)
+		switch {
+		case getErr != nil:
+			// A failed read proves nothing, and a dropped connection makes it likely. Keep the new key and the
+			// dirty marker: the sweeper converges on whatever the record names, the new key if the commit went
+			// through and the old one if it did not.
+			return nil, fmt.Errorf("could not confirm whether the rotation committed, the key sweeper will converge the tenant: %w", err)
+		case committed.KeyHash == newHash:
 			err = nil
 		}
 	}
