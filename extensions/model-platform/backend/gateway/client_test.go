@@ -93,6 +93,39 @@ func TestClient_GenerateKey(t *testing.T) {
 	}
 }
 
+func TestClient_ListModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+			t.Errorf("expected GET /v1/models, got %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o-mini"},{"id":"deepseek-v3"}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+
+	names, err := client.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels failed: %v", err)
+	}
+	if len(names) != 2 || names[0] != "gpt-4o-mini" || names[1] != "deepseek-v3" {
+		t.Errorf("unexpected model names: %v", names)
+	}
+}
+
+func TestClient_ListModels_GatewayError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	client := NewClient(GatewayConfig{BaseURL: server.URL})
+	if _, err := client.ListModels(context.Background()); err == nil {
+		t.Fatal("expected error when gateway rejects the request")
+	}
+}
+
 func TestClient_UpdateKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/key/update" {

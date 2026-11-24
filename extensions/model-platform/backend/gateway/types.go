@@ -93,6 +93,13 @@ type KeyInfo struct {
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
+// ListModelsResponse represents response from the OpenAI-compatible LiteLLM /v1/models endpoint.
+type ListModelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
 // SpendLogQueryParams defines filter and pagination parameters for querying LiteLLM spend logs.
 type SpendLogQueryParams struct {
 	StartDate string `json:"start_date,omitempty"` // Format: YYYY-MM-DD or RFC3339

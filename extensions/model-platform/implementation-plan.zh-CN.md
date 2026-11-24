@@ -39,6 +39,7 @@
   - [5.3 显式意图记录消除默认值粘性误判 (Explicit Preference Provenance)](#53-显式意图记录消除默认值粘性误判-explicit-preference-provenance)
   - [5.4 向量模型三段式生命周期与存量知识库保护 (3-Tier Lifecycle for Embedding Models)](#54-向量模型三段式生命周期与存量知识库保护-3-tier-lifecycle-for-embedding-models)
   - [5.5 知识库向量空间绝对不可变性与废弃模型准入防御 (DatasetEmbeddingGuardMiddleware)](#55-知识库向量空间绝对不可变性与废弃模型准入防御-datasetembeddingguardmiddleware)
+  - [5.6 模型上架向全部租户扇出同步 (Model Onboarding Fan-out)](#56-模型上架向全部租户扇出同步-model-onboarding-fan-out)
 - [6. 维度五：用量计量与对账系统设计](#6-维度五用量计量与对账设计-usage-metering--reconciliation)
   - [6.1 网关权威 Spend Log 原始日志暂存去重](#63-两层对账流水线与原始日志暂存去重-two-tier-idempotent-metering-pipeline)
   - [6.2 48 小时覆盖重算日账单流水线](#幂等聚合-sql-规范)
@@ -514,6 +515,28 @@ stateDiagram-v2
   }
   ```
 - 彻底保障底层向量空间的几何一致性与生命周期防御闭环。
+
+### 5.6 模型上架向全部租户扇出同步 (Model Onboarding Fan-out)
+管理员通过 `POST /api/v1/admin/model-platform/models` 一次性上架模型（`model_name`，`model_type` 为 `ModelType` 位标志：chat、embedding 或 rerank）。模型必须已由网关路由，上架时通过 `GET /v1/models` 校验，因此上游供应商凭据不会经过 RAGFlow。
+
+```mermaid
+flowchart LR
+    Admin["POST models"] --> Tx["单个事务"]
+    Tx --> Cat["platform_managed_model"]
+    Tx --> Task["platform_model_publish_task"]
+    Tx --> Items["platform_model_publish_item<br>每个 Ready 租户一条"]
+    Sweep["Worker 补扫"] -->|"缺少该模型的 Ready 租户"| Items
+    Items --> Worker["扇出 Worker"]
+    Worker --> GW["1. 重建虚拟 Key 白名单<br>已有模型 + 新模型"]
+    GW --> DB["2. 写入 tenant_model<br>status=active, is_managed=true"]
+```
+
+- **先网关、后数据库**：Worker 在两步之间中断时，Key 只是多放行了租户暂时看不到的模型；反过来则会出现 UI 可见但网关拒绝的模型。LiteLLM `/key/update` 会整体替换 `models` 列表，因此白名单始终由活跃的 `tenant_model` 加新模型重建（`reconciler.IncludeModelInWhitelist`），并与 Embedding 生命周期共用同一把实例级锁。
+- **乐观锁认领**：每个条目通过 `UPDATE ... WHERE version = ? AND status = 'pending'` 认领，多副本可同时运行 Worker。`running` 超过 2 分钟未更新的条目会回到 `pending`。失败按 Tier 2 退避重试，20 次后置为 `failed`，等待 `POST .../publish/tasks/:id/retry`。
+- **水平触发补扫**：每轮为仍缺少活跃目录模型的 Ready 租户补建条目，覆盖发布请求之后才变为 Ready 的租户。租户已有任意状态的 `tenant_model` 记录时跳过，已下架的模型不会被复活。
+- **进度**：`GET .../publish/tasks/:id` 按状态统计条目（total、succeeded、pending、failed），推导任务状态（`running`、`completed`、`partial_failed`），并列出失败租户及最后一次错误。
+- **幂等**：重复上架同一模型只会为仍缺少它的租户建条目；目录项已停用，或同名模型的 `model_type` 不同，返回 409。
+- **不改默认模型**：上架不会改变任何租户或用户的默认模型。
 
 ---
 

@@ -20,6 +20,7 @@ type Client interface {
 	UpdateKey(ctx context.Context, req *UpdateKeyRequest) (*UpdateKeyResponse, error)
 	DeleteKey(ctx context.Context, keys []string) (*DeleteKeyResponse, error)
 	GetKeyInfo(ctx context.Context, key string) (*KeyInfoResponse, error)
+	ListModels(ctx context.Context) ([]string, error)
 	GetSpendLogs(ctx context.Context, params SpendLogQueryParams) ([]SpendLogEntry, error)
 	HealthCheck(ctx context.Context) error
 }
@@ -143,6 +144,20 @@ func (c *litellmClient) GetKeyInfo(ctx context.Context, key string) (*KeyInfoRes
 	}
 
 	return &resp, nil
+}
+
+// ListModels returns the model names currently routable through the gateway (GET /v1/models).
+func (c *litellmClient) ListModels(ctx context.Context) ([]string, error) {
+	var resp ListModelsResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/v1/models", nil, &resp); err != nil {
+		return nil, fmt.Errorf("failed to list gateway models: %w", err)
+	}
+
+	names := make([]string, 0, len(resp.Data))
+	for _, m := range resp.Data {
+		names = append(names, m.ID)
+	}
+	return names, nil
 }
 
 // GetSpendLogs retrieves raw invocation spend logs from the LiteLLM proxy within a given date range or filter.
