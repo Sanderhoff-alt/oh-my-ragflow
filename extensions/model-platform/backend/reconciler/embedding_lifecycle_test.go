@@ -363,27 +363,6 @@ func TestEmbeddingLifecycle_SweepTombstoneCandidates(t *testing.T) {
 	}
 }
 
-func TestEmbeddingLifecycle_FilterAvailableForCreation(t *testing.T) {
-	models := []rentity.TenantModel{
-		{ID: "m1", ModelName: "active-embd", Status: "active", Extra: `{"is_managed":true}`},
-		{ID: "m2", ModelName: "deprecated-embd", Status: "active", Extra: `{"is_managed":true,"deprecated":true,"read_only":true}`},
-		{ID: "m3", ModelName: "disabled-embd", Status: "disabled", Extra: `{"is_managed":true,"tombstoned":true}`},
-		{ID: "m4", ModelName: "active-chat", Status: "active", Extra: `{}`},
-		{ID: "m5", ModelName: "nested-meta-embd", Status: "active", Extra: `{"deprecated":false,"metadata":{"deprecated":true}}`},
-		{ID: "m6", ModelName: "deprecated-only", Status: "active", Extra: `{"is_managed":true,"deprecated":true}`},
-		{ID: "m7", ModelName: "readonly-only", Status: "active", Extra: `{"is_managed":true,"read_only":true}`},
-	}
-
-	filtered := FilterAvailableForCreation(models)
-
-	if len(filtered) != 3 {
-		t.Fatalf("expected 3 available models (m1, m4, m5), got %d", len(filtered))
-	}
-	if filtered[0].ID != "m1" || filtered[1].ID != "m4" || filtered[2].ID != "m5" {
-		t.Errorf("unexpected filtered models: %+v", filtered)
-	}
-}
-
 func TestEmbeddingLifecycle_ReactivateEmbeddingModel(t *testing.T) {
 	ctx := context.Background()
 	db := setupTestDB(t)

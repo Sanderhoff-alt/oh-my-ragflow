@@ -245,12 +245,18 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 	// 5. Persist managed provider, instance, and models in local database transaction
 	persistErr := silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// A. TenantModelProvider
+		ownerUserID, err := resolveTenantOwnerUserID(tx, tenantID)
+		if err != nil {
+			return err
+		}
+
 		var provider rentity.TenantModelProvider
-		err := tx.Where("tenant_id = ? AND provider_name = ?", tenantID, ProviderOpenAIAPICompatible).
+		err = tx.Where("tenant_id = ? AND user_id = ? AND provider_name = ?", tenantID, ownerUserID, ProviderOpenAIAPICompatible).
 			First(&provider).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			provider = rentity.TenantModelProvider{
 				ID:           generateID(),
+				UserID:       ownerUserID,
 				TenantID:     tenantID,
 				ProviderName: ProviderOpenAIAPICompatible,
 			}
@@ -262,9 +268,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		}
 
 		// B. TenantModelInstance
-		extraMap := map[string]interface{}{
-			"base_url":   r.baseURL,
-			"is_managed": true,
+		// Upstream parses TenantModelInstance.Extra as map[string]string across provider
+		// listing, model factory, agent, and ingestion paths, so every value must be a string.
+		// OpenAI-API-Compatible URL suffixes omit "/v1", so normalize the gateway URL with "/v1".
+		extraMap := map[string]string{
+			"base_url":   normalizeOpenAIBaseURL(r.baseURL),
+			"is_managed": "true",
 		}
 		extraBytes, _ := json.Marshal(extraMap)
 		extraJSON := string(extraBytes)
@@ -434,6 +443,34 @@ func newTenantKeyRequest(tenantID string, models []string) *gateway.GenerateKeyR
 		UserID:  tenantID,
 		Models:  models,
 	}
+}
+
+// resolveTenantOwnerUserID returns the active owner's user_id for tenantID,
+// falling back to tenantID when no owner membership exists yet (community tenants use tenantID == userID).
+func resolveTenantOwnerUserID(tx *gorm.DB, tenantID string) (string, error) {
+	var owners []rentity.UserTenant
+	err := tx.Where("tenant_id = ? AND role = ? AND (status IS NULL OR status = ?)", tenantID, "owner", "1").
+		Limit(1).Find(&owners).Error
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve tenant owner for %s: %w", tenantID, err)
+	}
+	if len(owners) > 0 && strings.TrimSpace(owners[0].UserID) != "" {
+		return strings.TrimSpace(owners[0].UserID), nil
+	}
+	return tenantID, nil
+}
+
+// normalizeOpenAIBaseURL ensures the OpenAI-API-Compatible instance base_url ends with "/v1"
+// while keeping gateway management calls on the versionless root URL.
+func normalizeOpenAIBaseURL(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmed == "" {
+		trimmed = DefaultGatewayBaseURL
+	}
+	if strings.HasSuffix(strings.ToLower(trimmed), "/v1") {
+		return trimmed
+	}
+	return trimmed + "/v1"
 }
 
 func generateID() string {

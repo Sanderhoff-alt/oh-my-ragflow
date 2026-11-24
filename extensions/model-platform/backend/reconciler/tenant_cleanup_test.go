@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"ragflow/extensions/model-platform/backend/dao"
 	"ragflow/extensions/model-platform/backend/entity"
-	"ragflow/extensions/model-platform/backend/event"
 	"ragflow/extensions/model-platform/backend/gateway"
 	rentity "ragflow/internal/entity"
 )
@@ -111,52 +109,6 @@ func TestTenantDecommissioner_Idempotency(t *testing.T) {
 	// Exactly 1 delete key call
 	if deletedCount != 1 {
 		t.Errorf("expected exactly 1 key delete invocation, got %d", deletedCount)
-	}
-}
-
-func TestTenantDecommissioner_EventSubscription(t *testing.T) {
-	db := setupTestDB(t)
-	bus := event.NewEventBus(100)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bus.Start(ctx)
-	defer bus.Stop()
-
-	mockClient := newMockGatewayClient()
-	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
-	decommissioner := NewTenantDecommissioner(mockClient)
-
-	unsub := decommissioner.RegisterWithEventBus(bus, db)
-	defer unsub()
-
-	tenantID := "tenant-decom-event"
-	createTestTenantInDB(db, tenantID)
-	_ = rec.Reconcile(ctx, db, tenantID)
-
-	// Publish TenantDeleted event
-	bus.Publish(event.NewTenantDeletedEvent(tenantID))
-
-	// Wait for event delivery and decommissioning
-	deadline := time.Now().Add(2 * time.Second)
-	rdao := dao.NewReconcileDAO()
-	for time.Now().Before(deadline) {
-		state, err := rdao.GetByTenantID(ctx, db, tenantID)
-		if err == nil && state.Status == entity.StatusDeleted {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	state, err := rdao.GetByTenantID(ctx, db, tenantID)
-	if err != nil || state.Status != entity.StatusDeleted {
-		t.Fatalf("expected tenant to be deleted via event, got status: %v", state.Status)
-	}
-
-	mockClient.mu.Lock()
-	deletedCount := len(mockClient.deletedKeys)
-	mockClient.mu.Unlock()
-	if deletedCount != 1 {
-		t.Errorf("expected virtual key revoked, got deletedCount: %d", deletedCount)
 	}
 }
 

@@ -650,23 +650,6 @@ func (m *EmbeddingLifecycleManager) SweepTombstoneCandidates(
 	return tombstoned, errors.Join(errs...)
 }
 
-// FilterAvailableForCreation filters a list of TenantModel records, excluding any model
-// that is disabled, deprecated, read-only, or tombstoned, ensuring only healthy active models
-// are presented for new knowledgebase creation.
-func FilterAvailableForCreation(models []rentity.TenantModel) []rentity.TenantModel {
-	var available []rentity.TenantModel
-	for _, m := range models {
-		if m.Status != "active" {
-			continue
-		}
-		if isDeprecatedOrReadOnly(m.Extra) {
-			continue
-		}
-		available = append(available, m)
-	}
-	return available
-}
-
 func parseExtraMap(extraJSON string) map[string]interface{} {
 	m := make(map[string]interface{})
 	if extraJSON == "" {
@@ -688,21 +671,4 @@ func isDeprecated(extraJSON string) bool {
 	m := parseExtraMap(extraJSON)
 	v, ok := m["deprecated"].(bool)
 	return ok && v
-}
-
-func isDeprecatedOrReadOnly(extraJSON string) bool {
-	if extraJSON == "" {
-		return false
-	}
-	m := parseExtraMap(extraJSON)
-	if dep, ok := m["deprecated"].(bool); ok && dep {
-		return true
-	}
-	if ro, ok := m["read_only"].(bool); ok && ro {
-		return true
-	}
-	if tomb, ok := m["tombstoned"].(bool); ok && tomb {
-		return true
-	}
-	return false
 }

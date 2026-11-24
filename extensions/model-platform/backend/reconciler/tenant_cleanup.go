@@ -8,7 +8,6 @@ import (
 
 	"ragflow/extensions/model-platform/backend/dao"
 	"ragflow/extensions/model-platform/backend/entity"
-	"ragflow/extensions/model-platform/backend/event"
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
@@ -28,16 +27,6 @@ func NewTenantDecommissioner(client GatewayKeyClient) *TenantDecommissioner {
 		gatewayClient: client,
 		reconcileDAO:  dao.NewReconcileDAO(),
 	}
-}
-
-// RegisterWithEventBus binds the decommissioner to listen for TenantDeleted events.
-func (d *TenantDecommissioner) RegisterWithEventBus(bus *event.EventBus, db *gorm.DB) func() {
-	if bus == nil || db == nil {
-		return func() {}
-	}
-	return bus.Subscribe(event.TenantDeleted, func(ctx context.Context, evt event.TenantLifecycleEvent) error {
-		return d.DecommissionTenant(ctx, db, evt.TenantID)
-	})
 }
 
 // DecommissionTenant physically revokes every gateway virtual key of the tenant,

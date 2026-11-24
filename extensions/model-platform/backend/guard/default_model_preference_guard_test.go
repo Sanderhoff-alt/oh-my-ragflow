@@ -70,6 +70,7 @@ func setupPreferenceServer(db *gorm.DB, mutate func(db *gorm.DB, userID string))
 	}
 	r.PATCH("/api/v1/models/default", handler)
 	r.PATCH("/api/v1/models", handler)
+	r.PATCH("/api/v1/users/me/models", handler)
 	r.GET("/api/v1/models/default", handler)
 	r.PATCH("/api/v1/models/groups", handler)
 	return r
@@ -245,5 +246,43 @@ func TestDefaultModelPreference_TTSAndDecisionObservedAsExplicit(t *testing.T) {
 		if res.PreservedCount != 1 || res.UpgradedCount != 0 {
 			t.Errorf("model type %d: expected sticky preservation, got %+v", modelType, res)
 		}
+	}
+}
+
+func TestDefaultModelPreference_UsersMeModelsAndEmptyTenantIDFallback(t *testing.T) {
+	db := setupPreferenceTestDB(t)
+	const userID = "community-user-1"
+	ut := rentity.UserTenant{ID: "ut-" + userID, UserID: userID, TenantID: userID, Role: "owner", LLMID: platformChat}
+	if err := db.Create(&ut).Error; err != nil {
+		t.Fatalf("seed user_tenant: %v", err)
+	}
+	if err := reconciler.NewStickyGuard().RecordPlatformDefault(
+		context.Background(), db, userID, userID, int(rentity.ModelTypeChat), platformChat,
+	); err != nil {
+		t.Fatalf("record platform default: %v", err)
+	}
+
+	// Simulate real upstream AuthMiddleware where resolveUserAuthTenant returns "" so
+	// c.GetString("tenant_id") is empty and only user_id is populated.
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "")
+		c.Set("user_id", userID)
+		c.Next()
+	})
+	r.Use(DefaultModelPreferenceMiddleware(db))
+	r.PATCH("/api/v1/users/me/models", func(c *gin.Context) {
+		db.Model(&rentity.UserTenant{}).Where("tenant_id = ? AND user_id = ?", userID, userID).Update("llm_id", userChat)
+		c.JSON(http.StatusOK, gin.H{"code": 0})
+	})
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/users/me/models", strings.NewReader("{}"))
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	var pref mpentity.UserDefaultPreference
+	res := db.Where("tenant_id = ? AND user_id = ? AND model_type = ?", userID, userID, int(rentity.ModelTypeChat)).Limit(1).Find(&pref)
+	if res.RowsAffected == 0 || pref.Origin != mpentity.OriginUserExplicit || pref.CurrentModelID != userChat {
+		t.Fatalf("expected user_explicit pref via /users/me/models with user_id fallback, got rows=%d pref=%+v", res.RowsAffected, pref)
 	}
 }

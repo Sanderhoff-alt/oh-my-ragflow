@@ -1018,3 +1018,49 @@ func TestManagedProviderGuard_DatabaseBackedChecks(t *testing.T) {
 		})
 	}
 }
+
+func TestManagedProviderGuardMiddleware_UserIDFallbackWhenTenantIDEmpty(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	if err := db.AutoMigrate(&entity.TenantModelProvider{}, &entity.TenantModelInstance{}); err != nil {
+		t.Fatalf("failed to auto migrate: %v", err)
+	}
+
+	// Tenant A has a managed OpenAI-API-Compatible instance; Tenant B has only a self-owned one.
+	db.Create(&entity.TenantModelProvider{ID: "prov-a", TenantID: "user-a", UserID: "user-a", ProviderName: "OpenAI-API-Compatible"})
+	db.Create(&entity.TenantModelInstance{ID: "inst-a-managed", ProviderID: "prov-a", InstanceName: "platform", Extra: `{"is_managed":"true"}`})
+	db.Create(&entity.TenantModelProvider{ID: "prov-b", TenantID: "user-b", UserID: "user-b", ProviderName: "OpenAI-API-Compatible"})
+	db.Create(&entity.TenantModelInstance{ID: "inst-b-custom", ProviderID: "prov-b", InstanceName: "my-custom", Extra: `{"is_managed":"false"}`})
+
+	origDB := dao.DB
+	dao.DB = db
+	defer func() { dao.DB = origDB }()
+
+	runDelete := func(userID string) int {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			c.Set("tenant_id", "")
+			c.Set("user_id", userID)
+			c.Next()
+		})
+		r.Use(ManagedProviderGuardMiddleware())
+		r.DELETE("/api/v1/providers/:provider_id_or_name", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"deleted": c.Param("provider_id_or_name")})
+		})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/providers/OpenAI-API-Compatible", nil)
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if code := runDelete("user-a"); code != http.StatusForbidden {
+		t.Fatalf("expected user-a managed provider deletion to be blocked (403), got %d", code)
+	}
+	if code := runDelete("user-b"); code != http.StatusOK {
+		t.Fatalf("expected user-b self-owned provider deletion to be allowed (200) via user_id tenant isolation, got %d", code)
+	}
+}

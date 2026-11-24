@@ -343,14 +343,24 @@ func TestSecurityStability_EmbeddingDeprecationReadOnlySearch(t *testing.T) {
 		t.Fatal("expected model to remain allowed in gateway during deprecation")
 	}
 
-	// Verify model is excluded from new KB creation list
-	allModels := []rentity.TenantModel{
-		{ModelName: "text-embedding-3-small", Status: "active", Extra: `{"deprecated":true,"read_only":true}`},
-		{ModelName: "text-embedding-3-large", Status: "active", Extra: `{}`},
-	}
-	available := mpreconciler.FilterAvailableForCreation(allModels)
-	if len(available) != 1 || available[0].ModelName != "text-embedding-3-large" {
-		t.Fatalf("deprecated model was not filtered out from creation list: %+v", available)
+	// Verify creating a new dataset with the deprecated embedding model is blocked by the guard
+	gin.SetMode(gin.TestMode)
+	createRouter := gin.New()
+	createRouter.Use(func(c *gin.Context) {
+		c.Set("tenant_id", tenantID)
+		c.Next()
+	})
+	createRouter.Use(guard.DatasetImmutabilityGuardMiddleware(db))
+	createRouter.POST("/api/v1/datasets", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"code": 0})
+	})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/datasets", strings.NewReader(`{"name":"New KB","embedding_model":"text-embedding-3-small"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	createRouter.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 when creating KB with deprecated model, got %d (body: %s)", createW.Code, createW.Body.String())
 	}
 
 	// Verify existing Knowledgebase can STILL perform vector search / embedding calls

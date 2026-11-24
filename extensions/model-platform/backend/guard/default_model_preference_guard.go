@@ -37,8 +37,8 @@ func DefaultModelPreferenceMiddleware(customDB ...*gorm.DB) gin.HandlerFunc {
 		if len(customDB) > 0 && customDB[0] != nil {
 			db = customDB[0]
 		}
-		tenantID := c.GetString("tenant_id")
-		userID := c.GetString("user_id")
+		tenantID := resolveRequestTenantID(c)
+		userID := strings.TrimSpace(c.GetString("user_id"))
 		if db == nil || tenantID == "" || userID == "" {
 			c.Next()
 			return
@@ -80,7 +80,17 @@ func isDefaultModelUpdateRoute(c *gin.Context) bool {
 		p = c.Request.URL.Path
 	}
 	p = strings.TrimRight(strings.ToLower(p), "/")
-	return p == "/api/v1/models" || p == "/api/v1/models/default"
+	return p == "/api/v1/models" || p == "/api/v1/models/default" || p == "/api/v1/users/me/models"
+}
+
+// resolveRequestTenantID returns the authenticated tenant ID from gin.Context,
+// falling back to user_id when AuthMiddleware leaves tenant_id empty (community
+// credentials identify only a user and upstream requireCurrentTenantID uses user_id).
+func resolveRequestTenantID(c *gin.Context) string {
+	if tenantID := strings.TrimSpace(c.GetString("tenant_id")); tenantID != "" {
+		return tenantID
+	}
+	return strings.TrimSpace(c.GetString("user_id"))
 }
 
 // loadDefaultModelSlots returns the user's current default model per managed model type.
