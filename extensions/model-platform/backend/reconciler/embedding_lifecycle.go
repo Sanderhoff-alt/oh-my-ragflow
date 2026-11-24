@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"ragflow/extensions/model-platform/backend/dao"
-	"ragflow/extensions/model-platform/backend/gateway"
 	rentity "ragflow/internal/entity"
 
 	"gorm.io/gorm"
@@ -51,7 +50,6 @@ type EmbeddingLifecycleManager struct {
 	gatewayClient        GatewayKeyClient
 	allowedModels        []string
 	modelLocks           sync.Map
-	gatewayLocks         sync.Map
 	onBeforeTombstone    func(tenantID, modelName string)
 	onBeforeTombstoneDB  func(tenantID, modelName string)
 	onBeforeDeprecateDB  func(tenantID, modelName string)
@@ -84,17 +82,8 @@ func (m *EmbeddingLifecycleManager) getModelLock(tenantID, modelName string) *sy
 }
 
 func (m *EmbeddingLifecycleManager) getGatewayLock(instanceID string) *sync.Mutex {
-	val, _ := m.gatewayLocks.LoadOrStore(instanceID, &sync.Mutex{})
-	return val.(*sync.Mutex)
+	return instanceWhitelistMutex(instanceID)
 }
-
-type gatewayOverride int
-
-const (
-	gatewayOverrideNone gatewayOverride = iota
-	gatewayOverrideInclude
-	gatewayOverrideExclude
-)
 
 func (m *EmbeddingLifecycleManager) reconcileGatewayWhitelistLocked(
 	ctx context.Context,
@@ -103,55 +92,8 @@ func (m *EmbeddingLifecycleManager) reconcileGatewayWhitelistLocked(
 	overrideModel string,
 	overrideMode gatewayOverride,
 ) error {
-	var activeModels []rentity.TenantModel
-	if err := db.WithContext(ctx).Where("instance_id = ? AND status = ?", instance.ID, "active").
-		Find(&activeModels).Error; err != nil {
-		return fmt.Errorf("failed to query active models for gateway key update: %w", err)
-	}
-
-	modelSet := make(map[string]struct{})
-	hasActiveEmbedding := false
-	for _, am := range activeModels {
-		if overrideMode == gatewayOverrideExclude && am.ModelName == overrideModel {
-			continue
-		}
-		modelSet[am.ModelName] = struct{}{}
-		if am.ModelType == int(rentity.ModelTypeEmbedding) {
-			hasActiveEmbedding = true
-		}
-	}
-	if overrideMode == gatewayOverrideInclude && overrideModel != "" {
-		modelSet[overrideModel] = struct{}{}
-		hasActiveEmbedding = true
-	}
-
-	var whitelist []string
-	if m.isPermitted("platform/chat") {
-		whitelist = append(whitelist, "platform/chat")
-	}
-	if hasActiveEmbedding && m.isPermitted("platform/embedding") {
-		whitelist = append(whitelist, "platform/embedding")
-	}
-	for mName := range modelSet {
-		if m.isPermitted(mName) {
-			whitelist = append(whitelist, mName)
-		}
-	}
-
-	if len(whitelist) == 0 {
-		whitelist = []string{RevokedModelPlaceholder}
-	}
-
-	updateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	if _, err := m.gatewayClient.UpdateKey(updateCtx, &gateway.UpdateKeyRequest{
-		Key:    instance.APIKey,
-		Models: whitelist,
-	}); err != nil {
-		return fmt.Errorf("failed to update gateway virtual key whitelist: %w", err)
-	}
-	return nil
+	return rebuildGatewayWhitelist(ctx, db, m.gatewayClient, m.allowedModels, instance,
+		overrideModel, int(rentity.ModelTypeEmbedding), overrideMode)
 }
 
 func (m *EmbeddingLifecycleManager) reconcileGatewayWhitelist(

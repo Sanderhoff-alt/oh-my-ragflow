@@ -118,6 +118,9 @@ func (m *mockAdminGatewayClient) DeleteKeyByAlias(ctx context.Context, alias str
 func (m *mockAdminGatewayClient) GetKeyInfo(ctx context.Context, key string) (*gateway.KeyInfoResponse, error) {
 	return nil, nil
 }
+func (m *mockAdminGatewayClient) ListModels(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
 func (m *mockAdminGatewayClient) GetSpendLogs(ctx context.Context, params gateway.SpendLogQueryParams) ([]gateway.SpendLogEntry, error) {
 	return nil, nil
 }

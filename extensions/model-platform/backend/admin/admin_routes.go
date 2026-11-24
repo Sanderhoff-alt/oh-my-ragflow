@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"ragflow/extensions/model-platform/backend/gateway"
+	"ragflow/extensions/model-platform/backend/publisher"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -15,18 +16,24 @@ func SetupModelPlatformAdminMiddleware(engine *gin.Engine) {
 	// Placeholder for admin-specific middleware if needed.
 }
 
+// resolveGatewayClient returns gwClient, or a client built from the LITELLM_* environment, or nil when neither is configured.
+func resolveGatewayClient(gwClient gateway.Client) gateway.Client {
+	if gwClient != nil {
+		return gwClient
+	}
+	baseURL := os.Getenv("LITELLM_BASE_URL")
+	if baseURL == "" {
+		return nil
+	}
+	return gateway.NewClient(gateway.GatewayConfig{
+		BaseURL:   baseURL,
+		MasterKey: os.Getenv("LITELLM_MASTER_KEY"),
+	})
+}
+
 // AdminHealthHandler returns health status of the model platform admin service and optionally downstream gateway.
 func AdminHealthHandler(gwClient gateway.Client) gin.HandlerFunc {
-	client := gwClient
-	if client == nil {
-		baseURL := os.Getenv("LITELLM_BASE_URL")
-		if baseURL != "" {
-			client = gateway.NewClient(gateway.GatewayConfig{
-				BaseURL:   baseURL,
-				MasterKey: os.Getenv("LITELLM_MASTER_KEY"),
-			})
-		}
-	}
+	client := resolveGatewayClient(gwClient)
 
 	return func(c *gin.Context) {
 		status := gin.H{
@@ -62,9 +69,20 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 		return
 	}
 
+	client := resolveGatewayClient(gwClient)
+	var pub *publisher.Publisher
+	if client != nil {
+		pub = publisher.New(client)
+	}
+
 	modelPlatform := protected.Group("/model-platform")
 	{
 		modelPlatform.GET("/health", AdminHealthHandler(gwClient))
+
+		// Model onboarding: catalog entry plus rollout to all tenants, with progress and retry
+		modelPlatform.POST("/models", PublishModelHandler(pub, customDB...))
+		modelPlatform.GET("/models/publish/tasks/:id", GetPublishTaskHandler(customDB...))
+		modelPlatform.POST("/models/publish/tasks/:id/retry", RetryPublishTaskHandler(customDB...))
 
 		// Metering and billing management endpoints
 		modelPlatform.GET("/usage/daily", GetDailyUsageHandler(customDB...))

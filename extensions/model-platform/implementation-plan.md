@@ -38,6 +38,7 @@ English | [简体中文](implementation-plan.zh-CN.md)
   - [5.2 Explicit Preference Tracking & Sticky Guard](#52-explicit-preference-tracking--sticky-guard)
   - [5.3 Three-Stage Embedding Lifecycle Protection](#53-three-stage-embedding-lifecycle-protection)
   - [5.4 Dataset Vector Space Immutability & Deprecated Model Guard (DatasetEmbeddingGuardMiddleware)](#54-dataset-vector-space-immutability--deprecated-model-guard-datasetembeddingguardmiddleware)
+  - [5.5 Model Onboarding Fan-out to All Tenants](#55-model-onboarding-fan-out-to-all-tenants)
 - [6. Dimension 5: Metering & Authoritative Reconciliation Pipeline](#6-dimension-5-metering--authoritative-reconciliation-pipeline)
   - [6.1 Authoritative Gateway Spend Logs & Raw Staging Deduplication](#61-authoritative-gateway-spend-logs--raw-staging-deduplication)
   - [6.2 48-Hour Rolling Lookback Replacement Upsert Pipeline](#62-48-hour-rolling-lookback-replacement-upsert-pipeline)
@@ -377,6 +378,28 @@ stateDiagram-v2
 - **Creation Guard**: Blocks binding to retired/deprecated embedding models (either explicitly requested or resolved from tenant default). Returns HTTP 400 Bad Request.
 - **Empty Dataset Mutation Guard**: Blocks switching an empty dataset's embedding model to a retired/deprecated model. Returns HTTP 400 Bad Request.
 - **Non-Empty Immutability Guard**: If the dataset contains parsed documents or chunks (`chunk_num > 0 || doc_num > 0`) and the request mutates `embedding_model`, it aborts with HTTP 400 Bad Request.
+
+### 5.5 Model Onboarding Fan-out to All Tenants
+An administrator onboards a model once with `POST /api/v1/admin/model-platform/models` (`model_name`, `model_type` as `ModelType` bit flags: chat, embedding or rerank). The model must already be routed by the gateway; onboarding verifies it with `GET /v1/models`, so upstream provider credentials never pass through RAGFlow.
+
+```mermaid
+flowchart LR
+    Admin["POST models"] --> Tx["One transaction"]
+    Tx --> Cat["platform_managed_model"]
+    Tx --> Task["platform_model_publish_task"]
+    Tx --> Items["platform_model_publish_item<br>one per Ready tenant"]
+    Sweep["Worker sweep"] -->|"Ready tenants missing the model"| Items
+    Items --> Worker["Fan-out worker"]
+    Worker --> GW["1. Rebuild virtual key whitelist<br>existing models + new model"]
+    GW --> DB["2. Insert tenant_model<br>status=active, is_managed=true"]
+```
+
+- **Gateway first, database second**: if the worker stops between the two steps, the key allows a model the tenant cannot see yet. The reverse order would show a model that the gateway rejects. LiteLLM `/key/update` replaces the whole `models` list, so the whitelist is always rebuilt from the active `tenant_model` rows plus the new model (`reconciler.IncludeModelInWhitelist`), under the same per-instance lock as the embedding lifecycle.
+- **Optimistic claim**: each item is claimed with `UPDATE ... WHERE version = ? AND status = 'pending'`, so several replicas can run the worker. A `running` item untouched for 2 minutes returns to `pending`. Failures retry with the Tier 2 backoff policy and become `failed` after 20 attempts until `POST .../publish/tasks/:id/retry`.
+- **Level-triggered sweep**: every tick adds items for Ready tenants that still lack an active catalog model, so tenants that become Ready after the request are covered. A tenant with an existing `tenant_model` row in any status is skipped, so a retired model is never resurrected.
+- **Progress**: `GET .../publish/tasks/:id` counts items by status (total, succeeded, pending, failed), derives the task status (`running`, `completed`, `partial_failed`) and lists failed tenants with their last error.
+- **Idempotency**: publishing the same model again only creates items for tenants still missing it. A disabled catalog entry or a different `model_type` for an existing name returns 409.
+- **Defaults are untouched**: onboarding never changes a tenant's or user's default model.
 
 ---
 
