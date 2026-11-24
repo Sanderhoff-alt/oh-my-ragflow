@@ -16,6 +16,18 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+CLEANLINESS_ONLY=false
+if [[ "${1:-}" == "--cleanliness-only" || "${1:-}" == "-c" ]]; then
+    CLEANLINESS_ONLY=true
+elif [[ -n "${1:-}" ]]; then
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: $0 [--cleanliness-only|-c]"
+        exit 0
+    fi
+    echo "FATAL: Unknown option: $1 (supported: --cleanliness-only, -c, --help, -h)" >&2
+    exit 1
+fi
+
 echo -e "${BLUE}======================================================================${NC}"
 echo -e "${BLUE}      Model Platform Non-Invasive Compliance & CI Audit Suite        ${NC}"
 echo -e "${BLUE}======================================================================${NC}"
@@ -74,6 +86,21 @@ if [[ -n "${SUBMODULE_PORCELAIN}" ]]; then
     AUDIT_FAILURES=$((AUDIT_FAILURES + 1))
 else
     echo -e "${GREEN}[PASS] git -C upstream/ragflow status --porcelain: Working tree 100% clean.${NC}"
+fi
+
+# If cleanliness-only check requested, exit immediately after Gate 1
+if [[ "${CLEANLINESS_ONLY}" == "true" ]]; then
+    echo ""
+    echo -e "${BLUE}======================================================================${NC}"
+    if [[ ${AUDIT_FAILURES} -eq 0 ]]; then
+        echo -e "${GREEN}>>> SUBMODULE CLEANLINESS AUDIT: 100% CLEAN & PRISTINE (Exit Code: 0) <<<${NC}"
+        echo -e "${BLUE}======================================================================${NC}"
+        exit 0
+    else
+        echo -e "${RED}>>> SUBMODULE CLEANLINESS AUDIT: FAILED (${AUDIT_FAILURES} issues) (Exit Code: 1) <<<${NC}"
+        echo -e "${BLUE}======================================================================${NC}"
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -136,7 +163,12 @@ has_valid_ee_stub() {
 MISSING_PACKAGES=()
 for pkg in "${REQUIRED_PACKAGES[@]}"; do
     pkg_overlay_dir="${OVERLAY_DIR}/ee-baseline/${pkg}"
-    if ! has_valid_ee_stub "${pkg_overlay_dir}"; then
+    pkg_trampoline_dir="${OVERLAY_DIR}/trampolines/${pkg}"
+    if has_valid_ee_stub "${pkg_overlay_dir}"; then
+        continue
+    elif has_valid_ee_stub "${pkg_trampoline_dir}"; then
+        continue
+    else
         MISSING_PACKAGES+=("${pkg}")
     fi
 done
@@ -148,7 +180,18 @@ if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
     done
     AUDIT_FAILURES=$((AUDIT_FAILURES + 1))
 else
-    echo -e "${GREEN}[PASS] All 19 required packages have verified affirmative //go:build ee stubs.${NC}"
+    echo -e "${GREEN}[PASS] All 19 required packages have verified affirmative //go:build ee stubs or trampolines.${NC}"
+fi
+
+# Check 3.2: Verify router symbol exclusion in ee-baseline
+BASELINE_DIR="${OVERLAY_DIR}/ee-baseline"
+if [[ -d "${BASELINE_DIR}" ]]; then
+    if grep -rqE 'func[[:space:]]+(SetupEERouter|RegisterEE)' "${BASELINE_DIR}" 2>/dev/null; then
+        echo -e "${RED}[FAIL] ${BASELINE_DIR} must NOT declare SetupEERouter or RegisterEE* (reserved for trampolines)!${NC}" >&2
+        AUDIT_FAILURES=$((AUDIT_FAILURES + 1))
+    else
+        echo -e "${GREEN}[PASS] Symbol isolation verified: ee-baseline does not collide with trampolines.${NC}"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

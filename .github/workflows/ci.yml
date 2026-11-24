@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   go-build-and-unit:
-    name: Go build and unit tests
+    name: Enterprise Server Build & Core Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -133,7 +133,7 @@ jobs:
           echo 'Enterprise Go build (RAGFLOW_GO_TAGS=ee) with model-platform overlay and unit tier; upstream integration, API, SDK and model-backed tests are not yet configured.' >> "$GITHUB_STEP_SUMMARY"
 
   web:
-    name: Web build and tests
+    name: Web Frontend Build & Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -177,7 +177,7 @@ jobs:
         run: node ci/run-upstream-web-tests.cjs
 
   model-platform:
-    name: Model Platform Non-Invasive Audit & Integration Tests
+    name: Model Platform Audit & Extension Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -223,7 +223,4 @@ jobs:
         if: always()
         run: docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml down -v
       - name: "Post-run assertion: Verify upstream submodule remains 100% pristine"
-        run: |
-          git -C upstream/ragflow diff --quiet
-          test -z "$(git -C upstream/ragflow status --porcelain)"
-          echo "Upstream submodule verified 100% clean and non-invasive after build and test execution."
+        run: bash extensions/model-platform/scripts/audit-non-invasive.sh --cleanliness-only
