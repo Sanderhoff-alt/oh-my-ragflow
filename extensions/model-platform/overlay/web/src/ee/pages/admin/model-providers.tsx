@@ -56,9 +56,9 @@ function describe(action: Action, model: ManagedModel): string {
     return `${model.model_name} will become available again in every tenant.`;
   }
   if (model.model_type === 2) {
-    return `${model.active_kb_count} knowledge base(s) use ${model.model_name}. Tenants that still have knowledge bases keep it read-only, the others lose it at once.`;
+    return `${model.active_kb_count} knowledge base(s) use ${model.model_name}. Tenants that still have knowledge bases keep it read-only, the others lose it at once. Users who default to it move to the platform default.`;
   }
-  return `${model.model_name} will be disabled in every tenant at once. ${model.active_dialog_count} assistant(s) use it and will ask their owners to pick another model.`;
+  return `${model.model_name} will be disabled in every tenant at once. ${model.active_dialog_count} assistant(s) use it and will ask their owners to pick another model. Users who default to it move to the platform default.`;
 }
 
 function RolloutBanner({ taskId }: { taskId: string }) {

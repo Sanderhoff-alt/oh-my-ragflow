@@ -183,3 +183,106 @@ func TestRetire_ReportsUsersWhoPinnedTheModel(t *testing.T) {
 		t.Errorf("expected only the user who pinned the model to be reported, got %d", res.AffectedUsers)
 	}
 }
+
+func pinUsers(t *testing.T, db *gorm.DB, tenantID, modelRef, tenantModelID string, modelType int, users ...string) {
+	t.Helper()
+	sticky := reconciler.NewStickyGuard()
+	for _, u := range users {
+		id := tenantModelID
+		db.Create(&rentity.UserTenant{ID: "ut-" + u, UserID: u, TenantID: tenantID, Role: "normal", LLMID: modelRef, TenantLLMID: &id})
+		if _, err := sticky.RecordObservedUserChoice(context.Background(), db, tenantID, u, modelType, modelRef, id); err != nil {
+			t.Fatalf("failed to pin user %s: %v", u, err)
+		}
+	}
+}
+
+func TestRetire_MovesUsersWhoPinnedTheModelToThePlatformDefault(t *testing.T) {
+	db := setupPublishDB(t)
+	gw := newFakeGateway("deepseek-v3")
+	chat := int(rentity.ModelTypeChat)
+	seedTenant(t, db, "t1", entity.StatusReady)
+	db.Create(&entity.PlatformManagedModel{ID: "m-gpt", ModelName: "gpt-4o-mini", ModelType: chat, IsDefault: true, Status: entity.ManagedModelStatusActive})
+	w := newTestWorker(db, gw)
+	model := publishAndConverge(t, db, gw, w)
+	pinned := tenantRow(t, db, "t1", "deepseek-v3")
+	pinUsers(t, db, "t1", deepseekRef, pinned.ID, chat, "pinned")
+	db.Create(&rentity.UserTenant{ID: "ut-stays", UserID: "stays", TenantID: "t1", Role: "normal", LLMID: gptRef})
+
+	if _, err := Retire(context.Background(), db, model.ID); err != nil {
+		t.Fatalf("Retire failed: %v", err)
+	}
+	w.RunOnce(context.Background())
+
+	var moved, stays rentity.UserTenant
+	db.Where("user_id = ?", "pinned").First(&moved)
+	db.Where("user_id = ?", "stays").First(&stays)
+	if moved.LLMID != gptRef || moved.TenantLLMID == nil || *moved.TenantLLMID != "tm-t1" {
+		t.Errorf("a user who pinned the tombstoned model must follow the platform default, got %+v", moved)
+	}
+	var pref entity.UserDefaultPreference
+	db.Where("user_id = ?", "pinned").First(&pref)
+	if pref.Origin != entity.OriginPlatformDefault {
+		t.Errorf("a moved user must follow the platform default from now on, got %s", pref.Origin)
+	}
+	if stays.LLMID != gptRef {
+		t.Errorf("a user who never used the retired model must be left alone, got %q", stays.LLMID)
+	}
+}
+
+func TestRetire_ClearsThePinnedDefaultWhenThePlatformHasNone(t *testing.T) {
+	db := setupPublishDB(t)
+	gw := newFakeGateway("deepseek-v3")
+	chat := int(rentity.ModelTypeChat)
+	seedTenant(t, db, "t1", entity.StatusReady)
+	w := newTestWorker(db, gw)
+	model := publishAndConverge(t, db, gw, w)
+	pinUsers(t, db, "t1", deepseekRef, tenantRow(t, db, "t1", "deepseek-v3").ID, chat, "pinned")
+
+	if _, err := Retire(context.Background(), db, model.ID); err != nil {
+		t.Fatalf("Retire failed: %v", err)
+	}
+	w.RunOnce(context.Background())
+
+	var ut rentity.UserTenant
+	db.Where("user_id = ?", "pinned").First(&ut)
+	if ut.LLMID != "" || ut.TenantLLMID != nil {
+		t.Errorf("without a platform default the retired default must be cleared, got %+v", ut)
+	}
+}
+
+func TestRetire_KeepsDefaultsOfADeprecatedEmbeddingUntilItIsTombstoned(t *testing.T) {
+	db := setupPublishDB(t)
+	gw := newFakeGateway("bge-m3")
+	embedding := int(rentity.ModelTypeEmbedding)
+	seedTenant(t, db, "used", entity.StatusReady)
+	w := newTestWorker(db, gw)
+	if _, err := New(gw).Publish(context.Background(), db, Request{ModelName: "bge-m3", ModelType: embedding}); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	w.RunOnce(context.Background())
+	const bgeRef = "bge-m3@platform@OpenAI-API-Compatible"
+	bgeID := tenantRow(t, db, "used", "bge-m3").ID
+	db.Create(&rentity.UserTenant{ID: "ut-pinned", UserID: "pinned", TenantID: "used", Role: "normal", EmbdID: bgeRef, TenantEmbdID: &bgeID})
+	db.Create(&rentity.Knowledgebase{ID: "kb1", TenantID: "used", Name: "kb1", EmbdID: bgeRef})
+	var model entity.PlatformManagedModel
+	db.Where("model_name = ?", "bge-m3").First(&model)
+
+	if _, err := Retire(context.Background(), db, model.ID); err != nil {
+		t.Fatalf("Retire failed: %v", err)
+	}
+	w.RunOnce(context.Background())
+
+	var ut rentity.UserTenant
+	db.Where("user_id = ?", "pinned").First(&ut)
+	if ut.EmbdID != bgeRef {
+		t.Fatalf("a deprecated embedding model is still readable, so the default must stay, got %q", ut.EmbdID)
+	}
+
+	db.Model(&rentity.Knowledgebase{}).Where("id = ?", "kb1").Update("status", "0")
+	w.RunOnce(context.Background())
+
+	db.Where("user_id = ?", "pinned").First(&ut)
+	if ut.EmbdID != "" {
+		t.Errorf("once the model is tombstoned the default must be replaced, got %q", ut.EmbdID)
+	}
+}

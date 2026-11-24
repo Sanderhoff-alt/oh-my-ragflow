@@ -218,8 +218,9 @@ func Reactivate(ctx context.Context, db *gorm.DB, modelID string) (*Result, erro
 	return result, nil
 }
 
-// countPinnedUsers counts the users who explicitly chose the model as their default. A retirement never
-// overwrites such a choice, so the administrator needs to know how many users it will affect.
+// countPinnedUsers counts the users who explicitly chose the model as their default. Once the model is
+// tombstoned in their tenant they are moved to the platform default, so the administrator needs to know
+// how many users a retirement will touch.
 func countPinnedUsers(tx *gorm.DB, model *entity.PlatformManagedModel) (int64, error) {
 	if !tx.Migrator().HasTable(&entity.UserDefaultPreference{}) {
 		return 0, nil

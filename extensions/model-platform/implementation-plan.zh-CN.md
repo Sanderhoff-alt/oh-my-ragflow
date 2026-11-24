@@ -543,7 +543,7 @@ flowchart LR
 | retired | chat、rerank 等 | 任意 | `disabled` + `tombstoned` | 移除 |
 
 - **先网关、后数据库**：Worker 在两步之间中断时，Key 只是多放行了租户暂时看不到的模型；反过来则会出现 UI 可见但网关拒绝的模型。LiteLLM `/key/update` 会整体替换 `models` 列表，因此白名单始终由活跃的 `tenant_model` 重建（`reconciler.IncludeModelInWhitelist`）。`tenant_model_instance` 行锁负责跨副本串行，进程内互斥锁与 Embedding 生命周期共用。
-- **下架与重新激活**：`POST /models/:id/retire` 和 `/reactivate` 翻转目录状态并返回 202 与任务。Worker 处理条目时读取当时的目录状态，因此过期请求排下的条目会跟随最新意图。Embedding 使用 `EmbeddingLifecycleManager`（租户仍有知识库时为 deprecated，之后由补扫转为 tombstoned），其他模型使用 `NonEmbeddingLifecycleManager`（直接 tombstoned）。某类型的平台默认模型不能下架，已显式选择该模型的用户保留其选择，下架响应会报告人数。
+- **下架与重新激活**：`POST /models/:id/retire` 和 `/reactivate` 翻转目录状态并返回 202 与任务。Worker 处理条目时读取当时的目录状态，因此过期请求排下的条目会跟随最新意图。Embedding 使用 `EmbeddingLifecycleManager`（租户仍有知识库时为 deprecated，之后由补扫转为 tombstoned），其他模型使用 `NonEmbeddingLifecycleManager`（直接 tombstoned）。某类型的平台默认模型不能下架。模型在某个租户中被 tombstoned 后，该租户里默认使用它的用户（包括显式选择它的用户）会被迁移到该类型的平台默认模型并变回 `platform_default`；平台没有默认模型时则清空默认值，因此默认值不会指向一个没人能用的模型。deprecated 的 Embedding 模型仍可读取，其默认值保留，直到补扫将其 tombstoned。下架响应会报告将被迁移的、显式选择过该模型的用户数。
 - **设为默认**：`PUT /models/:id/default` 在一个事务中切换 `is_default`，并为每个 Ready 租户建条目。租户拥有该模型后，`StickyGuard.UpgradeDefaultModel` 用该租户自己的 `tenant_model` id 迁移 `platform_default` 用户，保留 `user_explicit` 用户（#49）。升级与保留人数按条目存储，在任务进度中汇总。
 - **冷启动与新租户**：`Reconcile` 从活跃目录读取 Key 白名单、`tenant_model` 记录和初始用户默认值。目录为空时仍创建托管 provider 和实例，并用拒绝全部的占位符生成 Key，因为 LiteLLM 把空的 `models` 视为不受限。早于目录的部署由 `BackfillManagedCatalog` 一次性收编，旧的 `gpt-4o-mini` 和 `text-embedding-3-small` 继续作为各自类型的默认模型。
 - **乐观锁认领**：每个条目通过 `UPDATE ... WHERE version = ? AND status = 'pending'` 认领，多副本可同时运行 Worker。`running` 超过 2 分钟未更新的条目会回到 `pending`。失败按 Tier 2 退避重试，20 次后置为 `failed`，等待 `POST .../publish/tasks/:id/retry`。

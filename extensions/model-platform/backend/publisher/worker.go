@@ -225,10 +225,28 @@ ORDER BY p.tenant_id LIMIT ?`,
 			return
 		}
 		_ = reconciler.WithInstanceRowLock(ctx, db, c.InstanceID, func() error {
-			_, err := w.embedding.SweepTombstoneCandidates(ctx, db, c.TenantID)
-			return err
+			if _, err := w.embedding.SweepTombstoneCandidates(ctx, db, c.TenantID); err != nil {
+				return err
+			}
+			return w.replaceTombstonedEmbeddingDefaults(ctx, db, c.TenantID, c.InstanceID)
 		})
 	}
+}
+
+// replaceTombstonedEmbeddingDefaults moves the users of the tenant off every retired embedding model that the
+// sweep has just tombstoned.
+func (w *Worker) replaceTombstonedEmbeddingDefaults(ctx context.Context, db *gorm.DB, tenantID, instanceID string) error {
+	var retired []entity.PlatformManagedModel
+	if err := db.Where("status = ? AND model_type = ?", entity.ManagedModelStatusRetired, int(rentity.ModelTypeEmbedding)).
+		Find(&retired).Error; err != nil {
+		return err
+	}
+	for i := range retired {
+		if err := w.replaceRetiredDefaults(ctx, db, tenantID, instanceID, &retired[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // process claims one item, applies it, and records the outcome.
@@ -321,7 +339,7 @@ func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublis
 	}
 
 	if model.Status == entity.ManagedModelStatusRetired {
-		return applyStats{}, w.ensureRetired(ctx, db, item.TenantID, &model, &instance, rows)
+		return applyStats{}, w.retireTenantModel(ctx, db, item.TenantID, &model, &instance, rows)
 	}
 	if err := w.ensureActive(ctx, db, item.TenantID, &model, &provider, &instance, rows); err != nil {
 		return applyStats{}, err
@@ -353,7 +371,7 @@ func (w *Worker) upgradeDefault(
 		return applyStats{}, nil
 	}
 
-	ref := fmt.Sprintf("%s@%s@%s", model.ModelName, reconciler.PlatformInstanceName, reconciler.ProviderOpenAIAPICompatible)
+	ref := managedRef(model.ModelName)
 	res, err := w.sticky.UpgradeDefaultModel(ctx, db, tenantID, model.ModelType, ref, rows[0].ID)
 	if err != nil {
 		return applyStats{}, fmt.Errorf("failed to upgrade the default model: %w", err)
@@ -412,6 +430,80 @@ func (w *Worker) ensureActive(
 			Extra:      string(extra),
 		}).Error
 	})
+}
+
+// retireTenantModel retires the model in one tenant, then moves the users who still default to it once the
+// tenant has lost it for good.
+func (w *Worker) retireTenantModel(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	model *entity.PlatformManagedModel,
+	instance *rentity.TenantModelInstance,
+	rows []rentity.TenantModel,
+) error {
+	if err := w.ensureRetired(ctx, db, tenantID, model, instance, rows); err != nil {
+		return err
+	}
+	return w.replaceRetiredDefaults(ctx, db, tenantID, instance.ID, model)
+}
+
+// replaceRetiredDefaults keeps user defaults from pointing at a model the tenant can no longer use. It only acts
+// on a tombstoned row: a deprecated embedding model stays readable, so users who default to it keep it. Users
+// move to the platform default of the type when the tenant has it, and the default is cleared otherwise.
+func (w *Worker) replaceRetiredDefaults(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	instanceID string,
+	model *entity.PlatformManagedModel,
+) error {
+	var rows []rentity.TenantModel
+	if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instanceID, model.ModelName, model.ModelType).
+		Limit(1).Find(&rows).Error; err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	if _, tombstoned := reconciler.RetirementFlags(rows[0].Extra); !tombstoned {
+		return nil
+	}
+
+	newRef, newTenantModelID := "", ""
+	var defaults []entity.PlatformManagedModel
+	if err := db.Where("model_type = ? AND is_default = ? AND status = ?", model.ModelType, true, entity.ManagedModelStatusActive).
+		Limit(1).Find(&defaults).Error; err != nil {
+		return err
+	}
+	if len(defaults) > 0 {
+		var healthy []rentity.TenantModel
+		if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ? AND status = ?",
+			instanceID, defaults[0].ModelName, defaults[0].ModelType, "active").Limit(1).Find(&healthy).Error; err != nil {
+			return err
+		}
+		if len(healthy) > 0 {
+			if deprecated, tombstoned := reconciler.RetirementFlags(healthy[0].Extra); !deprecated && !tombstoned {
+				newRef = managedRef(defaults[0].ModelName)
+				newTenantModelID = healthy[0].ID
+			}
+		}
+	}
+
+	moved, err := w.sticky.ReplaceRetiredDefault(ctx, db, tenantID, model.ModelType,
+		managedRef(model.ModelName), rows[0].ID, newRef, newTenantModelID)
+	if err != nil {
+		return fmt.Errorf("failed to replace the retired default model: %w", err)
+	}
+	if moved > 0 {
+		slog.Info("retired default model replaced", "tenant_id", tenantID, "model_name", model.ModelName,
+			"model_type", model.ModelType, "replacement", newRef, "users_count", moved)
+	}
+	return nil
+}
+
+func managedRef(modelName string) string {
+	return fmt.Sprintf("%s@%s@%s", modelName, reconciler.PlatformInstanceName, reconciler.ProviderOpenAIAPICompatible)
 }
 
 // ensureRetired retires a tenant row that is still fully active. An embedding model becomes deprecated while
