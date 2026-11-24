@@ -83,6 +83,7 @@ type KeyInfo struct {
 	Token     string                 `json:"token,omitempty"`
 	KeyAlias  string                 `json:"key_alias,omitempty"`
 	KeyName   string                 `json:"key_name,omitempty"`
+	Status    string                 `json:"status,omitempty"`
 	Spend     float64                `json:"spend,omitempty"`
 	MaxBudget *float64               `json:"max_budget,omitempty"`
 	Expires   string                 `json:"expires,omitempty"`

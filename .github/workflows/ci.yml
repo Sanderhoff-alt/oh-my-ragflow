@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   go-build-and-unit:
-    name: Go build and unit tests
+    name: Enterprise Server Build & Core Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -126,9 +126,6 @@ jobs:
         env:
           RAGFLOW_GO_TAGS: ee
         run: ./build.sh --test
-      - name: Run model-platform extension unit tests
-        working-directory: build/ragflow
-        run: CGO_ENABLED=0 go test -v -count=1 -tags ee ./extensions/model-platform/...
       - name: Report scope
         if: always()
         run: |
@@ -136,7 +133,7 @@ jobs:
           echo 'Enterprise Go build (RAGFLOW_GO_TAGS=ee) with model-platform overlay and unit tier; upstream integration, API, SDK and model-backed tests are not yet configured.' >> "$GITHUB_STEP_SUMMARY"
 
   web:
-    name: Web build and tests
+    name: Web Frontend Build & Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -178,3 +175,52 @@ jobs:
         run: npm run build
       - name: Run frontend tests
         run: node ci/run-upstream-web-tests.cjs
+
+  model-platform:
+    name: Model Platform Audit & Extension Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-go@v6
+        id: go
+        with:
+          go-version-file: upstream/ragflow/go.mod
+          cache: false
+      - name: Identify upstream revision
+        id: upstream
+        run: echo "sha=$(git -C upstream/ragflow rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-${{ hashFiles('upstream/ragflow/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-${{ steps.go.outputs.go-version }}-
+            ${{ runner.os }}-${{ runner.arch }}-go-mod-
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-${{ hashFiles('extensions/**', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
+      - name: "Gate Check: Non-invasive compliance audit"
+        run: bash extensions/model-platform/scripts/audit-non-invasive.sh
+      - name: Start LiteLLM and PostgreSQL live test cluster
+        run: bash extensions/model-platform/tests/e2e/setup_env.sh --start
+      - name: Run model-platform backend unit and integration tests
+        working-directory: build/ragflow
+        env:
+          REQUIRE_LIVE_GATEWAY: "true"
+        run: CGO_ENABLED=0 go test -v -count=1 -tags ee ./extensions/model-platform/...
+      - name: Teardown live test cluster
+        if: always()
+        run: docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml down -v
+      - name: "Post-run assertion: Verify upstream submodule remains 100% pristine"
+        run: bash extensions/model-platform/scripts/audit-non-invasive.sh --cleanliness-only
