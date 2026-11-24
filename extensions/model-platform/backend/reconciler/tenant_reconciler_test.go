@@ -86,19 +86,26 @@ func (m *mockGatewayClient) UpdateKey(ctx context.Context, req *gateway.UpdateKe
 	}, nil
 }
 
-func (m *mockGatewayClient) DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error) {
+func (m *mockGatewayClient) DeleteKeyByAlias(ctx context.Context, alias string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.deleteErr != nil {
-		return nil, m.deleteErr
+		return m.deleteErr
 	}
 
-	m.deletedKeys = append(m.deletedKeys, keys...)
-	for _, k := range keys {
-		delete(m.generated, k)
+	found := false
+	for key, req := range m.generated {
+		if req.KeyName == alias {
+			delete(m.generated, key)
+			found = true
+		}
 	}
-	return &gateway.DeleteKeyResponse{DeletedKeys: keys}, nil
+	if !found {
+		return errors.New("gateway returned error status 404: No keys found")
+	}
+	m.deletedKeys = append(m.deletedKeys, alias)
+	return nil
 }
 
 func setupTestDB(t *testing.T) *gorm.DB {

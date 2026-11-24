@@ -179,8 +179,8 @@ func (m *outageMockGateway) UpdateKey(ctx context.Context, req *gateway.UpdateKe
 	return &gateway.UpdateKeyResponse{Key: req.Key}, nil
 }
 
-func (m *outageMockGateway) DeleteKey(ctx context.Context, keys []string) (*gateway.DeleteKeyResponse, error) {
-	return &gateway.DeleteKeyResponse{}, nil
+func (m *outageMockGateway) DeleteKeyByAlias(ctx context.Context, alias string) error {
+	return nil
 }
 
 func TestSecurityStability_GatewayOutageAndSelfHealing(t *testing.T) {

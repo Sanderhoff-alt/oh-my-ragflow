@@ -89,50 +89,17 @@ func (d *TenantDecommissioner) DecommissionTenant(ctx context.Context, db *gorm.
 		return nil
 	}
 
-	// 2. Locate active virtual key from TenantModelInstance
-	var provider rentity.TenantModelProvider
-	var instance rentity.TenantModelInstance
-	var virtualKey string
+	// 2. Revoke the tenant's virtual key from LiteLLM Gateway by its canonical alias
+	revokeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-	err = silentDB.Where("tenant_id = ? AND provider_name = ?", tenantID, ProviderOpenAIAPICompatible).
-		First(&provider).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return fmt.Errorf("failed to query model provider: %w", err)
-	}
-	if err == nil {
-		err = silentDB.Where("provider_id = ? AND instance_name = ?", provider.ID, PlatformInstanceName).
-			First(&instance).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("failed to query model instance: %w", err)
-		}
-		if err == nil {
-			virtualKey = instance.APIKey
+	if err := d.gatewayClient.DeleteKeyByAlias(revokeCtx, tenantKeyAlias(tenantID)); err != nil {
+		if !isKeyNotFound(err) {
+			return fmt.Errorf("failed to revoke virtual key from gateway: %w", err)
 		}
 	}
 
-	// Collect keys/aliases to revoke in LiteLLM Gateway
-	var keysToDelete []string
-	if virtualKey != "" {
-		keysToDelete = append(keysToDelete, virtualKey)
-	} else if rec.GatewayKeyAlias != "" {
-		keysToDelete = append(keysToDelete, rec.GatewayKeyAlias)
-	} else {
-		keysToDelete = append(keysToDelete, fmt.Sprintf("tenant_%s", tenantID))
-	}
-
-	// 3. Revoke virtual key from LiteLLM Gateway
-	if len(keysToDelete) > 0 {
-		revokeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-
-		if _, err := d.gatewayClient.DeleteKey(revokeCtx, keysToDelete); err != nil {
-			if !isKeyNotFound(err) {
-				return fmt.Errorf("failed to revoke virtual key from gateway: %w", err)
-			}
-		}
-	}
-
-	// 4. Update database state in transaction: mark deleted and scrub key
+	// 3. Update database state in transaction: mark deleted and scrub key
 	return silentDB.Transaction(func(tx *gorm.DB) error {
 		// A. Transition Reconcile record to StatusDeleted with conflict resolution
 		_, err := d.reconcileDAO.MarkDeleted(ctx, tx, tenantID, rec.Version)
@@ -146,10 +113,21 @@ func (d *TenantDecommissioner) DecommissionTenant(ctx context.Context, db *gorm.
 			return fmt.Errorf("failed to mark reconcile record deleted: %w", err)
 		}
 
-		// B. Deactivate model instance and scrub raw API key
-		if instance.ID != "" {
+		// B. Deactivate platform model instances and scrub their raw API keys
+		var instanceIDs []string
+		err = tx.Model(&rentity.TenantModelInstance{}).
+			Where("instance_name = ?", PlatformInstanceName).
+			Where("provider_id IN (?)", tx.Model(&rentity.TenantModelProvider{}).
+				Select("id").
+				Where("tenant_id = ? AND provider_name = ?", tenantID, ProviderOpenAIAPICompatible)).
+			Pluck("id", &instanceIDs).Error
+		if err != nil {
+			return fmt.Errorf("failed to query model instances: %w", err)
+		}
+
+		if len(instanceIDs) > 0 {
 			err = tx.Model(&rentity.TenantModelInstance{}).
-				Where("id = ?", instance.ID).
+				Where("id IN ?", instanceIDs).
 				Updates(map[string]interface{}{
 					"status":  "deleted",
 					"api_key": "",
@@ -160,7 +138,7 @@ func (d *TenantDecommissioner) DecommissionTenant(ctx context.Context, db *gorm.
 
 			// C. Deactivate managed models
 			err = tx.Model(&rentity.TenantModel{}).
-				Where("instance_id = ?", instance.ID).
+				Where("instance_id IN ?", instanceIDs).
 				Update("status", "deleted").Error
 			if err != nil {
 				return fmt.Errorf("failed to deactivate models: %w", err)
