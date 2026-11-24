@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ type Worker struct {
 	client       reconciler.GatewayKeyClient
 	embedding    *reconciler.EmbeddingLifecycleManager
 	nonEmbedding *reconciler.NonEmbeddingLifecycleManager
+	sticky       *reconciler.StickyGuard
 	policy       reconciler.BackoffPolicy
 	interval     time.Duration
 	concurrency  int
@@ -70,6 +72,7 @@ func NewWorker(dbFn func() *gorm.DB, client reconciler.GatewayKeyClient, opts ..
 		client:       client,
 		embedding:    reconciler.NewEmbeddingLifecycleManager(client),
 		nonEmbedding: reconciler.NewNonEmbeddingLifecycleManager(client),
+		sticky:       reconciler.NewStickyGuard(),
 		policy:       reconciler.DefaultBackoffPolicy,
 		interval:     defaultInterval,
 		concurrency:  defaultConcurrency,
@@ -242,17 +245,19 @@ func (w *Worker) process(ctx context.Context, db *gorm.DB, item entity.ModelPubl
 		return
 	}
 
-	err := w.apply(ctx, db, item)
+	stats, err := w.apply(ctx, db, item)
 
 	finish := db.Model(&entity.ModelPublishItem{}).
 		Where("task_id = ? AND tenant_id = ? AND version = ?", item.TaskID, item.TenantID, claimed)
 	if err == nil {
 		_ = finish.Updates(map[string]interface{}{
-			"status":        entity.PublishItemSucceeded,
-			"last_error":    "",
-			"next_retry_at": nil,
-			"version":       claimed + 1,
-			"updated_at":    time.Now(),
+			"status":          entity.PublishItemSucceeded,
+			"last_error":      "",
+			"next_retry_at":   nil,
+			"version":         claimed + 1,
+			"upgraded_count":  stats.upgraded,
+			"preserved_count": stats.preserved,
+			"updated_at":      time.Now(),
 		}).Error
 		return
 	}
@@ -274,44 +279,88 @@ func (w *Worker) process(ctx context.Context, db *gorm.DB, item entity.ModelPubl
 	_ = finish.Updates(updates).Error
 }
 
+// applyStats reports the users a default model upgrade moved and the users whose own choice it kept.
+type applyStats struct {
+	upgraded  int64
+	preserved int64
+}
+
 // apply converges one tenant toward the catalog status of the task's model. The status is read now, not when
 // the task was created, so an item always chases the latest intent. Every step is idempotent, and the gateway
 // whitelist is always changed before the tenant_model row, so a crash in between is repaired by the next attempt.
-func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublishItem) error {
+// When the model is the platform default, the tenant's platform_default users are then moved to it.
+func (w *Worker) apply(ctx context.Context, db *gorm.DB, item entity.ModelPublishItem) (applyStats, error) {
 	var task entity.ModelPublishTask
 	if err := db.Where("id = ?", item.TaskID).First(&task).Error; err != nil {
-		return fmt.Errorf("publish task unavailable: %w", err)
+		return applyStats{}, fmt.Errorf("publish task unavailable: %w", err)
 	}
 	var catalog []entity.PlatformManagedModel
 	if err := db.Where("model_name = ?", task.ModelName).Limit(1).Find(&catalog).Error; err != nil {
-		return err
+		return applyStats{}, err
 	}
 	if len(catalog) == 0 {
-		return fmt.Errorf("model %q is not in the catalog", task.ModelName)
+		return applyStats{}, fmt.Errorf("model %q is not in the catalog", task.ModelName)
 	}
 	model := catalog[0]
 
 	var provider rentity.TenantModelProvider
 	if err := db.Where("tenant_id = ? AND provider_name = ?", item.TenantID, reconciler.ProviderOpenAIAPICompatible).
 		First(&provider).Error; err != nil {
-		return fmt.Errorf("managed provider unavailable: %w", err)
+		return applyStats{}, fmt.Errorf("managed provider unavailable: %w", err)
 	}
 	var instance rentity.TenantModelInstance
 	if err := db.Where("provider_id = ? AND instance_name = ?", provider.ID, reconciler.PlatformInstanceName).
 		First(&instance).Error; err != nil {
-		return fmt.Errorf("managed platform instance unavailable: %w", err)
+		return applyStats{}, fmt.Errorf("managed platform instance unavailable: %w", err)
 	}
 
 	var rows []rentity.TenantModel
 	if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, model.ModelName, model.ModelType).
 		Limit(1).Find(&rows).Error; err != nil {
-		return err
+		return applyStats{}, err
 	}
 
 	if model.Status == entity.ManagedModelStatusRetired {
-		return w.ensureRetired(ctx, db, item.TenantID, &model, &instance, rows)
+		return applyStats{}, w.ensureRetired(ctx, db, item.TenantID, &model, &instance, rows)
 	}
-	return w.ensureActive(ctx, db, item.TenantID, &model, &provider, &instance, rows)
+	if err := w.ensureActive(ctx, db, item.TenantID, &model, &provider, &instance, rows); err != nil {
+		return applyStats{}, err
+	}
+	if !model.IsDefault {
+		return applyStats{}, nil
+	}
+	return w.upgradeDefault(ctx, db, item.TenantID, &model, &instance)
+}
+
+// upgradeDefault moves the tenant's platform_default users to the model, keeping the users who chose a model
+// themselves. It only runs for a model that is healthy in the tenant, and is safe to repeat.
+func (w *Worker) upgradeDefault(
+	ctx context.Context,
+	db *gorm.DB,
+	tenantID string,
+	model *entity.PlatformManagedModel,
+	instance *rentity.TenantModelInstance,
+) (applyStats, error) {
+	var rows []rentity.TenantModel
+	if err := db.Where("instance_id = ? AND model_name = ? AND model_type = ?", instance.ID, model.ModelName, model.ModelType).
+		Limit(1).Find(&rows).Error; err != nil {
+		return applyStats{}, err
+	}
+	if len(rows) == 0 || rows[0].Status != "active" {
+		return applyStats{}, nil
+	}
+	if deprecated, tombstoned := reconciler.RetirementFlags(rows[0].Extra); deprecated || tombstoned {
+		return applyStats{}, nil
+	}
+
+	ref := fmt.Sprintf("%s@%s@%s", model.ModelName, reconciler.PlatformInstanceName, reconciler.ProviderOpenAIAPICompatible)
+	res, err := w.sticky.UpgradeDefaultModel(ctx, db, tenantID, model.ModelType, ref, rows[0].ID)
+	if err != nil {
+		return applyStats{}, fmt.Errorf("failed to upgrade the default model: %w", err)
+	}
+	slog.Info("platform default model upgrade", "tenant_id", tenantID, "model_name", model.ModelName,
+		"model_type", model.ModelType, "upgraded_count", res.UpgradedCount, "preserved_count", res.PreservedCount)
+	return applyStats{upgraded: res.UpgradedCount, preserved: res.PreservedCount}, nil
 }
 
 // ensureActive onboards the model into a tenant that lacks it, or reactivates a row retired earlier.

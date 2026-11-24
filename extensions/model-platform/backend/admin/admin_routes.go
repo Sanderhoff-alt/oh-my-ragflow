@@ -84,6 +84,7 @@ func RegisterModelPlatformAdminRoutesWithGateway(protected *gin.RouterGroup, gwC
 		modelPlatform.POST("/models", PublishModelHandler(pub, customDB...))
 		modelPlatform.POST("/models/:id/retire", RetireModelHandler(customDB...))
 		modelPlatform.POST("/models/:id/reactivate", ReactivateModelHandler(customDB...))
+		modelPlatform.PUT("/models/:id/default", SetDefaultModelHandler(customDB...))
 		modelPlatform.GET("/models/publish/tasks/:id", GetPublishTaskHandler(customDB...))
 		modelPlatform.POST("/models/publish/tasks/:id/retry", RetryPublishTaskHandler(customDB...))
 

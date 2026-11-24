@@ -68,6 +68,28 @@ func doJSON(r *gin.Engine, method, path, body string) (int, map[string]interface
 	return w.Code, out
 }
 
+func TestPublishAPI_SetDefault(t *testing.T) {
+	r, db := setupPublishAdminServer(t, "deepseek-v3")
+	db.Create(&entity.PlatformManagedModel{ID: "m-active", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusActive})
+	db.Create(&entity.PlatformManagedModel{ID: "m-retired", ModelName: "old-model", ModelType: 1, Status: entity.ManagedModelStatusRetired})
+
+	code, out := doJSON(r, http.MethodPut, "/admin/model-platform/models/m-active/default", "")
+	if code != http.StatusAccepted || out["data"].(map[string]interface{})["task_id"] == "" {
+		t.Fatalf("expected 202 with a task, got %d: %v", code, out)
+	}
+	var model entity.PlatformManagedModel
+	db.Where("id = ?", "m-active").First(&model)
+	if !model.IsDefault {
+		t.Error("expected the model to become the platform default")
+	}
+	if code, _ = doJSON(r, http.MethodPut, "/admin/model-platform/models/m-retired/default", ""); code != http.StatusConflict {
+		t.Errorf("expected 409 for a retired model, got %d", code)
+	}
+	if code, _ = doJSON(r, http.MethodPut, "/admin/model-platform/models/missing/default", ""); code != http.StatusNotFound {
+		t.Errorf("expected 404 for an unknown model, got %d", code)
+	}
+}
+
 func TestPublishAPI_RetireAndReactivate(t *testing.T) {
 	r, db := setupPublishAdminServer(t, "deepseek-v3")
 	db.Create(&entity.PlatformManagedModel{ID: "m-chat", ModelName: "deepseek-v3", ModelType: 1, Status: entity.ManagedModelStatusActive})

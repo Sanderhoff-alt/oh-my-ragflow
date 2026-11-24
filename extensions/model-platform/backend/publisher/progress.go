@@ -16,17 +16,20 @@ const (
 	TaskStatusPartialFailed = "partial_failed"
 )
 
-// Progress summarizes a publish task. Pending includes items currently being applied.
+// Progress summarizes a publish task. Pending includes items currently being applied. The user counts are only
+// non-zero for a set-default task: platform_default users moved to the model and user_explicit users kept.
 type Progress struct {
-	TaskID    string    `json:"task_id"`
-	ModelName string    `json:"model_name"`
-	ModelType int       `json:"model_type"`
-	Status    string    `json:"status"`
-	Total     int64     `json:"total"`
-	Succeeded int64     `json:"succeeded"`
-	Pending   int64     `json:"pending"`
-	Failed    int64     `json:"failed"`
-	CreatedAt time.Time `json:"created_at"`
+	TaskID         string    `json:"task_id"`
+	ModelName      string    `json:"model_name"`
+	ModelType      int       `json:"model_type"`
+	Status         string    `json:"status"`
+	Total          int64     `json:"total"`
+	Succeeded      int64     `json:"succeeded"`
+	Pending        int64     `json:"pending"`
+	Failed         int64     `json:"failed"`
+	UpgradedUsers  int64     `json:"upgraded_users_count"`
+	PreservedUsers int64     `json:"preserved_users_count"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // FailedItem describes a tenant whose rollout exhausted its retries.
@@ -64,6 +67,16 @@ func GetProgress(ctx context.Context, db *gorm.DB, taskID string) (*Progress, er
 	}
 
 	p := &Progress{TaskID: task.ID, ModelName: task.ModelName, ModelType: task.ModelType, CreatedAt: task.CreatedAt}
+	var userCounts struct {
+		UpgradedUsers  int64
+		PreservedUsers int64
+	}
+	if err := db.WithContext(ctx).Model(&entity.ModelPublishItem{}).
+		Select("COALESCE(SUM(upgraded_count), 0) AS upgraded_users, COALESCE(SUM(preserved_count), 0) AS preserved_users").
+		Where("task_id = ?", taskID).Scan(&userCounts).Error; err != nil {
+		return nil, err
+	}
+	p.UpgradedUsers, p.PreservedUsers = userCounts.UpgradedUsers, userCounts.PreservedUsers
 	for _, r := range rows {
 		p.Total += r.Count
 		switch entity.PublishItemStatus(r.Status) {

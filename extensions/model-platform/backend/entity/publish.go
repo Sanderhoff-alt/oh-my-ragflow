@@ -64,8 +64,12 @@ type ModelPublishItem struct {
 	NextRetryAt *time.Time        `gorm:"column:next_retry_at;index:idx_publish_item_due,priority:2" json:"next_retry_at,omitempty"`
 	LastError   string            `gorm:"column:last_error;type:text" json:"last_error,omitempty"`
 	Version     int64             `gorm:"column:version;not null;default:1" json:"version"`
-	CreatedAt   time.Time         `gorm:"column:created_at;autoCreateTime" json:"created_at"`
-	UpdatedAt   time.Time         `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
+	// UpgradedCount and PreservedCount are the users StickyGuard moved to the platform default in this tenant
+	// and the users whose explicit choice it kept. They stay zero unless the model is the platform default.
+	UpgradedCount  int64     `gorm:"column:upgraded_count;not null;default:0" json:"upgraded_count"`
+	PreservedCount int64     `gorm:"column:preserved_count;not null;default:0" json:"preserved_count"`
+	CreatedAt      time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 }
 
 // TableName returns the physical table name for ModelPublishItem.

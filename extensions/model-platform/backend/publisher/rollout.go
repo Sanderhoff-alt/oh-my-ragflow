@@ -38,11 +38,20 @@ const unflagged = `COALESCE(m.extra, '') NOT LIKE '%"tombstoned":true%' AND COAL
 // startRollout records a task for the model and an item for every tenant that must change to match the
 // catalog intent. The task is only a progress view: the worker converges tenants from the catalog status.
 func startRollout(tx *gorm.DB, model *entity.PlatformManagedModel) (*Result, error) {
+	return startRolloutFor(tx, model, tenantsToConverge)
+}
+
+// startRolloutFor is startRollout with an explicit choice of the tenants that get an item.
+func startRolloutFor(
+	tx *gorm.DB,
+	model *entity.PlatformManagedModel,
+	selectTenants func(db *gorm.DB, model *entity.PlatformManagedModel, taskID string) ([]string, error),
+) (*Result, error) {
 	task := entity.ModelPublishTask{ID: newID(), ModelName: model.ModelName, ModelType: model.ModelType}
 	if err := tx.Create(&task).Error; err != nil {
 		return nil, err
 	}
-	tenants, err := tenantsToConverge(tx, model, task.ID)
+	tenants, err := selectTenants(tx, model, task.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -50,6 +59,51 @@ func startRollout(tx *gorm.DB, model *entity.PlatformManagedModel) (*Result, err
 		return nil, err
 	}
 	return &Result{TaskID: task.ID, Total: len(tenants)}, nil
+}
+
+// readyTenants returns every Ready tenant that has no item in taskID, whatever its model state is.
+func readyTenants(db *gorm.DB, _ *entity.PlatformManagedModel, taskID string) ([]string, error) {
+	var tenants []string
+	err := db.Raw(`
+SELECT r.tenant_id FROM platform_tenant_reconcile r
+WHERE r.status = ?
+AND NOT EXISTS (
+	SELECT 1 FROM platform_model_publish_item it WHERE it.task_id = ? AND it.tenant_id = r.tenant_id
+)
+ORDER BY r.tenant_id`, entity.StatusReady, taskID).Scan(&tenants).Error
+	return tenants, err
+}
+
+// SetDefault makes an active catalog model the platform default of its type and starts the rollout that
+// moves every tenant's platform_default users to it. Users who chose a model themselves (user_explicit,
+// see #49) are preserved. The previous default stays active.
+func SetDefault(ctx context.Context, db *gorm.DB, modelID string) (*Result, error) {
+	var result *Result
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		model, err := lockCatalogModel(tx, modelID)
+		if err != nil {
+			return err
+		}
+		if model.Status != entity.ManagedModelStatusActive {
+			return fmt.Errorf("%w: %q is %s, reactivate it before making it the default", ErrModelNotActive, model.ModelName, model.Status)
+		}
+		if err := tx.Model(&entity.PlatformManagedModel{}).
+			Where("model_type = ? AND id <> ? AND is_default = ?", model.ModelType, model.ID, true).
+			Update("is_default", false).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&entity.PlatformManagedModel{}).Where("id = ?", model.ID).
+			Update("is_default", true).Error; err != nil {
+			return err
+		}
+		model.IsDefault = true
+		result, err = startRolloutFor(tx, model, readyTenants)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // tenantsToConverge returns the tenants whose realized state differs from the catalog intent and that have

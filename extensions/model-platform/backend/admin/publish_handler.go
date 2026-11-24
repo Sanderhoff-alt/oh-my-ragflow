@@ -47,7 +47,7 @@ func publishErrorResponse(err error) (int, string) {
 		return http.StatusNotFound, "model not found in the catalog"
 	case errors.Is(err, publisher.ErrModelNotInGateway):
 		return http.StatusUnprocessableEntity, err.Error()
-	case errors.Is(err, publisher.ErrModelConflict):
+	case errors.Is(err, publisher.ErrModelConflict), errors.Is(err, publisher.ErrModelNotActive):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, publisher.ErrGatewayUnavailable):
 		return http.StatusBadGateway, "gateway unavailable: could not verify the model route"
@@ -64,6 +64,12 @@ func RetireModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 // ReactivateModelHandler reactivates a retired catalog model and starts the rollout that restores tenants.
 func ReactivateModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
 	return lifecycleHandler(publisher.Reactivate, customDB...)
+}
+
+// SetDefaultModelHandler makes a catalog model the platform default of its type and starts the rollout that
+// moves platform_default users to it while keeping users who chose their own model.
+func SetDefaultModelHandler(customDB ...*gorm.DB) gin.HandlerFunc {
+	return lifecycleHandler(publisher.SetDefault, customDB...)
 }
 
 func lifecycleHandler(action func(ctx context.Context, db *gorm.DB, modelID string) (*publisher.Result, error), customDB ...*gorm.DB) gin.HandlerFunc {
