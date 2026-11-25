@@ -14,6 +14,7 @@ export enum PrivateRoutes {
   TicketDetail = '/support/:id',
   AdminRoleConfigModelProviders = '/admin/roles/:roleName/model-providers',
   AdminModelUsageStatistics = '/admin/model-usage-statistics',
+  AdminModelTenants = '/admin/model-tenants',
   AdminSettings = '/admin/settings',
   AdminSSOProviders = '/admin/sso',
   AdminModelProviders = '/admin/model-providers',
@@ -36,5 +37,9 @@ export const privateRoutes: PrivateRoute[] = [
   {
     path: PrivateRoutes.AdminModelUsageStatistics,
     Component: () => import('@/ee/pages/admin/model-usage-statistics'),
+  },
+  {
+    path: PrivateRoutes.AdminModelTenants,
+    Component: () => import('@/ee/pages/admin/model-tenants'),
   },
 ];

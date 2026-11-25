@@ -7,6 +7,7 @@ export default {
       nav: {
         modelProviders: '模型供应商',
         modelUsage: '模型用量统计',
+        tenantCredentials: '租户凭证与审计',
       },
       modelTypes: {
         all: '全部类型',
@@ -23,8 +24,94 @@ export default {
         active: '已启用',
         retired: '已退役',
         gatewayHealthy: '网关正常',
+        gatewayHealthyWithLatency: '网关正常 ({{latency}}ms)',
         gatewayDegraded: '网关异常',
+        gatewayUnreachable: '网关不可达',
         gatewayUnconfigured: '网关状态不可用',
+        refreshHealth: '刷新网关健康状态',
+        gatewayErrorBannerTitle: '网关健康检查报告异常',
+      },
+      actions: {
+        rotateKey: '轮换密钥',
+        rotateKeyResume: '重新轮换并吊销',
+        rotateKeyDisabledTitle: '仅就绪状态的租户支持轮换网关密钥',
+        rotateKeyTitle: '轮换租户虚拟密钥',
+        rotateKeyResumeTitle: '重新轮换密钥并吊销旧密钥',
+        rotateKeyDescription:
+          '该操作将为租户 {{tenantId}} 签发新的网关虚拟密钥，零中断更新其平台实例配置，并立即吊销旧密钥。',
+        rotateKeyResumeDescription:
+          '租户 {{tenantId}} 上一次密钥轮换仍有旧密钥尚未在网关侧完成吊销（后台清扫任务也会自动重试）。立即确认将签发新的替代密钥，并吊销包括当前生效密钥在内的所有旧密钥。',
+        rotateKeyCancel: '取消',
+        rotateKeyConfirm: '确认轮换',
+        rotateKeySuccess:
+          '已完成租户 {{tenantId}} 的密钥轮换（别名：{{alias}}）。',
+        rotateKeyPendingRevocation:
+          '租户 {{tenantId}} 的新密钥已生效，但旧密钥吊销仍在后台收敛中。',
+        rotateKeyResultConverged:
+          '已为租户 {{tenantId}} 完成密钥轮换并吊销全部旧密钥。',
+        rotateKeyResultPending:
+          '已为租户 {{tenantId}} 签发新密钥，旧密钥吊销仍在后台收敛中。',
+        rotateKeyAliasLabel: '新别名：{{alias}}',
+        rotateKeyFingerprintLabel: '新指纹：{{fingerprint}}',
+        rotateKeyTimestampLabel: '轮换时间：{{timestamp}}',
+        rotateKeyRevokedCount: '已吊销旧密钥数：{{count}}',
+      },
+      audit: {
+        runAction: '运行审计',
+        rerun: '重新审计',
+        close: '关闭',
+        dialogTitle: '租户消费隔离审计',
+        dialogSubtitle:
+          '基于平台网关原始账单核验租户 {{tenantId}} 的模型隔离状态。',
+        running: '正在执行消费隔离审计...',
+        failed: '审计失败：{{message}}',
+        statusLabel: '审计结论',
+        passed: '隔离正常',
+        violationDetected: '检测到异常',
+        notRunYet: '未审计',
+        selectTenantPrompt: '请输入租户 ID',
+        cardHint: '输入租户 ID 后可触发实时消费隔离审计。',
+        cardSpendSummary: '托管 {{managed}} / 非托管 {{selfOwned}}',
+        managedSpend: '平台托管模型费用',
+        selfOwnedSpend: '非托管 / 影子消费',
+        unmanagedModels: '检测到的非托管模型',
+        violations: '违规明细',
+        alertBannerTitle: '检测到租户 {{tenantId}} 存在消费隔离违规',
+      },
+      tenants: {
+        title: '租户凭证与审计',
+        subtitle:
+          '查看托管租户虚拟密钥状态、执行应急密钥轮换及实时消费隔离审计。',
+        refresh: '刷新',
+        dismiss: '关闭提示',
+        totalCount: '共 {{count}} 个租户',
+        pageLabel: '第 {{page}} 页',
+        empty: '当前状态下暂无托管租户。',
+        loadFailed: '加载租户凭证列表失败：{{message}}',
+        filters: {
+          status: '同步状态',
+        },
+        statuses: {
+          ready: '就绪',
+          degraded: '降级',
+          failed: '失败',
+          pending: '待处理',
+          provisioning: '初始化中',
+          deleted: '已删除',
+        },
+        convergence: {
+          clean: '已收敛',
+          dirty: '待完成吊销',
+        },
+        columns: {
+          tenant: '租户 ID',
+          status: '状态',
+          keyAlias: '密钥别名',
+          fingerprint: '密钥指纹',
+          lastRotated: '最近轮换',
+          convergence: '密钥状态',
+          actions: '操作',
+        },
       },
       providers: {
         title: '平台托管模型',
@@ -62,6 +149,16 @@ export default {
             '已完成 {{succeeded}}/{{total}} 个租户，待处理 {{pending}}，失败 {{failed}}',
           usersSummary:
             '（已迁移 {{upgraded}} 名用户，保留 {{preserved}} 名用户的自定义选择）',
+          showFailedDetails: '失败详情 ({{count}})',
+          hideFailedDetails: '收起失败详情',
+          dismiss: '关闭',
+          loadFailed: '加载下发进度失败：{{message}}',
+          backToFirstPage: '返回第 1 页',
+          failedColumns: {
+            tenant: '租户 ID',
+            retries: '重试次数',
+            error: '最近错误',
+          },
         },
         onboardDialog: {
           title: '上架托管模型',
@@ -92,7 +189,10 @@ export default {
         title: '模型用量统计',
         subtitle: '按租户与模型类型聚合的 Token、语音字符与费用计量视图。',
         filters: {
-          tenantPlaceholder: '按租户 ID 筛选',
+          tenantLabel: '租户 ID',
+          tenantPlaceholder: '例如 tenant_123',
+          modelLabel: '模型名称',
+          modelPlaceholder: '例如 deepseek-v3',
           startDate: '开始日期',
           endDate: '结束日期',
           modelType: '模型类型',
@@ -101,13 +201,22 @@ export default {
         cards: {
           totalSpend: '累计费用',
           totalCalls: '共 {{value}} 次调用',
+          cacheSavings: '缓存节省：{{value}}',
           totalTokens: '总 Token 消耗',
           tokenSplit: '输入 {{prompt}} / 输出 {{completion}}',
+          advancedTokens: '缓存 {{cached}} / 推理 {{reasoning}}',
           totalCharacters: '语音合成字符数 (TTS)',
           charactersHint: '通过 /v1/audio/speech 计量的合成字符数',
-          selfManaged: '租户自有模型',
-          zeroBilled: '零计费',
-          selfManagedHint: '租户自配实例严格隔离',
+          isolationAudit: '消费隔离审计',
+        },
+        trend: {
+          title: '每日消耗趋势',
+          subtitle: '按当前筛选条件的日期维度聚合趋势。',
+          cappedHint:
+            '当前展示最近 {{shown}} / {{total}} 条明细的聚合趋势，可缩小日期范围以查看完整汇总。',
+          spendSeries: '费用 (USD)',
+          tokensSeries: 'Token 数',
+          partialSeriesLabel: '{{series}}（部分统计）',
         },
         table: {
           title: '每日用量明细',
@@ -129,6 +238,7 @@ export default {
         error: {
           summaryFailed: '加载用量汇总失败：{{message}}',
           dailyFailed: '加载每日用量明细失败：{{message}}',
+          trendFailed: '加载每日消耗趋势失败：{{message}}',
           retry: '重试',
         },
         pagination: {

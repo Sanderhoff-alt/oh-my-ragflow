@@ -39,11 +39,30 @@ export type RolloutProgress = {
   preserved_users_count: number;
 };
 
+export type RolloutFailedItem = {
+  tenant_id: string;
+  retry_count: number;
+  last_error: string;
+};
+
+export type RolloutFailedPage = {
+  total: number;
+  page: number;
+  page_size: number;
+  items: RolloutFailedItem[];
+};
+
+export type RolloutTaskDetail = {
+  progress: RolloutProgress;
+  failed_items: RolloutFailedPage;
+};
+
 export type AdminHealthStatus = {
   status: 'ok' | 'degraded';
   service: string;
   gateway?: string;
   error?: string;
+  latency_ms?: number;
 };
 
 export type DailyUsageItem = {
@@ -113,6 +132,54 @@ export type UsageQueryParams = {
   page_size?: number;
 };
 
+export type AuditIsolationReport = {
+  tenant_id: string;
+  managed_spend_total: number;
+  self_owned_spend_total: number;
+  unmanaged_models_detected?: string[];
+  audit_passed: boolean;
+  violations?: string[];
+};
+
+export type TenantReconcileStatus =
+  | 'ready'
+  | 'pending'
+  | 'provisioning'
+  | 'degraded'
+  | 'failed'
+  | 'deleted';
+
+export type TenantKeyItem = {
+  tenant_id: string;
+  status: TenantReconcileStatus;
+  key_alias: string;
+  key_fingerprint: string;
+  key_rotated_at?: string;
+  key_rotated_by?: string;
+  key_dirty_since?: string;
+};
+
+export type TenantKeyListPage = {
+  total: number;
+  page_size: number;
+  items: TenantKeyItem[];
+};
+
+export type TenantKeyQueryParams = {
+  status?: TenantReconcileStatus;
+  after?: string;
+  page_size?: number;
+};
+
+export type KeyRotationResult = {
+  tenant_id: string;
+  key_alias: string;
+  new_key_fingerprint: string;
+  rotated_at: string;
+  revoked_keys: number;
+  old_keys_revoked: boolean;
+};
+
 type Envelope<T> = { code: number; data: T; message?: string };
 
 const client = axios.create({
@@ -138,12 +205,18 @@ async function unwrap<T>(request: Promise<{ data: Envelope<T> }>): Promise<T> {
 }
 
 export const getAdminHealth = async (): Promise<AdminHealthStatus> => {
+  const startedAt = performance.now();
   try {
     const response = await client.get<AdminHealthStatus>('/health');
-    return response.data;
+    const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+    return { ...response.data, latency_ms: latencyMs };
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.data) {
-      return error.response.data as AdminHealthStatus;
+      const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+      return {
+        ...(error.response.data as AdminHealthStatus),
+        latency_ms: latencyMs,
+      };
     }
     throw error;
   }
@@ -166,10 +239,15 @@ export const reactivateModel = (id: string) =>
 export const setDefaultModel = (id: string) =>
   unwrap<RolloutResult>(client.put(`/models/${id}/default`));
 
+export const getRolloutTaskDetail = (taskId: string, page = 1, pageSize = 20) =>
+  unwrap<RolloutTaskDetail>(
+    client.get(`/models/publish/tasks/${taskId}`, {
+      params: { page, page_size: pageSize },
+    }),
+  );
+
 export const getRolloutProgress = (taskId: string) =>
-  unwrap<{ progress: RolloutProgress }>(
-    client.get(`/models/publish/tasks/${taskId}`),
-  ).then((data) => data.progress);
+  getRolloutTaskDetail(taskId, 1, 1).then((data) => data.progress);
 
 export const retryFailedTenants = (taskId: string) =>
   unwrap<{ retried: number }>(
@@ -181,3 +259,16 @@ export const getDailyUsage = (params: UsageQueryParams) =>
 
 export const getUsageSummary = (params: UsageQueryParams) =>
   unwrap<UsageSummary>(client.get('/usage/summary', { params }));
+
+export const auditTenantUsage = (tenantId: string) =>
+  unwrap<AuditIsolationReport>(
+    client.get('/usage/audit', { params: { tenant_id: tenantId } }),
+  );
+
+export const listTenantKeys = (params: TenantKeyQueryParams = {}) =>
+  unwrap<TenantKeyListPage>(client.get('/tenants', { params }));
+
+export const rotateTenantKey = (tenantId: string) =>
+  unwrap<KeyRotationResult>(
+    client.post(`/tenants/${encodeURIComponent(tenantId)}/rotate-key`),
+  );

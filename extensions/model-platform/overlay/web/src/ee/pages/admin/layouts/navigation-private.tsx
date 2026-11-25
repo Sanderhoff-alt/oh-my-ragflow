@@ -1,4 +1,4 @@
-import { LucideBarChart3, LucideBox } from 'lucide-react';
+import { LucideBarChart3, LucideBox, LucideKeyRound } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -17,7 +17,8 @@ export type AdminNavExtension = {
 
 /**
  * Enterprise navigation extension for Model Platform.
- * Appends Model Providers and Model Usage Statistics to the admin navigation sidebar.
+ * Appends Model Providers, Model Usage Statistics, and Tenant Credentials to
+ * the admin navigation sidebar.
  */
 export function useEnterpriseAdminNav(): AdminNavExtension {
   const { t } = useTranslation();
@@ -33,6 +34,11 @@ export function useEnterpriseAdminNav(): AdminNavExtension {
         path: PrivateRoutes.AdminModelUsageStatistics,
         name: t('modelPlatform.nav.modelUsage'),
         icon: <LucideBarChart3 className="size-[1em]" />,
+      },
+      {
+        path: PrivateRoutes.AdminModelTenants,
+        name: t('modelPlatform.nav.tenantCredentials'),
+        icon: <LucideKeyRound className="size-[1em]" />,
       },
     ],
     hiddenPaths: [],
