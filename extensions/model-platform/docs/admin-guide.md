@@ -32,8 +32,8 @@ flowchart LR
 1. **Loopback-Only Gateway Binding**: `gateway/docker-compose.yml` binds LiteLLM strictly to `127.0.0.1:4000:4000`. Exposing `0.0.0.0:4000` or routing public traffic directly to LiteLLM is forbidden and rejected by `gateway/validate-gateway-config.sh`.
 2. **Zero Root Key Leakage**: Root upstream API keys exist only inside the LiteLLM container environment. Tenants receive scoped virtual keys (`sk-tenant-*`) bound to a dynamic model whitelist and stored on their managed `OpenAI-API-Compatible` → `platform` instance.
 3. **Log Desensitization**: `litellm-config.yaml` enables `redact_user_api_key_info: true`, `drop_params: true`, `set_verbose: false`, `json_logs: true`, and bounds per-worker key cache staleness with `user_api_key_cache_ttl: 5`.
-4. **Automatic Background Workers**: When the RAGFlow API server (`ServerTypeAPI`) starts with `LITELLM_BASE_URL` and `LITELLM_MASTER_KEY` configured, it automatically launches five background loops (`backend/worker/worker.go`):
-   - **Self-Healing Tenant Reconciler**: Two-tier provisioning for new/degraded tenants.
+4. **Automatic Background Workers**: When `LITELLM_BASE_URL` and `LITELLM_MASTER_KEY` are configured, the RAGFlow API server (`ServerTypeAPI`) automatically launches five background loops (`backend/worker/worker.go`), while the RAGFlow Admin server (`ServerTypeAdmin`) attaches only the lightweight Tier-1 `TenantCreated` event listener so admin-created users (`POST /api/v1/admin/users`) receive immediate provisioning without duplicating periodic loops:
+   - **Self-Healing Tenant Reconciler**: Single-attempt Tier-1 fast path on both API and Admin servers, backed by a unified DB-driven Tier-2 poller (`15s` interval, `5s → 15s → 30s → 1m → 2m` backoff cap) in the API server.
    - **Publish Rollout Worker**: Converges tenants whenever models are onboarded, retired, reactivated, or promoted to default.
    - **Metering Daemon**: Watermark-driven spend log collector, daily rollup aggregator, and optional retention sweeper.
    - **Dirty Key Sweeper** (`sweepDirtyKeys`): Runs every `1m` to revoke superseded virtual keys left dirty for more than `2m`.
@@ -289,10 +289,10 @@ ADMIN_TOKEN="<superuser-token>" \
 flowchart TD
     Create["New Tenant Created"] --> Hook["DB TX Hook: insert platform_tenant_reconcile (status=pending)"]
     Hook --> PreFlight["Post-Commit PreFlightCheck -> EventBus"]
-    PreFlight --> Tier1["Tier 1: In-Memory Reconciler (fast exponential retry)"]
+    PreFlight --> Tier1["Tier 1: Event Fast Path (API + Admin, single immediate attempt)"]
     Tier1 -->|"Success"| Ready["status = ready"]
     Tier1 -->|"Gateway Down"| Degraded["status = degraded (next_retry_at set)"]
-    Degraded --> Tier2["Tier 2: Background Poller (periodic self-healing)"]
+    Degraded --> Tier2["Tier 2: API Background Poller (every 15s, 5s..2m backoff)"]
     Tier2 -->|"Gateway Recovers"| Ready
 ```
 

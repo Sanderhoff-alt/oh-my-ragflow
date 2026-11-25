@@ -16,17 +16,15 @@ import (
 // ControllerOption configures the SelfHealingController.
 type ControllerOption func(*SelfHealingController)
 
-// WithBackoffPolicy sets a custom BackoffPolicy.
+// WithBackoffPolicy sets a custom BackoffPolicy used when scheduling deferred
+// retries in the database.
 func WithBackoffPolicy(policy BackoffPolicy) ControllerOption {
 	return func(c *SelfHealingController) {
 		c.policy = policy
-		if len(policy.Tier1Intervals) > 0 {
-			c.maxTier1Retries = len(policy.Tier1Intervals)
-		}
 	}
 }
 
-// WithPollerInterval sets the level-triggered scanning interval.
+// WithPollerInterval sets the Tier-2 level-triggered scanning interval.
 func WithPollerInterval(interval time.Duration) ControllerOption {
 	return func(c *SelfHealingController) {
 		if interval > 0 {
@@ -44,9 +42,23 @@ func WithMaxRetries(maxRetries int) ControllerOption {
 	}
 }
 
-// SelfHealingController coordinates two-tier self-healing for tenant model provisioning:
-// - Tier 1 (Fast Queue): Reacts immediately to TenantCreated events with up to 5 fast exponential retries.
-// - Tier 2 (Level-Triggered Poller): Continuously scans degraded/pending records to heal from service outages (e.g. 45s gateway maintenance).
+// WithDisablePoller runs only the Tier-1 TenantCreated event listener without
+// launching the Tier-2 periodic polling goroutine. This is used by the Admin
+// server process so admin-created tenants get immediate provisioning while
+// background polling remains single-homed in the API server.
+func WithDisablePoller() ControllerOption {
+	return func(c *SelfHealingController) {
+		c.disablePoller = true
+	}
+}
+
+// SelfHealingController coordinates tenant model provisioning across two complementary paths:
+//   - Tier 1 (Event Fast Path): Subscribes to TenantCreated and executes a single immediate
+//     reconcile attempt so healthy provisioning finishes in sub-second latency. On transient
+//     failure, Reconcile persists status=degraded with the next_retry_at deadline computed from
+//     the unified BackoffPolicy and exits immediately—eliminating any split in-memory retry loop.
+//   - Tier 2 (Level-Triggered Poller): Scans due pending/degraded records and stale provisioning
+//     leases in the database as the single source of truth for deferred retries.
 type SelfHealingController struct {
 	db              *gorm.DB
 	eventBus        *event.EventBus
@@ -54,8 +66,8 @@ type SelfHealingController struct {
 	dao             *dao.ReconcileDAO
 	policy          BackoffPolicy
 	pollerInterval  time.Duration
-	maxTier1Retries int
 	maxTotalRetries int
+	disablePoller   bool
 
 	stopChan    chan struct{}
 	stopOnce    sync.Once
@@ -69,9 +81,6 @@ type SelfHealingController struct {
 	tier1FailureCount int32
 	tier2HealedCount  int32
 	failedCount       int32
-
-	tier2Mu       sync.Mutex
-	tier2Attempts map[string]int
 }
 
 // NewSelfHealingController creates a new SelfHealingController.
@@ -82,11 +91,9 @@ func NewSelfHealingController(db *gorm.DB, bus *event.EventBus, reconciler *Tena
 		reconciler:      reconciler,
 		dao:             dao.NewReconcileDAO(),
 		policy:          DefaultBackoffPolicy,
-		pollerInterval:  30 * time.Second,
-		maxTier1Retries: 5,
+		pollerInterval:  15 * time.Second,
 		maxTotalRetries: 50,
 		stopChan:        make(chan struct{}),
-		tier2Attempts:   make(map[string]int),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -94,9 +101,10 @@ func NewSelfHealingController(db *gorm.DB, bus *event.EventBus, reconciler *Tena
 	return c
 }
 
-// Start begins event subscription (Tier 1) and background level-triggered polling (Tier 2).
+// Start begins Tier-1 event subscription and, unless WithDisablePoller was set,
+// the Tier-2 background level-triggered polling loop.
 func (c *SelfHealingController) Start(ctx context.Context) {
-	// 1. Tier 1: Subscribe to TenantCreated events
+	// 1. Tier 1: Subscribe to TenantCreated events for single immediate attempt
 	if c.eventBus != nil {
 		c.unsubscribe = c.eventBus.Subscribe(event.TenantCreated, func(eventCtx context.Context, evt event.TenantLifecycleEvent) error {
 			c.stopMu.RLock()
@@ -115,76 +123,62 @@ func (c *SelfHealingController) Start(ctx context.Context) {
 		})
 	}
 
-	// 2. Tier 2: Level-Triggered Poller loop
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		ticker := time.NewTicker(c.pollerInterval)
-		defer ticker.Stop()
+	// 2. Tier 2: Level-Triggered Poller loop (skipped in Tier-1-only mode)
+	if !c.disablePoller {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			ticker := time.NewTicker(c.pollerInterval)
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-c.stopChan:
-				return
-			case <-ticker.C:
-				c.PollAndHeal(ctx)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-c.stopChan:
+					return
+				case <-ticker.C:
+					c.PollAndHeal(ctx)
+				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
-// handleTier1Event processes a newly created tenant with fast exponential retries.
+// handleTier1Event performs a single immediate provisioning attempt for a newly created tenant.
+// If it fails transiently, Reconcile persists status=degraded with next_retry_at computed from
+// the unified BackoffPolicy and hands off all subsequent retries to the Tier-2 DB poller.
 func (c *SelfHealingController) handleTier1Event(ctx context.Context, tenantID string) {
-	// A. Quick verification: ensure tenant & user_tenant are visible
+	select {
+	case <-ctx.Done():
+		return
+	case <-c.stopChan:
+		return
+	default:
+	}
+
+	// Quick verification: ensure tenant & user_tenant are visible
 	if err := event.PreFlightCheck(ctx, c.db, tenantID, 50*time.Millisecond); err != nil {
 		// Transaction was rolled back or aborted: drop event
 		return
 	}
 
-	// B. Fast retry loop (up to maxTier1Retries)
-	for attempt := 0; attempt < c.maxTier1Retries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.stopChan:
-			return
-		default:
+	err := c.reconciler.Reconcile(
+		ctx,
+		c.db,
+		tenantID,
+		WithEnforceDeadline(),
+		WithReconcileBackoffPolicy(c.policy),
+	)
+	if err == nil {
+		state, getErr := c.dao.GetByTenantID(ctx, c.db, tenantID)
+		if getErr == nil && state.Status == entity.StatusReady {
+			atomic.AddInt32(&c.tier1SuccessCount, 1)
 		}
-
-		err := c.reconciler.Reconcile(ctx, c.db, tenantID)
-		if err == nil {
-			state, getErr := c.dao.GetByTenantID(ctx, c.db, tenantID)
-			if getErr == nil && state.Status == entity.StatusReady {
-				atomic.AddInt32(&c.tier1SuccessCount, 1)
-			}
-			return
-		}
-
-		delay := c.policy.CalculateTier1Backoff(attempt)
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.stopChan:
-			return
-		case <-time.After(delay):
-		}
+		return
 	}
 
-	// C. Tier 1 exhausted: schedule first Tier 2 slow retry without double-incrementing retry count
 	atomic.AddInt32(&c.tier1FailureCount, 1)
-	rec, err := c.dao.GetByTenantID(ctx, c.db, tenantID)
-	if err == nil && rec.Status == entity.StatusDegraded {
-		c.tier2Mu.Lock()
-		c.tier2Attempts[tenantID] = 1
-		c.tier2Mu.Unlock()
-
-		nextRetry := time.Now().Add(c.policy.CalculateTier2Backoff(0))
-		_ = c.db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
-			Where("tenant_id = ? AND version = ?", tenantID, rec.Version).
-			Update("next_retry_at", nextRetry).Error
-	}
 }
 
 // PollAndHeal scans due records in 'pending' or 'degraded' status and triggers self-healing.
@@ -232,46 +226,20 @@ func (c *SelfHealingController) PollAndHeal(ctx context.Context) {
 				continue
 			}
 			atomic.AddInt32(&c.failedCount, 1)
-			c.tier2Mu.Lock()
-			delete(c.tier2Attempts, freshRec.TenantID)
-			c.tier2Mu.Unlock()
 			continue
 		}
 
-		// Execute reconciliation (Reconcile handles optimistic locking claim internally with deadline enforcement)
-		if err := c.reconciler.Reconcile(ctx, c.db, freshRec.TenantID, WithEnforceDeadline()); err == nil {
+		// Execute reconciliation (Reconcile handles optimistic locking claim and unified backoff internally)
+		if err := c.reconciler.Reconcile(
+			ctx,
+			c.db,
+			freshRec.TenantID,
+			WithEnforceDeadline(),
+			WithReconcileBackoffPolicy(c.policy),
+		); err == nil {
 			state, getErr := c.dao.GetByTenantID(ctx, c.db, freshRec.TenantID)
 			if getErr == nil && state.Status == entity.StatusReady {
 				atomic.AddInt32(&c.tier2HealedCount, 1)
-				c.tier2Mu.Lock()
-				delete(c.tier2Attempts, freshRec.TenantID)
-				c.tier2Mu.Unlock()
-			}
-		} else {
-			// Reconcile internally marked degraded with Tier-1 interval.
-			// In Tier-2 level-triggered poller, update next_retry_at to Tier-2 backoff schedule.
-			latestRec, getErr := c.dao.GetByTenantID(ctx, c.db, freshRec.TenantID)
-			if getErr == nil && latestRec.Status == entity.StatusDegraded {
-				c.tier2Mu.Lock()
-				attempt, exists := c.tier2Attempts[freshRec.TenantID]
-				if !exists {
-					if freshRec.Status == entity.StatusPending {
-						attempt = 0
-					} else if latestRec.RetryCount > c.maxTier1Retries {
-						attempt = latestRec.RetryCount - c.maxTier1Retries
-					} else if latestRec.RetryCount > 0 {
-						attempt = latestRec.RetryCount - 1
-					} else {
-						attempt = 0
-					}
-				}
-				c.tier2Attempts[freshRec.TenantID] = attempt + 1
-				c.tier2Mu.Unlock()
-
-				nextRetry := time.Now().Add(c.policy.CalculateTier2Backoff(attempt))
-				_ = c.db.WithContext(ctx).Model(&entity.TenantReconcileRecord{}).
-					Where("tenant_id = ? AND version = ?", freshRec.TenantID, latestRec.Version).
-					Update("next_retry_at", nextRetry).Error
 			}
 		}
 	}

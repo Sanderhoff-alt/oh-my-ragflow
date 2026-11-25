@@ -61,8 +61,8 @@ flowchart LR
   *背景与决策*：开启 `RAGFLOW_GO_TAGS=ee` 会全局排除上游 19 个包中的 `//go:build !ee` 桩文件。因此建立肯定的 `ee-baseline` 回退桩与薄路由 Trampoline，由 `apply-overlay.sh` 组装到隔离目录 `build/ragflow`，保持 `upstream/ragflow` 100% 洁净。
 - **ADR-2：PostgreSQL 持久化 LiteLLM 网关与环回隔离**  
   *背景与决策*：虚拟密钥和账单日志需要持久化存储与严格网络边界。选用锁定版本的 LiteLLM（`v1.110.0`）配合独立 PostgreSQL 16，强制仅绑定 `127.0.0.1:4000`，默认 `model_list: []`，开启日志凭据脱敏并设置 `user_api_key_cache_ttl: 5`。
-- **ADR-3：两级自愈协调器（内存指数退避 + 电平触发 Poller）**  
-  *背景与决策*：网关重启或短时不可达不能阻塞租户注册，也不能遗留永久不可用的租户。采用一级内存快速指数退避应对抖动，辅以二级定时巡检 Poller 与租约回收机制应对长时故障。
+- **ADR-3：单次事件快路径 + 统一数据库退避的自愈 Poller**  
+  *背景与决策*：网关重启或短时不可达不能阻塞租户注册，也不能遗留永久不可用的租户；同时管理员通过 `POST /api/v1/admin/users` 创建的租户也应与自主注册一样即刻预配，且避免双调度器竞态或重复后台巡检。决定在 `ServerTypeAPI` 与 `ServerTypeAdmin` 均采用单次即时 Tier-1 事件尝试（失败即落盘交棒，无内存重试循环），所有延迟重试统一由 `ServerTypeAPI` 的数据库驱动 Tier-2 Poller 按单一 `BackoffPolicy`（`5s → 15s → 30s → 1m → 2m`，封顶 `2m`）、15 秒周期巡检与 2 分钟僵死租约回收完成。
 - **ADR-4：默认槽位原子初始化与粘性来源观测**  
   *背景与决策*：并发初始化存在覆盖竞态，平台默认升级需覆盖全部 7 类托管模型（`model_slots.go`）且尊重用户显式偏好。采用条件原子 SQL 初始化空槽位、成员加入时继承 Owner 默认值，以及 `DefaultModelPreferenceMiddleware` + `StickyGuard` 追踪偏好来源。
 - **ADR-5：向量模型三阶段生命周期（`Active` → `Deprecated` → `Tombstoned`）**  

@@ -105,7 +105,7 @@ extensions/model-platform/
   - `migrateBillingSchemaEE` 执行全部 6 项幂等迁移（`001`–`005` + `006_backfill_catalog`）。
   - `initializeTenantDefaultRoleEE` 调用 `mpdao.OnTenantCreateHook`。
   - `init()` 注册 `mpworker.SetDBProvider(GetDB)`。
-- **后台 Worker**（`overlay/ee-baseline/internal/server/stub_ee.go`）：当 `serverType == common.ServerTypeAPI` 且配置了 `LITELLM_BASE_URL` 与 `LITELLM_MASTER_KEY` 时，`StartServer` 启动 `mpworker.Start(ctx)`；`ShutdownServer` 优雅排空停止全部 Worker。
+- **后台 Worker**（`overlay/ee-baseline/internal/server/stub_ee.go`）：当配置了 `LITELLM_BASE_URL` 与 `LITELLM_MASTER_KEY` 时，`StartServer` 在 `common.ServerTypeAPI` 启动完整 `mpworker.Start(ctx)`，在 `common.ServerTypeAdmin` 启动轻量 `mpworker.StartAdminTier1(ctx)`（仅订阅 `TenantCreated` 事件，周期巡检任务仍由 API 服务统一承担）；`ShutdownServer` 优雅排空停止全部 Worker。
 - **成员加入钩子**（`overlay/ee-baseline/internal/service/stub_ee.go`）：`recordTenantPermissionChangeEE` 监听 `eventType == "tenant.member.joined"`，触发 `DefaultsManager.InitializeMemberFromOwner`。
 
 ### 2.3 前端 Web 覆盖接缝与企业标志防御
@@ -178,23 +178,22 @@ extensions/model-platform/
 
 ```mermaid
 flowchart TD
-    CommitEvent["TenantCreatedEvent（提交后）"] --> Tier1Queue["一级协调：内存事件 Worker"]
-    subgraph Tier1 ["一级：瞬时抖动快速恢复"]
-        Tier1Queue --> TryReconcile{"协调网关与数据库"}
+    CommitEvent["TenantCreatedEvent（提交后，API 与 Admin）"] --> Tier1Queue["一级快路径：单次即时事件处理"]
+    subgraph Tier1 ["一级：即时预配（API + Admin）"]
+        Tier1Queue --> TryReconcile{"协调网关与数据库（单次尝试）"}
         TryReconcile -->|"成功"| SetReady["status = ready"]
-        TryReconcile -->|"失败（< 5 次）"| Backoff1["指数退避（总计约 31s）"] --> TryReconcile
-        TryReconcile -->|"耗尽重试"| SetDegraded["status = degraded"]
+        TryReconcile -->|"瞬时失败"| SetDegraded["status = degraded + next_retry_at"]
     end
-    subgraph Tier2 ["二级：电平触发后台 Poller"]
-        Poller["ReconcilePoller（每 30s）"] --> FindDue["扫描到期 pending/degraded 及超时 provisioning (>2m)"]
+    subgraph Tier2 ["二级：电平触发后台 Poller（仅 API 服务）"]
+        Poller["ReconcilePoller（每 15s）"] --> FindDue["扫描到期 pending/degraded 及超时 provisioning (>2m)"]
         FindDue --> TryHeal{"网关是否可用？"}
         TryHeal -->|"是"| SetReady
-        TryHeal -->|"否"| Backoff2["带抖动退避（上限 10m，最多 50 次）"]
+        TryHeal -->|"否"| Backoff2["统一数据库退避（5s -> 15s -> 30s -> 1m -> 2m 封顶，最多 50 次）"]
     end
     SetDegraded --> Poller
 ```
 
-- 多副本并发由乐观版本锁（`WHERE tenant_id = ? AND version = ?`）协调，`provisioning` 超过 `2m` 未更新时自动回收租约。
+- 多副本 API 与 Admin 一级事件之间的并发统一由乐观版本锁（`WHERE tenant_id = ? AND version = ?`）协调，`provisioning` 超过 `2m` 未更新时自动回收租约；所有退避间隔均由数据库 `retry_count` 驱动的单一 `BackoffPolicy` 计算，消除了进程内双调度器竞态。
 
 ### 4.3 协调状态机与表结构（`platform_tenant_reconcile`）
 
@@ -395,7 +394,7 @@ flowchart TD
 
 | 故障场景 | 影响范围 | 防护与恢复机制 |
 | :--- | :--- | :--- |
-| 租户注册期间网关宕机 | 模型预配延迟 | `OnTenantCreateHook` 仅提交本地 SQL；一级快速退避重试，随后二级 `ReconcilePoller` 在 `retry_count < 50` 时将 `pending`/`degraded` 租户于网关恢复后自动收敛至 `ready`。一旦达到 50 次重试上限，租户转为 `failed`，不再被 `ReconcilePoller` 选中，需人工介入恢复。 |
+| 租户注册期间网关宕机 | 模型预配延迟 | `OnTenantCreateHook` 仅提交本地 SQL；一级快路径单次即时尝试失败后交棒至 `degraded`，随后 API 服务的二级 `ReconcilePoller`（每 15s 巡检，统一 `5s → 15s → 30s → 1m → 2m` 退避）在 `retry_count < 50` 时将 `pending`/`degraded` 租户于网关恢复后自动收敛至 `ready`。一旦达到 50 次重试上限，租户转为 `failed`，不再被 `ReconcilePoller` 选中，需人工介入恢复。 |
 | 签发虚拟密钥后数据库写入失败 | 潜在孤儿密钥 | 补偿回滚尝试单次按 `key_hash` 调用 `DeleteKeysByHash` 吊销新密钥；若该次吊销也失败，残留 Team 密钥会保留至网关恢复且后续协调重试执行（租户仍处于 `pending`/`degraded` 且未达 50 次重试上限时，`issueFreshKey` 会在重新签发前清扫残留 Team 密钥；已进入 `failed` 的租户需人工清理与升级处理）。 |
 | Worker 在预配或分发途中崩溃 | 任务卡死在 `provisioning`/`running` | 租约超时自动回收（`provisioning` 与发布 `running` 子项均为 2 分钟）。 |
 | 上游删除租户账号 | 残留可用虚拟密钥 | `scanOrphanedTenants`（每小时）与 `TenantDecommissioner` 物理吊销该 Team 全部密钥并标记 `deleted`。 |
