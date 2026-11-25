@@ -3,11 +3,13 @@ package dao
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"ragflow/extensions/model-platform/backend/entity"
 	"ragflow/extensions/model-platform/backend/event"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -42,6 +44,13 @@ func OnTenantCreateHook(ctx context.Context, tx *gorm.DB, tenantID string) error
 		return err
 	}
 
+	// Skip background visibility polling when nothing listens for TenantCreated
+	// (for example, unit tests that do not start model-platform workers).
+	bus := event.GetDefaultBus()
+	if !bus.HasSubscribers(event.TenantCreated) {
+		return nil
+	}
+
 	// Nested transactions give no commit callback, so poll a root connection until the tenant is visible.
 	pool := tx.ConnPool
 	if pool == nil && tx.Statement != nil {
@@ -54,11 +63,54 @@ func OnTenantCreateHook(ctx context.Context, tx *gorm.DB, tenantID string) error
 		Context:  context.Background(),
 		Clauses:  map[string]clause.Clause{},
 	}
+
+	// Unshared SQLite in-memory pools open a fresh empty database per connection.
+	// Clamp the pool to a single connection so background PreFlightCheck queries
+	// serialize onto the existing connection instead of allocating an empty one.
+	clampUnsharedSQLiteMemoryPool(rootDB)
+
+	busCtx := bus.Context()
 	go func() {
-		if err := event.PreFlightCheck(context.Background(), rootDB, tenantID, 3*time.Second); err == nil {
-			event.GetDefaultBus().Publish(event.NewTenantCreatedEvent(tenantID))
+		if err := event.PreFlightCheck(busCtx, rootDB, tenantID, 3*time.Second); err == nil {
+			bus.Publish(event.NewTenantCreatedEvent(tenantID))
 		}
 	}()
 
 	return nil
+}
+
+func isUnsharedSQLiteMemoryDSN(dsn string) bool {
+	lower := strings.ToLower(strings.TrimSpace(dsn))
+	if lower == "" || lower == ":memory:" {
+		return true
+	}
+	if strings.Contains(lower, ":memory:") || strings.Contains(lower, "mode=memory") {
+		return !strings.Contains(lower, "cache=shared")
+	}
+	return false
+}
+
+func clampUnsharedSQLiteMemoryPool(db *gorm.DB) {
+	if db == nil || db.Config == nil || db.Dialector == nil {
+		return
+	}
+	var dsn string
+	switch d := db.Dialector.(type) {
+	case *sqlite.Dialector:
+		dsn = d.DSN
+	case sqlite.Dialector:
+		dsn = d.DSN
+	default:
+		return
+	}
+	if !isUnsharedSQLiteMemoryDSN(dsn) {
+		return
+	}
+	sqlDB, err := db.DB()
+	if err != nil || sqlDB == nil {
+		return
+	}
+	if sqlDB.Stats().MaxOpenConnections != 1 {
+		sqlDB.SetMaxOpenConns(1)
+	}
 }

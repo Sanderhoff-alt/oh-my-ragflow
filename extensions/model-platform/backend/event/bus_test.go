@@ -104,6 +104,63 @@ func TestEventBus_PublishTimeoutWhenBufferFull(t *testing.T) {
 	}
 }
 
+func TestEventBus_HasSubscribersAndContext(t *testing.T) {
+	var nilBus *EventBus
+	if nilBus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected nil bus to report no subscribers")
+	}
+	select {
+	case <-nilBus.Context().Done():
+	default:
+		t.Fatal("expected nil bus context to be canceled")
+	}
+
+	bus := NewEventBus(16)
+	if bus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected fresh bus to have no subscribers")
+	}
+
+	unsub := bus.Subscribe(TenantCreated, func(ctx context.Context, evt TenantLifecycleEvent) error {
+		return nil
+	})
+	if !bus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected bus to report subscriber for TenantCreated")
+	}
+	if bus.HasSubscribers(EventType("other.event")) {
+		t.Fatal("expected bus to report no subscriber for unrelated event")
+	}
+
+	unsub()
+	if bus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected bus to report no subscriber after unsubscribe")
+	}
+
+	unsubWildcard := bus.Subscribe("*", func(ctx context.Context, evt TenantLifecycleEvent) error {
+		return nil
+	})
+	defer unsubWildcard()
+	if !bus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected wildcard subscription to satisfy HasSubscribers")
+	}
+
+	busCtx := bus.Context()
+	select {
+	case <-busCtx.Done():
+		t.Fatal("expected running bus context not to be canceled")
+	default:
+	}
+
+	bus.Stop()
+	if bus.HasSubscribers(TenantCreated) {
+		t.Fatal("expected stopped bus to report no subscribers")
+	}
+	select {
+	case <-busCtx.Done():
+	default:
+		t.Fatal("expected bus context to be canceled after Stop")
+	}
+}
+
 func TestPreFlightCheck_ImmediateSuccess(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
