@@ -24,7 +24,7 @@ English | [简体中文](architecture.zh-CN.md)
 ```mermaid
 flowchart LR
     AdminUI["Admin Console UI Overlay<br/>(/admin/model-providers,<br/>/admin/model-usage-statistics,<br/>/admin/model-tenants)"] -->|"Admin API<br/>/api/v1/admin/model-platform/*"| AdminSvc["Model Platform Admin API<br/>(RAGFlow Admin :9381)"]
-    Workers["API Server Background Workers<br/>(Reconciler, Publisher, Metering,<br/>Key Sweeper, Orphan Scanner)"] -->|"Master Key<br/>/key/*, /v1/models, /global/spend/logs"| Gateway["LiteLLM Model Gateway<br/>(127.0.0.1:4000)"]
+    Workers["API Server Background Workers<br/>(Reconciler, Publisher, Metering,<br/>Key Sweeper, Orphan Scanner)"] -->|"Master Key<br/>/key/*, /v1/models, /spend/logs/v2"| Gateway["LiteLLM Model Gateway<br/>(127.0.0.1:4000)"]
     AdminSvc -->|"Master Key<br/>(Health, Catalog Verify, Rotate)"| Gateway
     Workers -->|"Provision / Converge<br/>Managed Catalog & Defaults"| RAGFlowDB[("RAGFlow DB")]
     AppAPI["RAGFlow Core + App Guards<br/>(ManagedProvider, DatasetImmutability,<br/>DefaultModelPreference)"] -->|"Tenant Virtual Key<br/>sk-tenant-*"| Gateway
@@ -39,7 +39,7 @@ flowchart LR
 | **RAGFlow Core (`upstream/ragflow`)** | Tenant auth, model factory/drivers, chat/dataset/agent pipelines, base Admin & User UI | 100% pristine Git submodule (zero diff) |
 | **Control Plane & Guards (`extensions/model-platform/backend`)** | 13 Admin API endpoints, 3 App API middleware guards, 5 background workers, 6 schema migrations | Wired solely through `ee-baseline` stubs and thin Go trampolines |
 | **Web UI Overlay (`extensions/model-platform/overlay/web/src/ee`)** | 3 Admin governance pages, localized resources, `ProviderInstanceCardWithPrivilege` read-only shield | Injected via upstream `src/ee` seams with `VITE_RAGFLOW_ENTERPRISE=false` |
-| **LiteLLM Gateway (`extensions/model-platform/gateway`)** | Root credential vault, team-scoped virtual keys, model whitelisting, authoritative spend logs | Loopback `127.0.0.1:4000` + dedicated PostgreSQL; root secrets never leave container |
+| **LiteLLM Gateway (`extensions/model-platform/gateway`)** | Root credential vault, team-scoped virtual keys, model whitelisting, authoritative spend logs | Loopback `127.0.0.1:4000` + dedicated PostgreSQL; root secrets stay in the gateway and are sent only to upstream providers (never exposed to tenants or Admin APIs) |
 
 ---
 
@@ -51,7 +51,7 @@ flowchart LR
 4. **Sticky User Default Provenance**: Platform default rollouts only migrate users whose slot provenance is `platform_default`. Explicit user choices (`user_explicit`, observed by `DefaultModelPreferenceMiddleware`) are preserved unless the chosen model is retired and tombstoned.
 5. **Dataset Vector Space Immutability**: Non-empty datasets (with documents or parsed chunks) cannot change their embedding model (HTTP `400`). Retired embedding models remain read-only for referencing datasets while being blocked from new or empty dataset bindings.
 6. **Physical Zero-Billing Bypass**: Tenant-owned BYOK instances route directly to external endpoints without passing through the gateway, guaranteeing `$0.00` platform spend, auditable live via `GET /api/v1/admin/model-platform/usage/audit`.
-7. **Gateway-First Convergence & Mathematical Metering Idempotence**: Catalog fan-out updates gateway whitelists before database visibility so tenants never see unroutable models; spend logs deduplicate on `spend_id` and aggregate via calendar-aligned replacement upserts rather than additive increments.
+7. **Gateway-First Convergence & Mathematical Metering Idempotence**: Catalog activation updates gateway whitelists before database visibility so newly onboarded models are routable before tenants see them; retirement revokes gateway whitelist access before disabling the `tenant_model` row (a brief fail-closed window where the gateway stops new traffic before the DB converges). Spend logs deduplicate on `spend_id` and aggregate via calendar-aligned replacement upserts rather than additive increments.
 
 ---
 

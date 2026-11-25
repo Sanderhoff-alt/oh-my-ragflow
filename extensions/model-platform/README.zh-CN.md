@@ -4,7 +4,7 @@
 
 `model-platform` 扩展通过隔离部署的 LiteLLM 模型网关，为 RAGFlow 提供集中托管、按租户隔离的平台模型能力，同时完整保留各租户配置自有密钥（BYOK，Bring Your Own Key）供应商的自由度。平台模型消耗在网关层进行权威归属与计量；租户自有 BYOK 流量在物理链路上直接访问外部上游，不经过网关，产生严格 `$0.00` 平台费用。
 
-**状态：** 生产就绪（Phase 0–5 全部完成并合并，已包含动态模型目录、应急密钥轮换、自愈计量与 Admin 治理控制台）。
+**状态：** 生产就绪（已具备动态模型目录、租户生命周期与自愈协调、应急密钥轮换、权威计量与隔离审计及 Admin 治理控制台）。
 
 ## 核心能力亮点
 
@@ -21,30 +21,38 @@
 
 ## 快速开始
 
-1. **启动隔离部署的 LiteLLM 网关**：
+1. **配置并启动隔离部署的 LiteLLM 网关**：
+
+   首先创建 `.env`（仅在文件不存在时复制，避免覆盖已有配置与加密盐），并在继续之前替换为真实的 `POSTGRES_PASSWORD`、`LITELLM_MASTER_KEY`、`LITELLM_SALT_KEY` 与 `PLATFORM_UPSTREAM_OPENAI_KEY`（若 `POSTGRES_PASSWORD` 包含 `@`、`#`、`:`、`/`、`%` 等 URL 特殊字符，请同时显式配置百分号编码后的 `DATABASE_URL`）：
 
    ```sh
-   cd extensions/model-platform/gateway
-   cp .env.example .env
-   # 填写 POSTGRES_PASSWORD、LITELLM_MASTER_KEY、LITELLM_SALT_KEY 与上游供应商密钥
-   ./validate-gateway-config.sh
-   docker compose up -d
+   [ -f extensions/model-platform/gateway/.env ] || cp extensions/model-platform/gateway/.env.example extensions/model-platform/gateway/.env
+   chmod 600 extensions/model-platform/gateway/.env
+   # 请先编辑 extensions/model-platform/gateway/.env，替换所有示例密钥后再执行下一步
    ```
 
-2. **组装并构建增强版 RAGFlow 发行工作区**（保持 `upstream/ragflow` 100% 洁净）：
+   确认密钥填写完毕后，在子 Shell 中先通过校验再启动网关（保持当前目录停留在仓库根，且校验失败时中止启动）：
 
    ```sh
-   ./extensions/model-platform/scripts/apply-overlay.sh
+   (cd extensions/model-platform/gateway && ./validate-gateway-config.sh && docker compose up -d)
    ```
 
-3. **配置 RAGFlow API 与 Admin 服务环境变量**：
+2. **在仓库根目录组装并编译增强版 RAGFlow 发行版**（保持 `upstream/ragflow` 100% 洁净）：
 
    ```sh
-   export LITELLM_BASE_URL=http://127.0.0.1:4000
-   export LITELLM_MASTER_KEY=<与网关一致的-master-key>
+   ./extensions/model-platform/scripts/apply-overlay.sh \
+     && (cd build/ragflow && RAGFLOW_GO_TAGS=ee bash build.sh --go) \
+     && (cd build/ragflow/web && npm ci && VITE_RAGFLOW_ENTERPRISE=false npm run build)
    ```
 
-   启动增强版 RAGFlow API 与 Admin 服务后，在 `gateway/litellm-config.yaml` 中添加模型路由，随后进入 **Admin 控制台 → 模型供应商**（`/admin/model-providers`）上架模型即可。
+3. **配置 RAGFlow API 与 Admin 服务环境变量**（请按 `.env` 中的原样填写 `LITELLM_MASTER_KEY`，并使用单引号防止 Shell 展开 `$` 等特殊字符）：
+
+   ```sh
+   export LITELLM_BASE_URL='http://127.0.0.1:4000'
+   export LITELLM_MASTER_KEY='replace-with-gateway-master-key'
+   ```
+
+   携带上述环境变量从 `build/ragflow` 启动编译好的 RAGFlow API 与 Admin 服务。在 `extensions/model-platform/gateway/litellm-config.yaml` 中添加新模型路由后，请先重新校验配置再强制重建网关容器（`(cd extensions/model-platform/gateway && ./validate-gateway-config.sh && docker compose up -d --force-recreate --no-deps litellm-proxy)`），避免非法 YAML 中断运行中的网关并确保挂载经编辑器原子替换后的配置文件，随后进入 **Admin 控制台 → 模型供应商**（`/admin/model-providers`）上架模型即可。
 
 ## 文档导航
 

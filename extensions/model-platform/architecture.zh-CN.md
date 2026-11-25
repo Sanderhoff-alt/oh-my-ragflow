@@ -24,7 +24,7 @@
 ```mermaid
 flowchart LR
     AdminUI["Admin 控制台 UI 覆盖层<br/>(/admin/model-providers,<br/>/admin/model-usage-statistics,<br/>/admin/model-tenants)"] -->|"Admin API<br/>/api/v1/admin/model-platform/*"| AdminSvc["模型平台 Admin API<br/>(RAGFlow Admin :9381)"]
-    Workers["API 服务后台 Worker<br/>(Reconciler, Publisher, Metering,<br/>Key Sweeper, Orphan Scanner)"] -->|"Master Key<br/>/key/*, /v1/models, /global/spend/logs"| Gateway["LiteLLM 模型网关<br/>(127.0.0.1:4000)"]
+    Workers["API 服务后台 Worker<br/>(Reconciler, Publisher, Metering,<br/>Key Sweeper, Orphan Scanner)"] -->|"Master Key<br/>/key/*, /v1/models, /spend/logs/v2"| Gateway["LiteLLM 模型网关<br/>(127.0.0.1:4000)"]
     AdminSvc -->|"Master Key<br/>(健康检查/目录校验/密钥轮换)"| Gateway
     Workers -->|"预配 / 收敛<br/>托管目录与默认槽位"| RAGFlowDB[("RAGFlow 数据库")]
     AppAPI["RAGFlow 核心 + 应用守卫<br/>(ManagedProvider, DatasetImmutability,<br/>DefaultModelPreference)"] -->|"租户虚拟密钥<br/>sk-tenant-*"| Gateway
@@ -39,7 +39,7 @@ flowchart LR
 | **RAGFlow 核心（`upstream/ragflow`）** | 租户认证、模型工厂与驱动、对话/知识库/智能体流水线、基础前后端 UI | 100% 洁净的官方 Git 子模块（零本地改动） |
 | **控制面与守卫（`extensions/model-platform/backend`）** | 13 个 Admin API 端点、3 个 App API 守卫中间件、5 个后台 Worker 循环、6 项数据库迁移 | 仅通过 `ee-baseline` 桩与薄 Go Trampoline 接入 |
 | **Web UI 覆盖层（`extensions/model-platform/overlay/web/src/ee`）** | 3 个 Admin 治理页面、多语言文案、`ProviderInstanceCardWithPrivilege` 只读保护层 | 在 `VITE_RAGFLOW_ENTERPRISE=false` 条件下通过上游 `src/ee` 接缝注入 |
-| **LiteLLM 网关（`extensions/model-platform/gateway`）** | 根密钥隔离托管、按 Team 划分的虚拟密钥、模型白名单路由与权威账单日志 | 仅监听环回 `127.0.0.1:4000` + 独立 PostgreSQL；根密钥不离容器 |
+| **LiteLLM 网关（`extensions/model-platform/gateway`）** | 根密钥隔离托管、按 Team 划分的虚拟密钥、模型白名单路由与权威账单日志 | 仅监听环回 `127.0.0.1:4000` + 独立 PostgreSQL；根密钥仅驻留网关并仅用于请求上游供应商（绝不暴露给租户或 Admin API） |
 
 ---
 
@@ -51,7 +51,7 @@ flowchart LR
 4. **默认模型粘性来源保护**：平台切换默认模型仅迁移来源为 `platform_default` 的用户；由 `DefaultModelPreferenceMiddleware` 观测并记录为 `user_explicit` 的用户选择受到保护，除非所选模型被退役并进入 `tombstoned`。
 5. **知识库向量空间不可变**：包含文档或已解析切片的非空知识库禁止更换向量模型（HTTP `400`）；已退役向量模型对存量引用知识库保持只读可用，同时阻止新建或空知识库绑定。
 6. **物理零计费直连旁路**：租户自有 BYOK 实例不经平台网关直连外部端点，产生严格 `$0.00` 平台费用，可通过 `GET /api/v1/admin/model-platform/usage/audit` 实时审计验证。
-7. **先网关后数据库收敛与计量数学幂等**：目录分发先更新网关白名单再更新数据库，防止租户看到网关拒绝调用的模型；原始账单按 `spend_id` 去重，日汇总采用自然日对齐的替换 Upsert 而非增量累加。
+7. **先网关后数据库收敛与计量数学幂等**：目录上架/激活时先更新网关白名单再写入数据库，确保新模型对租户可见前已可路由；退役时同样先移除网关白名单再禁用 `tenant_model`（存在短暂的 fail-closed 窗口，网关先阻断新流量随后数据库收敛）。原始账单按 `spend_id` 去重，日汇总采用自然日对齐的替换 Upsert 而非增量累加。
 
 ---
 

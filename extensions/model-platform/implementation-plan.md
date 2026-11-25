@@ -186,7 +186,7 @@ flowchart TD
         TryReconcile -->|"Exhausted"| SetDegraded["status = degraded"]
     end
     subgraph Tier2 ["Tier 2: Level-Triggered Poller"]
-        Poller["ReconcilePoller (every 30s)"] --> FindDue["Find pending/degraded due + stale provisioning (>5m)"]
+        Poller["ReconcilePoller (every 30s)"] --> FindDue["Find pending/degraded due + stale provisioning (>2m)"]
         FindDue --> TryHeal{"Gateway Available?"}
         TryHeal -->|"Yes"| SetReady
         TryHeal -->|"No"| Backoff2["Jittered Backoff (up to 10m, max 50 retries)"]
@@ -194,7 +194,7 @@ flowchart TD
     SetDegraded --> Poller
 ```
 
-- Concurrency across replicas is coordinated by optimistic version locking (`WHERE tenant_id = ? AND version = ?`) and lease reclamation for `provisioning` rows stale for `> 5m`.
+- Concurrency across replicas is coordinated by optimistic version locking (`WHERE tenant_id = ? AND version = ?`) and lease reclamation for `provisioning` rows stale for `> 2m`.
 
 ### 4.3 Reconcile State Machine & Schema (`platform_tenant_reconcile`)
 
@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
 
 ### 4.4 Native Driver Resolution & Compensating Rollback
 
-`TenantReconciler.Reconcile` provisions `ProviderName = "OpenAI-API-Compatible"`, `InstanceName = "platform"`, `extra = {"is_managed": true}`, active catalog `tenant_model` rows, and initial empty default slots. Before issuing a new key it cleans up any leftover team keys; if DB persistence fails after issuing a key, compensating rollback revokes the new key immediately by its `key_hash`.
+`TenantReconciler.Reconcile` provisions `ProviderName = "OpenAI-API-Compatible"`, `InstanceName = "platform"`, `extra = {"is_managed": true}`, active catalog `tenant_model` rows, and initial empty default slots. Before issuing a new key it cleans up any leftover team keys; if DB persistence fails after issuing a key, compensating rollback attempts a single `DeleteKeysByHash` revocation for the newly issued key (if that revocation fails, the leftover key remains until the gateway recovers and a subsequent reconcile sweeps it while the tenant is `pending`/`degraded` under the 50-retry limit, or until manual cleanup/escalation if the tenant reaches `failed`).
 
 ### 4.5 Managed Provider Write Protection (`ManagedProviderGuardMiddleware`)
 
@@ -284,7 +284,7 @@ Per-tenant derived model states:
 | `retired` | `embedding` (`2`) | `0` | `disabled` + `extra.tombstoned=true` | Evicted |
 | `retired` | All other 6 types | Any | `disabled` + `extra.tombstoned=true` | Evicted |
 
-- **Gateway First, DB Second**: Always updates LiteLLM `/key/update` (rebuilding the full `models` list under the provider row lock + in-process mutex) before modifying `tenant_model`, so tenants never see an unroutable model.
+- **Gateway First, DB Second**: Always updates LiteLLM `/key/update` (rebuilding the full `models` list under the provider row lock + in-process mutex) before modifying `tenant_model`. On activation, this guarantees a newly visible model is already routable at the gateway; on retirement, it intentionally fails closed (revoking gateway access first, then disabling `tenant_model`), with publish-worker retries converging any transient DB failure after the gateway update.
 - **Defaults Never Changed by Onboarding**: Only `PUT /models/:id/default` promotes a default; retiring a model currently marked `is_default` is rejected with `400`. When a model is tombstoned in a tenant, users whose default pointed to it are moved to the current platform default (or cleared if none exists).
 
 ### 5.3 Atomic Default Initialization, Inheritance & Sticky Provenance
@@ -362,7 +362,7 @@ Managed by `migration/004_usage_schema.go` (`platform_tenant_usage_daily`, PK `(
 
 ```mermaid
 flowchart TD
-    LiteLLM[("LiteLLM /global/spend/logs")] -->|"Online checkpoint (~10m) / Uncapped restart replay / Day-aligned cold start"| Collector["SpendLogCollector"]
+    LiteLLM[("LiteLLM /spend/logs/v2")] -->|"Online checkpoint (~10m) / Uncapped restart replay / Day-aligned cold start"| Collector["SpendLogCollector"]
     Collector -->|"ON CONFLICT DO NOTHING (spend_id)"| Staging[("platform_gateway_spend_log")]
     Staging -->|"Routine lookback + dynamic multi-day catch-up<br/>(METERING_TIMEZONE aligned)"| Pipeline["UsagePipeline"]
     Pipeline -->|"Replacement Upsert (no +=)"| Daily[("platform_tenant_usage_daily")]
@@ -372,8 +372,9 @@ flowchart TD
 
 - **Cold Start**: Aligns fetch boundary to `00:00:00` in `METERING_TIMEZONE` for the day `METERING_LOOKBACK_HOURS` (default `48`) earlier.
 - **Online Operation**: Advances an in-memory `lastCheckedAt` checkpoint after every successful poll (even with 0 logs), keeping queries bounded to `[lastCheckedAt - METERING_FETCH_OVERLAP, Now]`.
-- **Restart Recovery & Dynamic Catch-up**: Resumes uncapped from `MAX(request_time) - METERING_FETCH_OVERLAP`. If any newly inserted row has `EarliestInsertedAt < EndTime - METERING_LOOKBACK_HOURS`, Loop 1 immediately triggers `UsagePipeline.AggregateDailyUsage` over `[EarliestInsertedAt, EndTime]` (retaining pending catch-up retries across cycles on transient failure).
-- **Cross-Dialect SQL**: `resolveDateExpression` adapts timezone date bucketing across MySQL, PostgreSQL, and SQLite.
+- **Restart Recovery & Dynamic Catch-up**: Resumes uncapped from `MAX(request_time) - METERING_FETCH_OVERLAP` for logs still retained at the gateway. If any newly inserted row has `EarliestInsertedAt < EndTime - METERING_LOOKBACK_HOURS`, Loop 1 immediately triggers `UsagePipeline.AggregateDailyUsage` over `[EarliestInsertedAt, EndTime]`. On transient aggregation failure, `pendingCatchupStart` is retained in `MeteringDaemon` process memory and retried on subsequent polling cycles within the same process; it is not persisted across an API process restart, so if the process restarts after staging old rows but before catch-up aggregation succeeds, dates older than `METERING_LOOKBACK_HOURS` will not be automatically re-triggered (and retention purges in the new process will not know to preserve those unaggregated rows) unless `METERING_LOOKBACK_HOURS` covers them or a manual rollup is run. **Purge-safety warning**: Because `AggregateDailyUsage` uses replacement upserts and does not detect previously purged days, before widening `METERING_LOOKBACK_HOURS` or running a manual rollup over older dates, operators must verify that `platform_gateway_spend_log` still holds complete raw rows for every calendar day in the target range; otherwise re-aggregating a partially purged day will overwrite its stored daily total with a lower sum.
+- **Accepted Bounds & Operator Sizing**: Both online polling and restart replay query backward by `METERING_FETCH_OVERLAP` (default `5m`). Any gateway spend log written later than `METERING_FETCH_OVERLAP` after its `request_time` falls behind the lower bound and will not be picked up or recovered by dynamic catch-up; similarly, logs purged by gateway retention (`maximum_spend_logs_retention_period`) during an outage cannot be replayed. Operators should size `METERING_FETCH_OVERLAP` above expected gateway write latency and keep gateway retention longer than the maximum tolerated outage plus collection delay.
+- **Cross-Dialect SQL**: `resolveDateExpression` adapts calendar-day bucketing across PostgreSQL, MySQL, and SQLite. PostgreSQL applies per-row `AT TIME ZONE` rules for IANA zone names; MySQL and SQLite apply a single fixed offset computed at aggregation time, so historical backfills across a DST transition may assign rows to the adjacent calendar day.
 
 ### 6.3 Declarative Opt-In Spend Log Retention
 
@@ -394,13 +395,13 @@ Self-owned BYOK instances connect directly to external URLs, generating zero Lit
 
 | Failure Scenario | Impact Scope | Defense & Recovery Mechanism |
 | :--- | :--- | :--- |
-| Gateway down during tenant creation | Provisioning delayed | `OnTenantCreateHook` commits local SQL only; Tier-1 retries, then Tier-2 `ReconcilePoller` heals to `ready` on recovery. |
-| DB failure after virtual key generated | Orphaned gateway key | Compensating rollback revokes the new key by `key_hash`; subsequent reconcile sweeps leftover team keys first. |
-| Worker crash during provisioning or rollout | Stuck `provisioning` / `running` item | Lease timeout reclaims `provisioning` after `5m` and publish items after `2m`. |
+| Gateway down during tenant creation | Provisioning delayed | `OnTenantCreateHook` commits local SQL only; Tier-1 retries, then Tier-2 `ReconcilePoller` heals `pending`/`degraded` tenants to `ready` on recovery while `retry_count < 50`. Once a tenant reaches the 50-retry limit, it transitions to `failed`, is no longer selected by `ReconcilePoller`, and requires manual recovery. |
+| DB failure after virtual key generated | Orphaned gateway key | Compensating rollback attempts a single `DeleteKeysByHash` for the new key; if revocation also fails, leftover team keys remain until the gateway recovers and a subsequent reconcile runs (`issueFreshKey` sweeps leftover team keys while the tenant is still `pending`/`degraded` under the 50-retry limit; tenants that reach `failed` require manual cleanup/escalation). |
+| Worker crash during provisioning or rollout | Stuck `provisioning` / `running` item | Lease timeout reclaims stale `provisioning` and publish `running` items after `2m`. |
 | Tenant deleted upstream | Residual active key | `scanOrphanedTenants` (`1h`) + `TenantDecommissioner` revoke all team keys and mark `deleted`. |
-| Tenant virtual key leaked | Unauthorized spend until rotated | `POST /tenants/:tenant_id/rotate-key` (or `emergency-rotate-keys.sh`) swaps keys atomically with zero downtime; `sweepDirtyKeys` (`1m`) guarantees old-key revocation converges. |
+| Tenant virtual key leaked | Unauthorized spend until rotated | `POST /tenants/:tenant_id/rotate-key` (or `emergency-rotate-keys.sh`) swaps keys atomically with zero downtime; `sweepDirtyKeys` (`1m`) retries old-key revocation, which stays pending while the gateway is unreachable. |
 | Embedding model retired with active KBs | Existing KB vector search | 3-stage lifecycle preserves read-only gateway whitelist until KB count drops to 0; `DatasetImmutabilityGuard` blocks new/empty bindings. |
-| Prolonged API or gateway outage | Metering gap across days | Uncapped DB-watermark replay + automatic dynamic multi-day catch-up with replacement upserts (zero double-counting). |
+| Prolonged API or gateway outage | Metering gap across days | Uncapped DB-watermark replay + dynamic multi-day catch-up with replacement upserts (zero double-counting), subject to Section 6.2 bounds: logs expired under gateway retention (`maximum_spend_logs_retention_period`) cannot be replayed, and pending catch-up state is in-memory only (if the API process restarts before catch-up succeeds, operators must confirm raw log completeness in `platform_gateway_spend_log` before widening `METERING_LOOKBACK_HOURS` or running a manual rollup). |
 | Tenant attempts to modify/delete `platform` | Tampering / metering corruption | UI hides mutation controls (`ProviderInstanceCardWithPrivilege`); backend returns HTTP `403` (`ManagedProviderGuardMiddleware`). |
 
 ### 7.2 End-to-End Verification & CI Commands
@@ -415,12 +416,12 @@ bash extensions/model-platform/gateway/validate-gateway-config.sh
 # 3. Assemble isolated build workspace and compile Go (ee) + Web (enterprise flag off)
 bash extensions/model-platform/scripts/apply-overlay.sh
 (cd build/ragflow && RAGFLOW_GO_TAGS=ee bash build.sh --go)
-(cd build/ragflow/web && VITE_RAGFLOW_ENTERPRISE=false npm run build)
+(cd build/ragflow/web && npm ci && VITE_RAGFLOW_ENTERPRISE=false npm run build)
 
 # 4. Run Go unit tests across all model-platform backend packages
 (cd build/ragflow && go test -tags "cgo,static,sonic,ee" ./extensions/model-platform/backend/...)
 
 # 5. Run live Dockerized E2E suites (core, security/stability, admin integration, dynamic catalog, key rotation)
-docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml up -d
-(cd build/ragflow && go test -v -tags "cgo,static,sonic,ee" ./extensions/model-platform/tests/e2e/...)
+docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml up -d --wait
+(cd build/ragflow && REQUIRE_LIVE_GATEWAY=true go test -count=1 -v -tags "cgo,static,sonic,ee" ./extensions/model-platform/tests/e2e/...)
 ```

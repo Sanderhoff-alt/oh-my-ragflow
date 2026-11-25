@@ -87,12 +87,12 @@ flowchart TD
     Check -->|"Yes (provenance = user_explicit)"| Keep["User's explicit choice is preserved untouched"]
 ```
 
-- **Never touched the dropdown?** Your slot stays `platform_default` and automatically upgrades when the platform administrator promotes a newer default model.
-- **Manually picked a model (platform or BYOK)?** `DefaultModelPreferenceMiddleware` records your choice as `user_explicit`. Future platform default upgrades will **not** overwrite your selection.
+- **Never changed the slot?** Your slot stays `platform_default` and automatically upgrades when the platform administrator promotes a newer default model.
+- **Manually switched to a different model (platform or BYOK)?** `DefaultModelPreferenceMiddleware` records that change as `user_explicit`. Future platform default upgrades will **not** overwrite your selection. (Re-selecting the model that is already assigned as `platform_default` does **not** change its provenance to `user_explicit`, so a later platform upgrade may still update it.)
 - **Newly joined team members**: Empty default slots are initialized from the Tenant Owner's current defaults when you join the workspace.
 
 > [!NOTE]
-> Clearing a default slot or re-selecting the exact same model does not overwrite existing provenance. If a model you explicitly selected is later **retired** by the platform administrator, your default slot is safely moved to the current platform default so new chats and datasets do not fail.
+> Clearing a default slot or re-selecting the exact same model does not overwrite existing provenance. When a platform model is **tombstoned** in your tenant (for example, any retired non-embedding model or a retired embedding model with no remaining datasets), your default slot is automatically moved to the current active platform default for that type — or cleared (with its preference record removed) if no usable active platform default currently exists. However, if a retired **embedding** model is still referenced by existing datasets in your tenant, it remains in a read-only `deprecated` state and your default slot stays unchanged until it is tombstoned; creating a new dataset without specifying an explicit `embedding_model` will return HTTP `400`, so either choose an active embedding model on creation or update your default embedding slot.
 
 ### 3.3 Bring Your Own Key (BYOK) — Tenant Owner Workflow
 
@@ -143,9 +143,9 @@ flowchart TD
 
 For `Chat`, `Decision`, `Rerank`, `ASR`, `Vision`, and `TTS` models:
 
-- The retired model is disabled immediately in your tenant.
-- Existing assistants (`Dialog`) referencing that model will prompt you to select an active model.
-- Any user whose default model pointed to the retired model is automatically moved to the platform default for that type.
+- A background rollout task disables the retired model across tenants as each tenant converges.
+- Existing assistants (`Dialog`) still bound to the retired model will fail/be rejected when sending requests (because the model is disabled in the tenant and removed from the gateway whitelist) until the assistant owner switches to an active model in the assistant's settings.
+- Once the model is tombstoned for your tenant, any user whose default model pointed to it is automatically moved to the current active platform default for that type (or the default slot is cleared if no usable platform default exists).
 
 ---
 
@@ -161,7 +161,7 @@ Platform-managed instances use tenant-scoped virtual keys managed centrally by t
 No. BYOK instances bypass the platform model gateway completely and connect directly to your configured provider URL, incurring strictly `$0.00` platform spend.
 
 **Q4: The platform admin changed the default chat model, why did mine stay the same (or why did it change)?**  
-If you previously chose a chat model manually in **Set default models**, Sticky Selection protects your choice (`user_explicit`). If you had never customized that slot, it remained `platform_default` and automatically upgraded to the new platform default.
+If you previously switched the chat slot to a different model in **Set default models**, Sticky Selection recorded your choice as `user_explicit` and preserved it. If you never changed that slot (or only re-selected the already-assigned `platform_default` model), its provenance remained `platform_default` and automatically upgraded to the new platform default.
 
 **Q5: Why can't I change the embedding model of my existing dataset?**  
 Once a dataset has documents or parsed chunks, changing its embedding model would mix incompatible vector spaces and corrupt search results. Create a new dataset with the new embedding model and re-index your files.

@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 The `model-platform` extension provides centrally managed, tenant-scoped platform models for RAGFlow through an isolated LiteLLM gateway while preserving every tenant's freedom to configure Bring Your Own Key (BYOK) providers. Platform model consumption is attributed and metered authoritatively at the gateway; tenant-owned BYOK traffic bypasses the gateway physically and incurs `$0.00` platform spend.
 
-**Status:** Production Ready (Phases 0–5 Completed & Merged, including Dynamic Model Catalog, Emergency Key Rotation, Self-Healing Metering, and Admin Governance UI).
+**Status:** Production Ready (Dynamic Model Catalog, Tenant Lifecycle & Self-Healing, Emergency Key Rotation, Authoritative Metering & Audit, and Admin Governance UI).
 
 ## Feature Highlights
 
@@ -21,30 +21,38 @@ The `model-platform` extension provides centrally managed, tenant-scoped platfor
 
 ## Quick Start
 
-1. **Start the isolated LiteLLM gateway**:
+1. **Configure and start the isolated LiteLLM gateway**:
+
+   First create `.env` (without overwriting an existing one) and populate real secrets for `POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and `PLATFORM_UPSTREAM_OPENAI_KEY` (if `POSTGRES_PASSWORD` contains URL-reserved characters such as `@`, `#`, `:`, `/`, or `%`, set an explicit percent-encoded `DATABASE_URL` as well):
 
    ```sh
-   cd extensions/model-platform/gateway
-   cp .env.example .env
-   # Populate POSTGRES_PASSWORD, LITELLM_MASTER_KEY, LITELLM_SALT_KEY, and upstream provider keys
-   ./validate-gateway-config.sh
-   docker compose up -d
+   [ -f extensions/model-platform/gateway/.env ] || cp extensions/model-platform/gateway/.env.example extensions/model-platform/gateway/.env
+   chmod 600 extensions/model-platform/gateway/.env
+   # Edit extensions/model-platform/gateway/.env and replace all example secrets before continuing
    ```
 
-2. **Assemble and build the enhanced RAGFlow distribution** (keeping `upstream/ragflow` 100% untouched):
+   Then validate the configuration and start the gateway in a subshell (so your shell stays at the repository root, and startup aborts if validation fails):
 
    ```sh
-   ./extensions/model-platform/scripts/apply-overlay.sh
+   (cd extensions/model-platform/gateway && ./validate-gateway-config.sh && docker compose up -d)
    ```
 
-3. **Configure RAGFlow API & Admin environment variables**:
+2. **Assemble and build the enhanced RAGFlow distribution** from the repository root (keeping `upstream/ragflow` 100% untouched):
 
    ```sh
-   export LITELLM_BASE_URL=http://127.0.0.1:4000
-   export LITELLM_MASTER_KEY=<same-master-key-as-gateway>
+   ./extensions/model-platform/scripts/apply-overlay.sh \
+     && (cd build/ragflow && RAGFLOW_GO_TAGS=ee bash build.sh --go) \
+     && (cd build/ragflow/web && npm ci && VITE_RAGFLOW_ENTERPRISE=false npm run build)
    ```
 
-   Start the enhanced RAGFlow API and Admin services, then add routes to `gateway/litellm-config.yaml` and onboard models from **Admin Console → Model Providers** (`/admin/model-providers`).
+3. **Configure RAGFlow API & Admin environment variables** (enter `LITELLM_MASTER_KEY` verbatim as set in `.env`, using single quotes so the shell does not expand `$` or other special characters):
+
+   ```sh
+   export LITELLM_BASE_URL='http://127.0.0.1:4000'
+   export LITELLM_MASTER_KEY='replace-with-gateway-master-key'
+   ```
+
+   Start the compiled RAGFlow API and Admin services from `build/ragflow` with these environment variables set. When adding a model route to `extensions/model-platform/gateway/litellm-config.yaml`, re-validate the config before recreating the proxy container (`(cd extensions/model-platform/gateway && ./validate-gateway-config.sh && docker compose up -d --force-recreate --no-deps litellm-proxy)`) so invalid YAML cannot disrupt the running gateway and LiteLLM mounts any atomically replaced config file, then onboard the model from **Admin Console → Model Providers** (`/admin/model-providers`).
 
 ## Documentation
 

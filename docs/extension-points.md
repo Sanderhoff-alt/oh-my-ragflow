@@ -31,7 +31,7 @@ Representative seams in the pinned source include:
 | Billing and permissions | [`internal/service/billing/stub.go`](../upstream/ragflow/internal/service/billing/stub.go), [`internal/permission/stub.go`](../upstream/ragflow/internal/permission/stub.go) | Billing service and permission-policy seams |
 | Other packages | [`cmd`](../upstream/ragflow/cmd), [`internal`](../upstream/ragflow/internal) | Additional tagged files and definitions; this table is not exhaustive |
 
-For example, the tenant DAO calls its creation hook inside a transaction before inserting the tenant. That hook alone does not establish a safe post-commit lifecycle or justify remote side effects. The model-platform-specific questions are documented in its [architecture](../extensions/model-platform/architecture.md).
+For example, the tenant DAO calls its creation hook inside a transaction before inserting the tenant. That hook alone does not establish a safe post-commit lifecycle or justify remote side effects; how `model-platform` decouples post-commit reconciliation through local staging and visibility pre-checks is documented in its [architecture](../extensions/model-platform/architecture.md) and [engineering design reference](../extensions/model-platform/implementation-plan.md).
 
 The upstream build script also optionally sources `build_ee.sh` and has a guarded enterprise native-integration-test hook. These are build integration seams, not evidence that arbitrary runtime hooks exist. Verify their exact behavior before using them.
 

@@ -124,7 +124,7 @@ Lists every catalog model sorted by `model_name`, enriched with per-tenant state
 
 #### `POST /api/v1/admin/model-platform/models`
 
-Onboards a model into the managed catalog and starts an asynchronous rollout to every `ready` tenant that does not yet have it. Re-publishing the same active `(model_name, model_type)` is idempotent and only enqueues tenants still missing it. **Never modifies existing defaults.**
+Onboards a model into the managed catalog and starts an asynchronous rollout to every `ready` tenant that does not yet have it. Re-publishing the same active `(model_name, model_type)` is idempotent and only enqueues tenants still missing it. **Never changes the catalog default**; however, if an administrator re-publishes a model that is already marked as the catalog default for tenants that lack it, the rollout worker will converge those tenants' users who have `platform_default` provenance or no preference record onto that default (preserving `user_explicit` users).
 
 **Request Body:**
 
@@ -166,10 +166,12 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
 
 #### `POST /api/v1/admin/model-platform/models/:id/retire`
 
-Retires an active catalog model and launches a rollout converging all tenants:
+Retires an active catalog model and launches an asynchronous rollout task processed per tenant by the background publish worker:
 
-- **Embedding (`2`)**: Transitions tenants with referencing datasets to `deprecated` (read-only) and tombstones tenants with zero references.
-- **Non-embedding (`1, 4, 8, 16, 32, 128`)**: Immediately disables/tombstones across tenants and moves affected default users to the platform default.
+- **Embedding (`2`)**: Transitions tenants with referencing datasets to `deprecated` (read-only) and transitions tenants with zero references to `tombstoned` as each tenant item is processed.
+- **Non-embedding (`1, 4, 8, 16, 32, 128`)**: Converges each tenant asynchronously to disabled/`tombstoned` and moves affected default users to the platform default.
+
+Transient gateway/DB errors for a tenant item are retried with backoff; items reaching the retry limit (default 20) enter `failed` and can be inspected via `GET /api/v1/admin/model-platform/models/publish/tasks/:id` and re-queued via `POST /api/v1/admin/model-platform/models/publish/tasks/:id/retry`.
 
 **Response (`202 Accepted`):** Same `Result` shape (`task_id`, `total`, optional `affected_users_count`).
 
@@ -194,7 +196,7 @@ Reactivates a retired catalog model and launches a rollout restoring it to all r
 
 #### `PUT /api/v1/admin/model-platform/models/:id/default`
 
-Promotes an active catalog model to the platform default for its `model_type`. The rollout updates users whose preference provenance is `platform_default` while preserving `user_explicit` selections.
+Promotes an active catalog model to the platform default for its `model_type`. The rollout updates users whose preference provenance is `platform_default` **or who have no preference record** (even if their current default slot is non-empty), while preserving `user_explicit` selections.
 
 **Response (`202 Accepted`):**
 
@@ -203,8 +205,7 @@ Promotes an active catalog model to the platform default for its `model_type`. T
   "code": 202,
   "data": {
     "task_id": "3a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d",
-    "total": 42,
-    "affected_users_count": 28
+    "total": 42
   }
 }
 ```
@@ -310,7 +311,7 @@ Lists managed tenants and their gateway virtual key metadata using stable cursor
       {
         "tenant_id": "tenant_acme_01",
         "status": "ready",
-        "key_alias": "tenant-tenant_acme_01-v3",
+        "key_alias": "tenant_tenant_acme_01_a94f3c1e",
         "key_fingerprint": "a94f3c1e",
         "key_rotated_at": "2026-11-24T14:22:10Z",
         "key_rotated_by": "admin@example.com"
@@ -318,7 +319,7 @@ Lists managed tenants and their gateway virtual key metadata using stable cursor
       {
         "tenant_id": "tenant_nova_02",
         "status": "ready",
-        "key_alias": "tenant-tenant_nova_02-v2",
+        "key_alias": "tenant_tenant_nova_02_7d12e8b4",
         "key_fingerprint": "7d12e8b4",
         "key_rotated_at": "2026-11-25T07:50:00Z",
         "key_rotated_by": "admin@example.com",
@@ -346,14 +347,14 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/tenants/tenant_ac
 **Success Responses:**
 
 - `200 OK` — New key is active and **all superseded keys were revoked** (`old_keys_revoked: true`).
-- `202 Accepted` — New key is active, but **revocation of one or more superseded keys is still converging** (`old_keys_revoked: false`). The background `sweepDirtyKeys` loop retries automatically, or you may call this endpoint again immediately.
+- `202 Accepted` — New key is active, but **revocation of one or more superseded keys is still converging** (`old_keys_revoked: false`). Waiting for the background `sweepDirtyKeys` loop retries only old-key revocation; calling this endpoint again executes another full rotation (issuing and switching to a different new key before attempting to revoke all superseded keys, without guaranteeing revocation succeeds if the gateway is still failing).
 
 ```json
 {
   "code": 200,
   "data": {
     "tenant_id": "tenant_acme_01",
-    "key_alias": "tenant-tenant_acme_01-v4",
+    "key_alias": "tenant_tenant_acme_01_9c31b7d2",
     "new_key_fingerprint": "9c31b7d2",
     "rotated_at": "2026-11-25T09:10:00Z",
     "revoked_keys": 1,
@@ -466,6 +467,15 @@ Returns high-level aggregated consumption totals across the same filter paramete
         "total_tokens": 1690000,
         "characters": 0,
         "total_spend": 0.4382
+      },
+      "embedding": {
+        "model_type": 2,
+        "call_count": 640,
+        "prompt_tokens": 2150000,
+        "completion_tokens": 0,
+        "total_tokens": 2150000,
+        "characters": 0,
+        "total_spend": 0.043
       }
     },
     "start_date": "2026-11-25",
@@ -478,7 +488,7 @@ Returns high-level aggregated consumption totals across the same filter paramete
 
 #### `GET /api/v1/admin/model-platform/usage/audit`
 
-Conducts a live spend isolation audit against the raw gateway staging table (`platform_gateway_spend_log`), comparing every billed `model_name` for `tenant_id` against that tenant's authorized managed models in `OpenAI-API-Compatible` → `platform`.
+Conducts a live spend isolation audit against the records currently staged in the raw gateway table (`platform_gateway_spend_log`), comparing every staged `model_name` for `tenant_id` via exact string match against the tenant's current `tenant_model` rows under `OpenAI-API-Compatible` → `platform` (not filtered by model status). Passing (`audit_passed: true`) confirms that all currently staged gateway spend records match that current managed-model list; it does not cover traffic that bypassed the gateway, has not yet been collected, or was already purged by retention, nor does it prove that every historical call was authorized at the exact time it occurred (for example, if a now-disabled or retired row still exists in `tenant_model`).
 
 **Query Parameters:**
 
@@ -558,9 +568,9 @@ Prevents vector space corruption and retired-embedding bindings on dataset creat
 
 | Trigger | HTTP Status | Exact Message Template |
 | :--- | :---: | :--- |
-| Creating or updating a dataset with a retired/deprecated/read-only embedding model | `400` | `Embedding model "<model>" is retired/deprecated and cannot be used for knowledgebases. Please choose an active model.` |
+| Creating a dataset with a retired/deprecated/read-only embedding model, or updating a dataset to switch to a different retired/deprecated/read-only embedding model | `400` | `Embedding model "<model>" is retired/deprecated and cannot be used for knowledgebases. Please choose an active model.` |
 | Creating a dataset without an explicit embedding when the requesting user's default embedding is retired/deprecated | `400` | `Tenant default embedding model "<model>" is retired/deprecated. Please specify an active embedding model or update tenant default setting.` |
-| Changing the embedding model of a dataset that already has `chunk_num > 0`, `doc_num > 0`, or active rows in `document` | `400` | `Cannot modify embedding model of a dataset that already contains parsed documents or chunks. Create a new dataset to use a different embedding model.` |
+| Changing the embedding model of a dataset that already has `chunk_num > 0`, `doc_num > 0`, or active rows in `document` (to a different **active** model; if the new model is retired/deprecated, the retired-model check above takes precedence) | `400` | `Cannot modify embedding model of a dataset that already contains parsed documents or chunks. Create a new dataset to use a different embedding model.` |
 
 > [!NOTE]
 > Submitting the dataset's **existing** embedding model unchanged is always permitted. Changing the embedding model of a **completely empty** dataset to an **active** model is also permitted.
@@ -578,4 +588,4 @@ Observes user-initiated changes to personal default model slots so `StickyGuard`
 - **Behavior**:
   - Does not alter upstream request/response formats or introduce new error codes.
   - Compares the requesting user's `user_tenant` default slots before and after the upstream handler executes.
-  - Whenever a slot changes to a different non-empty value, records its provenance as `user_explicit` under a row lock so subsequent `PUT /api/v1/admin/model-platform/models/:id/default` rollouts preserve it.
+  - When a slot changes to a different non-empty value and both default-slot reads (before and after the handler) plus the recording write succeed, records its provenance as `user_explicit` under a row lock so subsequent `PUT /api/v1/admin/model-platform/models/:id/default` rollouts preserve it. If any of these steps fails, no `user_explicit` record is written, the error is attached only to the request context without altering the response, and a later default rollout can overwrite the choice. Selecting the same model again does not create a record.

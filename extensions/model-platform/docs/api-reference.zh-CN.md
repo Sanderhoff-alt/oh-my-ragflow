@@ -124,7 +124,7 @@
 
 #### `POST /api/v1/admin/model-platform/models`
 
-将模型录入平台托管目录，并启动异步任务向所有尚未拥有该模型的 `ready` 租户下发。对已上架的相同 `(model_name, model_type)` 重复调用具有幂等性，仅补发缺失租户。**绝不更改任何现有默认模型。**
+将模型录入平台托管目录，并启动异步任务向所有尚未拥有该模型的 `ready` 租户下发。对已上架的相同 `(model_name, model_type)` 重复调用具有幂等性，仅补发缺失租户。**绝不修改目录级的平台默认模型**；但若管理员对某个已被设为平台默认模型的条目重新执行上架以补发缺失租户，下发 Worker 在为这些租户补齐该模型后，会将其中来源为 `platform_default` 或尚无偏好记录的用户迁移至该默认模型（保留 `user_explicit` 用户）。
 
 **请求体字段：**
 
@@ -166,10 +166,12 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
 
 #### `POST /api/v1/admin/model-platform/models/:id/retire`
 
-退役一个活跃的托管模型并启动全租户收敛任务：
+退役一个活跃的托管模型并启动异步发布任务，由后台发布 Worker 按租户逐个收敛：
 
-- **向量模型（`2`）**：存在知识库引用的租户转为 `deprecated`（只读兼容），无引用的租户立即进入 `tombstoned`。
-- **非向量模型（`1, 4, 8, 16, 32, 128`）**：立即在全部租户禁用/退役，并将受影响的默认模型用户迁移至当前平台默认模型。
+- **向量模型（`2`）**：存在知识库引用的租户在任务处理到该租户时转为 `deprecated`（只读兼容），无引用的租户异步进入 `tombstoned`。
+- **非向量模型（`1, 4, 8, 16, 32, 128`）**：由后台 Worker 按租户异步收敛至禁用/`tombstoned`，并将受影响的默认模型用户迁移至当前平台默认模型。
+
+单租户若遇网关或数据库瞬时故障会按退避策略自动重试；达到重试上限（默认 20 次）的条目将转为 `failed`，可通过 `GET /api/v1/admin/model-platform/models/publish/tasks/:id` 轮询查看进度与失败明细，并通过 `POST /api/v1/admin/model-platform/models/publish/tasks/:id/retry` 重新入队。
 
 **响应（`202 Accepted`）：** 返回 `task_id`、`total` 与可选的 `affected_users_count`。
 
@@ -194,7 +196,7 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
 
 #### `PUT /api/v1/admin/model-platform/models/:id/default`
 
-将一个活跃托管模型设为所属 `model_type` 的平台默认模型。后台任务会将来源为 `platform_default` 的用户自动迁移至该模型，同时保留来源为 `user_explicit` 的用户自定义选择。
+将一个活跃托管模型设为所属 `model_type` 的平台默认模型。后台任务会将来源为 `platform_default` **或尚无偏好记录**（即使其当前默认槽位非空）的用户自动迁移至该模型，同时保留来源为 `user_explicit` 的用户自定义选择。
 
 **响应示例（`202 Accepted`）：**
 
@@ -203,8 +205,7 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
   "code": 202,
   "data": {
     "task_id": "3a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d",
-    "total": 42,
-    "affected_users_count": 28
+    "total": 42
   }
 }
 ```
@@ -310,7 +311,7 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
       {
         "tenant_id": "tenant_acme_01",
         "status": "ready",
-        "key_alias": "tenant-tenant_acme_01-v3",
+        "key_alias": "tenant_tenant_acme_01_a94f3c1e",
         "key_fingerprint": "a94f3c1e",
         "key_rotated_at": "2026-11-24T14:22:10Z",
         "key_rotated_by": "admin@example.com"
@@ -318,7 +319,7 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/models \
       {
         "tenant_id": "tenant_nova_02",
         "status": "ready",
-        "key_alias": "tenant-tenant_nova_02-v2",
+        "key_alias": "tenant_tenant_nova_02_7d12e8b4",
         "key_fingerprint": "7d12e8b4",
         "key_rotated_at": "2026-11-25T07:50:00Z",
         "key_rotated_by": "admin@example.com",
@@ -346,14 +347,14 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/tenants/tenant_ac
 **成功响应：**
 
 - `200 OK` — 新密钥已生效，且**全部旧密钥已完成吊销**（`old_keys_revoked: true`）。
-- `202 Accepted` — 新密钥已生效，但**部分旧密钥吊销仍在后台收敛中**（`old_keys_revoked: false`）。后台 `sweepDirtyKeys` 会持续重试，也可以立即重新调用本接口完成吊销。
+- `202 Accepted` — 新密钥已生效，但**部分旧密钥吊销仍在后台收敛中**（`old_keys_revoked: false`）。等待后台 `sweepDirtyKeys` 仅重试吊销旧密钥；若再次调用本接口，则会执行一次新的完整轮换（先签发并切换到另一把新密钥，再重试吊销包括前一次在内的所有旧密钥，且若网关仍异常并不保证吊销成功）。
 
 ```json
 {
   "code": 200,
   "data": {
     "tenant_id": "tenant_acme_01",
-    "key_alias": "tenant-tenant_acme_01-v4",
+    "key_alias": "tenant_tenant_acme_01_9c31b7d2",
     "new_key_fingerprint": "9c31b7d2",
     "rotated_at": "2026-11-25T09:10:00Z",
     "revoked_keys": 1,
@@ -466,6 +467,15 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/tenants/tenant_ac
         "total_tokens": 1690000,
         "characters": 0,
         "total_spend": 0.4382
+      },
+      "embedding": {
+        "model_type": 2,
+        "call_count": 640,
+        "prompt_tokens": 2150000,
+        "completion_tokens": 0,
+        "total_tokens": 2150000,
+        "characters": 0,
+        "total_spend": 0.043
       }
     },
     "start_date": "2026-11-25",
@@ -478,7 +488,7 @@ curl -X POST http://127.0.0.1:9381/api/v1/admin/model-platform/tenants/tenant_ac
 
 #### `GET /api/v1/admin/model-platform/usage/audit`
 
-直接扫描权威原始账单表 `platform_gateway_spend_log`，将指定 `tenant_id` 产生费用的每一条 `model_name` 与该租户在 `OpenAI-API-Compatible` → `platform` 下合法授权的托管模型清单逐条比对。
+直接扫描当前留存在权威原始账单暂存表 `platform_gateway_spend_log` 中的记录，将指定 `tenant_id` 的每一条已采集 `model_name` 与该租户在 `OpenAI-API-Compatible` → `platform` 下当前的 `tenant_model` 清单逐条做精确字符串比对（不按模型状态过滤）。审计通过（`audit_passed: true`）仅表示当前暂存表中的所有网关计费记录均命中该托管模型清单：它不覆盖绕过网关、尚未采集或已因保留策略被清理的流量，也不证明每条历史调用在发生时均处于已授权状态（例如已禁用或已退役但仍保留在 `tenant_model` 中的同名模型也会计入 `managed_spend_total`）。
 
 **查询参数：**
 
@@ -558,9 +568,9 @@ curl "http://127.0.0.1:9381/api/v1/admin/model-platform/usage/audit?tenant_id=te
 
 | 触发条件 | HTTP 状态码 | 精确错误消息模板 |
 | :--- | :---: | :--- |
-| 创建或更新知识库时绑定了已退役/弃用/只读的向量模型 | `400` | `Embedding model "<model>" is retired/deprecated and cannot be used for knowledgebases. Please choose an active model.` |
+| 创建知识库时绑定已退役/弃用/只读的向量模型，或更新知识库时尝试切换为另一个已退役/弃用/只读的向量模型 | `400` | `Embedding model "<model>" is retired/deprecated and cannot be used for knowledgebases. Please choose an active model.` |
 | 创建知识库未指定向量模型，而当前用户的默认向量模型已退役/弃用 | `400` | `Tenant default embedding model "<model>" is retired/deprecated. Please specify an active embedding model or update tenant default setting.` |
-| 对已包含 `chunk_num > 0`、`doc_num > 0` 或存在有效 `document` 记录的知识库尝试更换向量模型 | `400` | `Cannot modify embedding model of a dataset that already contains parsed documents or chunks. Create a new dataset to use a different embedding model.` |
+| 对已包含 `chunk_num > 0`、`doc_num > 0` 或存在有效 `document` 记录的知识库尝试更换为另一个**活跃**向量模型（若目标模型本身已退役/弃用，则优先触发上一行的已退役模型错误） | `400` | `Cannot modify embedding model of a dataset that already contains parsed documents or chunks. Create a new dataset to use a different embedding model.` |
 
 > [!NOTE]
 > 提交与知识库**当前绑定一致**的向量模型（无变更）始终放行；对**完全为空**的知识库更换为**活跃**向量模型也始终放行。
@@ -578,4 +588,4 @@ curl "http://127.0.0.1:9381/api/v1/admin/model-platform/usage/audit?tenant_id=te
 - **行为说明**：
   - 不改变上游请求/响应格式，也不引入新的错误码。
   - 在上游处理器执行前后对比当前用户的 `user_tenant` 7 类默认槽位。
-  - 若某个槽位变更为新的非空模型，则在行锁保护下将其来源记录为 `user_explicit`，使后续 `PUT /api/v1/admin/model-platform/models/:id/default` 滚动升级不会覆盖该用户的选择。
+  - 当某个槽位变更为新的非空模型，且处理器执行前后的两次默认槽位读取以及写入偏好记录全部成功时，在行锁保护下将其来源记录为 `user_explicit`，使后续 `PUT /api/v1/admin/model-platform/models/:id/default` 滚动升级不会覆盖该用户的选择。若任一步骤失败，则不会写入 `user_explicit` 记录，错误仅附加到请求上下文而不改变响应，后续平台默认升级可能会覆盖该槽位；重复选择当前已选中的同一模型也不会创建记录。

@@ -24,6 +24,9 @@ flowchart LR
     APISvc -->|"租户 BYOK 密钥<br/>（物理直连旁路，$0.00 平台费用）"| Upstream
 ```
 
+> [!NOTE]
+> **宿主机与容器网络连通及传输安全说明**：网关在宿主机环回发布 `127.0.0.1:4000:4000` 并加入 Docker 桥接网络 `ragflow-model-platform-net`。当 RAGFlow API/Admin 直接运行在宿主机时，配置 `LITELLM_BASE_URL=http://127.0.0.1:4000`；当 API/Admin 运行在 Docker 容器内时，请将容器加入 `ragflow-model-platform-net`（或其他共享内部 Docker 网络）并配置 `LITELLM_BASE_URL=http://litellm-proxy:4000`（容器内的 `127.0.0.1` 仅指向容器自身，且 `host.docker.internal` 无法访问仅绑定环回的宿主机端口）。注意：当前部署**未在 `litellm-proxy` 上启用 TLS**，`LITELLM_MASTER_KEY` 与租户虚拟密钥在内部桥接网络上以 HTTP 明文传输，请确保 `ragflow-model-platform-net` 仅包含受信任的 RAGFlow 控制面容器。
+
 ### 安全与生命周期核心保障
 
 1. **仅环回地址监听**：`gateway/docker-compose.yml` 强制将 LiteLLM 绑定到 `127.0.0.1:4000:4000`。严禁暴露 `0.0.0.0:4000` 或将公网流量直接路由至 LiteLLM，`gateway/validate-gateway-config.sh` 会在部署前强制校验该规则。
@@ -52,7 +55,8 @@ flowchart LR
 
 ```sh
 cd extensions/model-platform/gateway
-cp .env.example .env
+[ -f .env ] || cp .env.example .env
+chmod 600 .env
 ```
 
 在 `.env` 中配置高强度唯一密钥：
@@ -61,11 +65,11 @@ cp .env.example .env
 | :--- | :---: | :--- |
 | `POSTGRES_DB` | 否 | LiteLLM 专用数据库名（默认 `litellm`）。 |
 | `POSTGRES_USER` | 否 | LiteLLM 专用数据库用户名（默认 `litellm`）。 |
-| `POSTGRES_PASSWORD` | 是 | LiteLLM PostgreSQL 强密码。 |
-| `DATABASE_URL` | 否 | 完整 PostgreSQL DSN；留空时由 `POSTGRES_*` 自动拼装。 |
+| `POSTGRES_PASSWORD` | 是 | LiteLLM PostgreSQL 强密码。若密码包含 URL 特殊字符（如 `#`、`@`、`:`、`/`、`%`），请显式配置经过百分号编码（percent-encoded）的 `DATABASE_URL`，因为 Compose 会将 `POSTGRES_PASSWORD` 原样拼入默认 `DATABASE_URL`。 |
+| `DATABASE_URL` | 否 | 完整 PostgreSQL DSN；留空时由 `POSTGRES_*` 自动拼装（当 `POSTGRES_PASSWORD` 含 URL 特殊字符时请显式覆盖为百分号编码后的 DSN）。 |
 | `LITELLM_MASTER_KEY` | 是 | LiteLLM 管理接口主密钥（如 `sk-master-...`），需与 RAGFlow API/Admin 进程保持一致。 |
 | `LITELLM_SALT_KEY` | 是 | LiteLLM 数据库密文字段加密盐。**首次启动后切勿随意变更**，否则将导致已加密记录无法解密。 |
-| `PLATFORM_UPSTREAM_OPENAI_KEY` | 是 | 上游根供应商密钥，在 `litellm-config.yaml` 中通过 `os.environ/...` 引用。如需接入其他供应商，可按需追加 `PLATFORM_UPSTREAM_*` 变量。 |
+| `PLATFORM_UPSTREAM_OPENAI_KEY` | 是 | 转发至 `litellm-proxy` 容器并在 `litellm-config.yaml` 中通过 `os.environ/PLATFORM_UPSTREAM_OPENAI_KEY` 引用的上游根供应商密钥。注意：`validate-gateway-config.sh` 当前强制要求 `litellm-config.yaml` 中**任何声明的 `api_key`** 均须引用 `os.environ/PLATFORM_UPSTREAM_OPENAI_KEY`（若需支持其他 `PLATFORM_UPSTREAM_*` 凭据变量，需同时更新 `docker-compose.yml` 与 `validate-gateway-config.sh`）。 |
 | `PLATFORM_UPSTREAM_OPENAI_BASE` | 否 | 上游 API 基础地址（默认 `https://api.openai.com/v1`）。 |
 
 **第二步 — 在 `litellm-config.yaml` 中添加模型路由：**
@@ -87,14 +91,12 @@ model_list:
 ```
 
 > [!CAUTION]
-> 严禁在 `litellm-config.yaml` 中硬编码任何明文 API Key，必须统一使用 `os.environ/<变量名>` 引用环境变量。
+> 严禁在 `litellm-config.yaml` 中硬编码任何明文 API Key；当前 `validate-gateway-config.sh` 强制要求统一引用 `os.environ/PLATFORM_UPSTREAM_OPENAI_KEY`。
 
 **第三步 — 校验配置并启动：**
 
 ```sh
-./validate-gateway-config.sh
-docker compose up -d
-docker compose ps
+./validate-gateway-config.sh && docker compose up -d && docker compose ps
 ```
 
 在宿主机本地验证环回健康状态：
@@ -105,10 +107,13 @@ curl -fsS http://127.0.0.1:4000/health/liveliness
 
 ### 2.2 构建并配置 RAGFlow 服务
 
-组装企业扩展叠加工作区（`build/ragflow`）：
+先返回仓库根目录（从 `extensions/model-platform/gateway/` 向上三级），组装企业扩展叠加工作区（`build/ragflow`），并编译增强版后端与前端：
 
 ```sh
-./extensions/model-platform/scripts/apply-overlay.sh
+cd ../../.. \
+  && ./extensions/model-platform/scripts/apply-overlay.sh \
+  && (cd build/ragflow && RAGFLOW_GO_TAGS=ee bash build.sh --go) \
+  && (cd build/ragflow/web && npm ci && VITE_RAGFLOW_ENTERPRISE=false npm run build)
 ```
 
 在启动增强版 RAGFlow 服务时，请同时为 **API 服务**（运行后台 Worker）与 **Admin 服务**（提供 `/api/v1/admin/model-platform/*`）注入 `LITELLM_BASE_URL` 和 `LITELLM_MASTER_KEY`。
@@ -124,7 +129,7 @@ curl -fsS http://127.0.0.1:4000/health/liveliness
 
 | 环境变量 | 默认值 | 生效进程 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `LITELLM_BASE_URL` | *(空)* | API + Admin | LiteLLM 网关内部地址（如 `http://127.0.0.1:4000`）。启用后台 Worker、模型上架、深度健康检查与密钥轮换的必需项。 |
+| `LITELLM_BASE_URL` | *(空)* | API + Admin | LiteLLM 网关内部地址：API/Admin 直接运行在宿主机时填写 `http://127.0.0.1:4000`，运行在共享 `ragflow-model-platform-net` 网络的 Docker 容器内时填写 `http://litellm-proxy:4000`。启用后台 Worker、模型上架、深度健康检查与密钥轮换的必需项。 |
 | `LITELLM_MASTER_KEY` | *(空)* | API + Admin | 与 `LITELLM_BASE_URL` 配套的 LiteLLM 主密钥。 |
 
 ### 3.2 计量采集与数据保留参数（RAGFlow API 进程）
@@ -134,17 +139,17 @@ curl -fsS http://127.0.0.1:4000/health/liveliness
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `METERING_DAEMON_ENABLED` | `true` | 设为 `false` 可关闭后台账单采集、每日汇总与过期日志清理任务。 |
-| `METERING_POLL_INTERVAL` | `5m` | 从 LiteLLM `/global/spend/logs` 增量拉取原始账单日志的周期。 |
+| `METERING_POLL_INTERVAL` | `5m` | 从 LiteLLM `/spend/logs/v2` 增量拉取原始账单日志的周期。 |
 | `METERING_AGGREGATION_INTERVAL` | `1h` | 执行常规日历日聚合写入 `platform_tenant_usage_daily` 的周期。 |
-| `METERING_FETCH_OVERLAP` | `5m` | 每次轮询相对水位线向前重叠的安全窗口，用于兜底网关延迟写入（原始表通过 `request_id` 唯一去重，不会重复计费）。 |
+| `METERING_FETCH_OVERLAP` | `5m` | 每次轮询相对水位线向前重叠的安全窗口，用于兜底网关延迟写入（原始表通过 `spend_id` 唯一去重，缺失时回退至 `request_id`，不会重复计费）。 |
 | `METERING_LOOKBACK_HOURS` | `48` | 冷启动与常规滚动聚合回看小时数（按 `METERING_TIMEZONE` 对齐到自然日边界）。 |
 | `METERING_TIMEZONE` | `UTC` | 业务计费自然日所属时区。支持 `UTC`、`Local`、IANA 时区名（如 `Asia/Shanghai`、`America/New_York`）或数字偏移（如 `+08:00`、`-05:00`）。 |
-| `METERING_SPEND_LOG_RETENTION_DAYS` | `0` | 原始账单表 `platform_gateway_spend_log` 的可选保留天数（`0` 表示永久保留）。设为 `> 0` 后，每日清理任务会在**首次启动拉取完成之后**并在聚合互斥锁保护下分批清理过期原始日志，避免影响进行中的历史补齐聚合。 |
+| `METERING_SPEND_LOG_RETENTION_DAYS` | `0` | 原始账单表 `platform_gateway_spend_log` 的可选保留天数（`0` 表示永久保留）。设为 `> 0` 后，每日清理任务会在**首次启动拉取完成之后**并在聚合互斥锁保护下分批清理过期原始日志，避免影响同一进程内进行中的历史补齐聚合。注意：待补齐状态仅驻留于进程内存、不跨 API 重启持久化；若早于保留期的原始日志在聚合完成前经历进程重启，重启后的清理任务可能将其提前清除。 |
 | `METERING_COLLECTOR_BATCH_SIZE` | `100` | 原始账单日志单批写入数据库的记录条数。 |
 | `METERING_PIPELINE_BATCH_SIZE` | `100` | 每日用量汇总单批 Upsert 的记录条数。 |
 
 > [!TIP]
-> 如果同时在 `litellm-config.yaml` 中启用了 `general_settings.maximum_spend_logs_retention_period`，建议将 LiteLLM 侧保留周期设置得**短于** RAGFlow 侧的 `METERING_SPEND_LOG_RETENTION_DAYS`（或保持 RAGFlow 为 `0` 永久保留），以便控制面作为更长周期的权威审计库。
+> 如果同时在 `litellm-config.yaml` 中启用了 `general_settings.maximum_spend_logs_retention_period`，必须确保该保留周期**足以覆盖最大 API 服务停机时长加采集延迟**（否则停机期间在网关过期的日志无法通过重启回放找回），同时仍将其设置得**短于** RAGFlow 侧的 `METERING_SPEND_LOG_RETENTION_DAYS`（或保持 RAGFlow 为 `0` 永久保留），以便控制面作为更长周期的权威审计库。
 
 ---
 
@@ -170,12 +175,12 @@ curl -fsS http://127.0.0.1:4000/health/liveliness
    - 后端会校验网关路由存在性、写入平台目录并异步向所有就绪租户分发。**上架新模型不会修改任何现有默认模型设置。**
 4. **设为默认（`设为默认`）**：
    - 对任意“已启用”且非默认的模型可执行。
-   - 系统将把来源为 `platform_default` 的用户自动迁移到新默认模型，同时**完整保留已手动自定义过默认模型的用户（`user_explicit`）**。
+   - 系统将把来源为 `platform_default`（或尚无偏好记录）的用户自动迁移到新默认模型，同时**完整保留已手动自定义过默认模型的用户（`user_explicit`）**。
 5. **退役（`退役`）与重新启用（`重新启用`）**：
    - 当前某类型的平台默认模型不允许直接退役，需先将同类型其他活跃模型设为默认。
    - 退役前请先核对表格中的 **租户分布（可用 / 只读 / 已退役）** 与 **引用数**（`N 个知识库` / `N 个助手`）：
      - **向量模型（Embedding）** 采用三阶段退役（`已启用` → `只读/弃用` → `已退役`）：仍关联知识库的租户保留只读检索能力，无引用的租户立即移除。
-     - **非向量模型**（对话、决策、重排、ASR、视觉、TTS）会立即在所有租户禁用：引用该模型的助手会提示所有者改选其他模型，默认使用该模型的用户会迁移至平台默认模型。
+     - **非向量模型**（对话、决策、重排、ASR、视觉、TTS）会异步在所有租户禁用：仍绑定该模型的存量助手在发起请求时会因模型已禁用/不可用而失败（需所有者手动切换为活跃模型），默认使用该模型的用户会迁移至当前平台默认模型（若无可用默认模型则清空槽位）。
    - 点击已退役模型的 **重新启用** 可将其重新恢复至全部租户。
 6. **下发进度横幅（Rollout Banner）**：
    - 触发上架、退役、重新启用或设为默认后自动显示，每 3 秒轮询最新进度。
@@ -185,7 +190,7 @@ curl -fsS http://127.0.0.1:4000/health/liveliness
 ```mermaid
 stateDiagram-v2
     [*] --> Active: 上架模型
-    Active --> Active: 设为默认（仅迁移 platform_default 用户）
+    Active --> Active: 设为默认（迁移 platform_default 及无偏好记录用户）
     Active --> Deprecated: 退役（仍被知识库引用的向量模型）
     Active --> Tombstoned: 退役（非向量模型，或 0 引用的向量模型）
     Deprecated --> Tombstoned: 最后一个关联知识库被删除
@@ -214,12 +219,12 @@ stateDiagram-v2
 
 用于巡检各托管租户的虚拟密钥状态、触发单租户应急轮换以及执行消费隔离审计。
 
-- **同步状态筛选与游标翻页**：支持按 `就绪`、`降级`、`失败`、`待处理`、`初始化中`、`已删除` 6 种状态筛选；列表采用稳定游标分页（`after`），避免状态变动导致翻页漏行。
+- **同步状态筛选与游标翻页**：支持按 `就绪`、`降级`、`失败`、`待处理`、`初始化中`、`已删除` 6 种状态筛选；列表采用稳定游标分页（`after`），可避免租户移出当前筛选状态时产生翻页偏移。注意游标分页并非时间点快照（若某租户在游标越过之后才进入所选状态，后续页不会包含该租户），状态收敛稳定后请从第一页重新扫描确认。
 - **密钥元数据（绝不暴露明文）**：仅展示 `密钥别名`、8 位 SHA-256 `密钥指纹`、`最近轮换` 时间/操作人以及 `密钥状态`（`已收敛` / `待完成吊销`），API 与界面均永不返回明文密钥。
 - **轮换密钥 / 重新轮换并吊销**：
   - 仅 `就绪` 状态的租户允许触发。
   - 执行时先签发新虚拟密钥并原子更新租户 `platform` 实例（零业务中断），随后立即吊销旧密钥。
-  - 若上次轮换时旧密钥吊销尚未完成（`密钥状态 = 待完成吊销`），按钮显示为 **重新轮换并吊销**，点击即可立即补全吊销（后台清扫任务也会自动重试）。
+  - 若上次轮换时旧密钥吊销尚未完成（`密钥状态 = 待完成吊销`），按钮显示为 **重新轮换并吊销**，点击可立即尝试重新轮换并吊销（若网关仍不可用，旧密钥吊销仍会保持待完成；请确认返回 HTTP `200` 或页面状态变为 `已收敛` 后再视为吊销完成，后台清扫任务也会持续自动重试）。
 - **运行审计**：弹出 **租户消费隔离审计** 对话框，对比平台托管费用与非托管/影子消费并展示违规明细。
 
 ---
@@ -259,15 +264,17 @@ ADMIN_TOKEN="<superuser-token>" \
 ./extensions/model-platform/scripts/emergency-rotate-keys.sh --tenant tenant_acme_01
 
 # 3. 限制并发与速率，批量轮换全部就绪租户
+# 每次轮换批次请使用新的 --output 结果文件；--resume 会向该文件追加并跳过
+# 其中已有 HTTP 200 记录的租户（仅应用于续跑同一批次）。
 ADMIN_TOKEN="<superuser-token>" \
 ./extensions/model-platform/scripts/emergency-rotate-keys.sh \
   --all --force --concurrency 10 --rate-limit 5 \
-  --output ./rotate-keys.ndjson
+  --output ./rotate-keys-20261125.ndjson
 
-# 4. 排查异常后断点续跑（自动跳过已返回 HTTP 200 的租户）
+# 4. 排查异常后断点续跑同一批次（自动跳过本批次已返回 HTTP 200 的租户）
 ADMIN_TOKEN="<superuser-token>" \
 ./extensions/model-platform/scripts/emergency-rotate-keys.sh \
-  --all --force --resume ./rotate-keys.ndjson --output ./rotate-keys.ndjson
+  --all --force --resume ./rotate-keys-20261125.ndjson --output ./rotate-keys-20261125.ndjson
 ```
 
 **退出码说明**：`0` = 目标租户全部轮换完成且旧密钥吊销成功（`200`）；`1` = 存在失败租户或返回 `202`（旧密钥吊销仍在后台收敛）；`2` = 参数非法或缺少必要依赖。
@@ -293,22 +300,24 @@ flowchart TD
 - **恢复步骤**：
   1. 恢复 LiteLLM 与 PostgreSQL（在 `extensions/model-platform/gateway` 下执行 `docker compose up -d`）。
   2. 确认 `GET /api/v1/admin/model-platform/health` 返回 `200` 且 `"gateway": "healthy"`。
-  3. 在 **Admin 控制台 → 租户凭证与审计** 中筛选 `降级` / `待处理` / `失败`，确认二级 Poller 已将其自动收敛回 `就绪`。
+  3. 在 **Admin 控制台 → 租户凭证与审计** 中筛选 `降级` 与 `待处理`，确认二级 Poller 已将它们自动收敛回 `就绪`（前提是 `retry_count < 50`）。
+  4. 同时检查 `失败` 筛选页：已耗尽 50 次重试进入 `failed` 状态的租户**不会**被二级 Poller 自动重试，且当前后端尚未提供面向运维人员的 `failed` 租户重置界面或接口（`rotate-key` 仅接受 `ready` 租户，发布任务重试仅作用于模型下发条目）。请通过内部故障工单或平台维护团队通道上报升级，并附上受影响租户的 `tenant_id` 以及 `GET /api/v1/admin/model-platform/tenants?status=failed` 返回的 `last_error`。
 
 ### 6.2 计量中断与历史账单自愈补齐
 
 - **正常在线运行**：`SpendLogCollector` 使用内存水位线配合 `METERING_FETCH_OVERLAP`（默认 `5m`）执行小窗口增量拉取，长时空闲也不会产生超大范围扫描。
 - **API 服务或网关长时间中断后恢复**：
-  - 服务重启后，采集器从数据库持久水位线起无上限回放拉取（首次冷启动按 `METERING_LOOKBACK_HOURS` 自然日对齐），每条原始记录按 `request_id` 幂等去重（`ON CONFLICT DO NOTHING`）。
+  - 服务重启后，采集器从数据库持久水位线起无上限回放拉取（首次冷启动按 `METERING_LOOKBACK_HOURS` 自然日对齐），范围仅限于**网关仍保留的原始日志**，每条记录按 `spend_id`（缺失时回退至 `request_id`）幂等去重（`ON CONFLICT DO NOTHING`）。若网关启用了 `maximum_spend_logs_retention_period` 且日志在采集恢复前已过期清除，则无法通过回放补齐。
   - 一旦补齐写入了早于常规回看窗口的历史账单，`MeteringDaemon` 会自动触发**动态多日 Catch-up 聚合**，以**确定性替换写入（Replacement Upsert，绝不使用 `+=` 累加）**重算对应自然日数据，保证零重复计费。
+    - **重启限制**：待补齐的日期范围仅保存在 `MeteringDaemon` 进程内存中，不会跨 API 进程重启持久化。若历史账单已写入，但补齐聚合完成前 API 进程发生重启，则超出 `METERING_LOOKBACK_HOURS` 的历史日期不会自动重新触发聚合（除非重启后的拉取又写入了更早的日志）。此时请先**确认待重算范围内每个自然日在 `platform_gateway_spend_log` 中的原始日志均完整未被保留清理**（因为对已部分清理的原始日志执行替换聚合会用偏小的值覆盖已有每日汇总），再临时调大 `METERING_LOOKBACK_HOURS` 重启 API 服务，或手工补跑聚合。
 - **核验方式**：等待一个 `METERING_POLL_INTERVAL` + `METERING_AGGREGATION_INTERVAL` 周期后，查询 `GET /api/v1/admin/model-platform/usage/daily?start_date=...&end_date=...`，核对断档日期的数据已补齐。
 
 ### 6.3 密钥轮换中途中断（`待完成吊销`）
 
-如果签发新虚拟密钥并写入 RAGFlow 数据库后网关恰好失联，租户业务保持零中断，但协调记录会被打上 `key_dirty_since` 标记：
+如果签发新虚拟密钥并写入 RAGFlow 数据库后网关恰好失联，RAGFlow 已持久保存新密钥，并在协调记录上打上 `key_dirty_since` 标记。网关本身不可达期间，平台托管模型推理请求会失败；待网关恢复可达后，请求会自动使用新密钥恢复（此时旧密钥吊销仍在后台收敛）：
 
-- **自动清扫**：后台 `sweepDirtyKeys` 每 `1m` 自动巡检超过 `2m` 未收敛的租户并重试吊销旧密钥。
-- **人工立即收敛**：在 **租户凭证与审计** 页面找到状态为 **待完成吊销** 的租户，点击 **重新轮换并吊销**（或再次调用 `POST /tenants/:tenant_id/rotate-key`）。
+- **自动清扫**：后台 `sweepDirtyKeys` 每 `1m` 自动巡检超过 `2m` 未收敛的租户并仅重试吊销旧密钥（不会签发新密钥）。
+- **人工立即触发**：在 **租户凭证与审计** 页面找到状态为 **待完成吊销** 的租户，点击 **重新轮换并吊销**（或调用 `POST /tenants/:tenant_id/rotate-key`）。注意：再次调用轮换接口会签发一把新的替代密钥并尝试吊销包括前一次在内的一切旧密钥，而非仅仅补跑吊销。
 
 ### 6.4 影子消费 / 隔离违规告警排查
 
@@ -316,4 +325,5 @@ flowchart TD
 
 1. 在审计弹窗或 `GET /usage/audit?tenant_id=<id>` 响应中查看 `unmanaged_models_detected` 与 `violations`。
 2. 核实是否有人手动在 LiteLLM 中给该租户虚拟密钥放开了未上架模型，或手工删除了数据库模型记录而未同步收缩网关白名单。
-3. 执行单租户密钥轮换（`POST /tenants/:tenant_id/rotate-key`），系统会根据租户当前的活跃/只读托管模型重新生成严格白名单并吊销旧密钥；完成后重新点击 **运行审计** 确认恢复为 **隔离正常**。
+3. 执行单租户密钥轮换（`POST /tenants/:tenant_id/rotate-key`），根据租户当前的活跃/只读托管模型重建严格白名单并尝试吊销旧密钥。仅在返回 `HTTP 200`（`old_keys_revoked: true`）或后台清扫已将该租户收敛为 `已收敛`（`Converged`）状态后，才可视为**新增**非托管调用已被彻底阻断；若响应返回 `HTTP 202`（`old_keys_revoked: false`），旧密钥尚未吊销，请参考第 6.3 节监控或重新执行吊销收敛。
+4. 单独追踪与处置历史违规记录：`GET /usage/audit` 会扫描 `platform_gateway_spend_log` 中该租户的全部存量记录（不设时间窗口），密钥轮换**不会**清除历史非托管账单，因此在历史违规记录过期清理或核销出范围之前，**运行审计**仍会持续返回 `audit_passed: false`。
