@@ -1,340 +1,216 @@
-# Model Platform Implementation Plan & Task Breakdown
+# Model Platform Engineering Design Reference
 
 English | [简体中文](implementation-plan.zh-CN.md)
 
 > [!NOTE]
-> **Document Scope & Division of Labor**:
-> - **System Architecture & ADRs**: Please refer to [architecture.md](architecture.md) (Chinese version: [architecture.zh-CN.md](architecture.zh-CN.md)) for high-level system boundaries, domain invariants, and Architectural Decision Records.
-> - **Document Purpose**: Focuses on concrete **engineering implementation details, code extension seams, database schema migrations, 25-task engineering specifications, and end-to-end verification guides**. Together, these documents form a comprehensive blueprint for the extension.
+> **Document Scope**: This is the long-lived engineering design reference for the `model-platform` extension. Keep it synchronized with code changes whenever subsystems, schemas, overlays, or verification workflows evolve.
+> - **High-Level Architecture & ADRs**: [architecture.md](architecture.md)
+> - **Operator Deployment & Admin Console**: [docs/admin-guide.md](docs/admin-guide.md)
+> - **Tenant Workflows & Role Matrix**: [docs/user-guide.md](docs/user-guide.md)
+> - **HTTP API & Guard Contracts**: [docs/api-reference.md](docs/api-reference.md)
 
 ---
 
 ## Table of Contents
 
-- [1. Principles & Boundary Scope](#1-principles--boundary-scope)
-  - [1.1 Core Implementation Objectives](#11-core-implementation-objectives)
-  - [1.2 Six Engineering Principles at a Glance](#12-six-engineering-principles-at-a-glance)
-- [2. Dimension 1: Build & Workspace Overlay Integration](#2-dimension-1-build--workspace-overlay-integration)
-  - [2.1 Go ee Global Build Tag Exclusion Analysis](#21-go-ee-global-build-tag-exclusion-analysis)
-  - [2.2 Affirmative Baseline Stubs (ee-baseline) & Symbol Partitioning](#22-affirmative-baseline-stubs-ee-baseline--symbol-partitioning)
-  - [2.3 Thin Seam Trampolines](#23-thin-seam-trampolines)
-  - [2.4 Frontend Web Overlay Seams & Enterprise Flag Defense](#24-frontend-web-overlay-seams--enterprise-flag-defense)
-  - [2.5 Build-Time CI Guards](#25-build-time-ci-guards)
-  - [2.6 Workspace Overlay Pipeline (apply-overlay.sh)](#26-workspace-overlay-pipeline-apply-overlaysh)
-- [3. Dimension 2: LiteLLM Gateway Selection & Credential Pipeline](#3-dimension-2-litellm-gateway-selection--credential-pipeline)
-  - [3.1 Gateway Infrastructure & Loopback Isolation (127.0.0.1:4000)](#31-gateway-infrastructure--loopback-isolation-1270014000)
-  - [3.2 Root Provider Secret Physical Isolation](#32-root-provider-secret-physical-isolation)
-  - [3.3 Scoped Tenant Virtual Key Specification (sk-tenant-...)](#33-scoped-tenant-virtual-key-specification-sk-tenant-)
-  - [3.4 Gateway Permission Routing & Admin Endpoint Blocking](#34-gateway-permission-routing--admin-endpoint-blocking)
-  - [3.5 Tenant Decommissioning & Virtual Key Revocation](#35-tenant-decommissioning--virtual-key-revocation)
-  - [3.6 Emergency Key Rotation](#36-emergency-key-rotation)
-- [4. Dimension 3: Tenant Lifecycle & Self-Healing Reconciler](#4-dimension-3-tenant-lifecycle--self-healing-reconciler)
-  - [4.1 GORM Post-Commit Asynchronous Decoupling](#41-gorm-post-commit-asynchronous-decoupling)
-  - [4.2 Two-Tier Self-Healing Controller Architecture](#42-two-tier-self-healing-controller-architecture)
-  - [4.3 State Machine Model & Migration Schema (platform_tenant_reconcile)](#43-state-machine-model--migration-schema-platform_tenant_reconcile)
+- [1. Engineering Principles & Code Layout](#1-engineering-principles--code-layout)
+- [2. Build & Workspace Overlay Integration](#2-build--workspace-overlay-integration)
+  - [2.1 Go `ee` Global Build Tag Exclusion & Affirmative `ee-baseline` Stubs](#21-go-ee-global-build-tag-exclusion--affirmative-ee-baseline-stubs)
+  - [2.2 Thin Router Trampolines & Runtime Wiring](#22-thin-router-trampolines--runtime-wiring)
+  - [2.3 Frontend Web Overlay Seams & Enterprise Flag Defense](#23-frontend-web-overlay-seams--enterprise-flag-defense)
+  - [2.4 Workspace Assembly & Non-Invasive CI Gates](#24-workspace-assembly--non-invasive-ci-gates)
+- [3. LiteLLM Gateway & Credential Pipeline](#3-litellm-gateway--credential-pipeline)
+  - [3.1 Gateway Topology & Loopback Isolation](#31-gateway-topology--loopback-isolation)
+  - [3.2 Key Identity, Scoped Virtual Keys & Revocation](#32-key-identity-scoped-virtual-keys--revocation)
+  - [3.3 Emergency Key Rotation](#33-emergency-key-rotation)
+  - [3.4 Tenant Decommissioning & Orphan Cleanup](#34-tenant-decommissioning--orphan-cleanup)
+- [4. Tenant Lifecycle, Self-Healing & Write Protection](#4-tenant-lifecycle-self-healing--write-protection)
+  - [4.1 Transaction-Decoupled Hook & Pre-Flight Visibility](#41-transaction-decoupled-hook--pre-flight-visibility)
+  - [4.2 Two-Tier Self-Healing Controller](#42-two-tier-self-healing-controller)
+  - [4.3 Reconcile State Machine & Schema (`platform_tenant_reconcile`)](#43-reconcile-state-machine--schema-platform_tenant_reconcile)
   - [4.4 Native Driver Resolution & Compensating Rollback](#44-native-driver-resolution--compensating-rollback)
-  - [4.5 Backend Managed Model Protection (ManagedProviderGuardMiddleware)](#45-backend-managed-model-protection-managedproviderguardmiddleware)
-- [5. Dimension 4: Model Defaults & Dataset Vector Space Protection](#5-dimension-4-model-defaults--dataset-vector-space-protection)
-  - [5.1 Atomic Conditional SQL for Default Initialization](#51-atomic-conditional-sql-for-default-initialization)
-  - [5.2 Explicit Preference Tracking & Sticky Guard](#52-explicit-preference-tracking--sticky-guard)
-  - [5.3 Three-Stage Embedding Lifecycle Protection](#53-three-stage-embedding-lifecycle-protection)
-  - [5.4 Dataset Vector Space Immutability & Deprecated Model Guard (DatasetEmbeddingGuardMiddleware)](#54-dataset-vector-space-immutability--deprecated-model-guard-datasetembeddingguardmiddleware)
-  - [5.5 Managed Model Catalog, Fan-out and Lifecycle](#55-managed-model-catalog-fan-out-and-lifecycle)
-- [6. Dimension 5: Metering & Authoritative Reconciliation Pipeline](#6-dimension-5-metering--authoritative-reconciliation-pipeline)
-  - [6.1 Authoritative Gateway Spend Logs & Raw Staging Deduplication](#61-authoritative-gateway-spend-logs--raw-staging-deduplication)
-  - [6.2 48-Hour Rolling Lookback Replacement Upsert Pipeline](#62-48-hour-rolling-lookback-replacement-upsert-pipeline)
-  - [6.3 Physical Zero-Billing Isolation for Self-Owned Models](#63-physical-zero-billing-isolation-for-self-owned-models)
-  - [6.4 Admin Usage Statistics & Streaming CSV Export API](#64-admin-usage-statistics--streaming-csv-export-api)
-- [7. 25-Task Engineering Breakdown (Phase 0 ~ Phase 5)](#7-25-task-engineering-breakdown-phase-0--phase-5)
-  - [7.1 Executive Task Matrix](#71-executive-task-matrix)
-  - [7.2 Architecture Breakdown & Phase Evolution Diagram](#72-architecture-breakdown--phase-evolution-diagram)
-  - [7.3 Detailed Engineering Task Specifications](#73-detailed-engineering-task-specifications)
-- [8. End-to-End Integration & Verification Guide](#8-end-to-end-integration--verification-guide)
-  - [8.1 Target & Scope Definition (Core Capability MVP)](#81-target--scope-definition-core-capability-mvp)
-  - [8.2 End-to-End Sequence Diagram](#82-end-to-end-sequence-diagram)
-  - [8.3 Failure Modes & Fault Tolerance Matrix](#83-failure-modes--fault-tolerance-matrix)
-  - [8.4 Step-by-Step Execution & Verification Commands](#84-step-by-step-execution--verification-commands)
+  - [4.5 Managed Provider Write Protection (`ManagedProviderGuardMiddleware`)](#45-managed-provider-write-protection-managedproviderguardmiddleware)
+- [5. Managed Model Catalog, Defaults & Dataset Protection](#5-managed-model-catalog-defaults--dataset-protection)
+  - [5.1 Managed Model Slots (7 Gateway-Routed Types)](#51-managed-model-slots-7-gateway-routed-types)
+  - [5.2 Catalog, Fan-Out Rollout & Lifecycle Convergence](#52-catalog-fan-out-rollout--lifecycle-convergence)
+  - [5.3 Atomic Default Initialization, Inheritance & Sticky Provenance](#53-atomic-default-initialization-inheritance--sticky-provenance)
+  - [5.4 Three-Stage Embedding Lifecycle & Dataset Immutability Guard](#54-three-stage-embedding-lifecycle--dataset-immutability-guard)
+- [6. Metering, Reconciliation & Isolation Audit Pipeline](#6-metering-reconciliation--isolation-audit-pipeline)
+  - [6.1 Raw Spend Log Staging & Deduplication](#61-raw-spend-log-staging--deduplication)
+  - [6.2 Self-Healing Watermark Collector & Replacement Rollup](#62-self-healing-watermark-collector--replacement-rollup)
+  - [6.3 Declarative Opt-In Spend Log Retention](#63-declarative-opt-in-spend-log-retention)
+  - [6.4 Physical Zero-Billing BYOK Bypass & Live Isolation Audit](#64-physical-zero-billing-byok-bypass--live-isolation-audit)
+- [7. Fault Tolerance Matrix & Verification Suite](#7-fault-tolerance-matrix--verification-suite)
+  - [7.1 Failure Modes & Recovery Matrix](#71-failure-modes--recovery-matrix)
+  - [7.2 End-to-End Verification & CI Commands](#72-end-to-end-verification--ci-commands)
 
 ---
 
-## 1. Principles & Boundary Scope
+## 1. Engineering Principles & Code Layout
 
-### 1.1 Core Implementation Objectives
-The `model-platform` extension introduces multi-tenant model hosting capabilities into `oh-my-ragflow`. Platform administrators can provision pre-configured Large Language Models (LLM) and Embedding models for tenants, while tenants retain full freedom to configure self-owned providers.
+All changes to `extensions/model-platform/` adhere to six invariants:
 
-### 1.2 Six Engineering Principles at a Glance
-For architectural rationale and domain invariant proofs, please refer directly to [architecture.md](architecture.md#3-core-invariant-guarantees). At the engineering implementation level, all tasks strictly adhere to six mandatory constraints:
-1. **Strict Non-Invasive Architecture**: The `upstream/ragflow` submodule directory must remain 100% clean and unmodified (`git status --porcelain` is strictly empty).
-2. **Native Driver Resolution**: Managed providers use `ProviderName = "OpenAI-API-Compatible"` with `InstanceName = "platform"`, reusing upstream drivers without modifying upstream factory code or triggering dummy stubs.
-3. **Physical Credential Isolation**: Root upstream API keys reside exclusively in the LiteLLM gateway environment. The proxy binds strictly to loopback `127.0.0.1:4000`. Tenants receive only scoped virtual keys (`sk-tenant-...`).
-4. **GORM Post-Commit Decoupling**: No remote network calls may execute inside upstream database transactions. Reconcilers trigger via GORM `AfterCommit` events and feature a two-tier self-healing controller surviving 45-second gateway outages.
-5. **Atomic Defaults & Immutable Datasets**: Concurrency races are eliminated via atomic conditional SQL. Explicit user choices are tracked in preference tables. Parsed datasets with chunks have strictly immutable vector spaces (HTTP 400).
-6. **Authoritative Spend Logs & Mathematical Idempotence**: LiteLLM spend logs serve as the sole truth boundary, staged with `INSERT IGNORE` on `spend_id`. Daily usage aggregates over a 48-hour day-aligned lookback window using replacement upserts (`call_count = VALUES(call_count)`).
+1. **Strict Non-Invasive Upstream**: `upstream/ragflow` remains 100% unmodified (`git status --porcelain` empty).
+2. **Native Driver Resolution**: Managed models persist as `ProviderName = "OpenAI-API-Compatible"` with `InstanceName = "platform"` and `is_managed = true`, reusing upstream drivers directly.
+3. **Physical Credential Isolation**: Root upstream secrets live solely in the loopback-bound LiteLLM container (`127.0.0.1:4000`); tenants receive team-scoped virtual keys (`sk-tenant-*`).
+4. **Transaction-Decoupled Side Effects**: No remote RPC executes inside upstream DB transactions; background workers reconcile asynchronously after commit visibility.
+5. **Atomic Defaults & Vector Space Safety**: Empty default slots initialize with conditional atomic SQL; explicit user choices are preserved by `StickyGuard`; non-empty dataset embeddings are immutable (`400`).
+6. **Authoritative Metering Idempotence**: LiteLLM spend logs stage into `platform_gateway_spend_log` with `ON CONFLICT DO NOTHING` on `spend_id`, and roll up into `platform_tenant_usage_daily` via calendar-aligned replacement upserts.
 
----
-
-## 2. Dimension 1: Build & Workspace Overlay Integration
-
-### 2.1 Go ee Global Build Tag Exclusion Analysis
-In upstream RAGFlow, enterprise features are guarded by Go build tags:
-- The build script `upstream/ragflow/build.sh:32-34` injects `RAGFLOW_GO_TAGS`:
-  ```bash
-  EXTRA_GO_TAGS="${RAGFLOW_GO_TAGS:-}"
-  GO_BUILD_TAGS="cgo,static,sonic"
-  [ -n "$EXTRA_GO_TAGS" ] && GO_BUILD_TAGS="$GO_BUILD_TAGS,$EXTRA_GO_TAGS"
-  ```
-- Any upstream file constrained by `//go:build !ee` is globally excluded by the Go compiler when `-tags ee` is supplied.
-- **The Global Exclusion Trap**: Go build tags are global compiler directives. Once `RAGFLOW_GO_TAGS=ee` is supplied, all upstream `!ee` community stub files are excluded simultaneously. If an extension only stubs the packages it immediately needs, the compiler fails on all remaining packages:
-  1. Packages containing only `stub.go` (such as `clickhouse` and `billing`) trigger `build constraints exclude all Go files`.
-  2. Callers of unstubbed packages trigger `undefined symbol` compiler errors.
-
-### 2.2 Affirmative Baseline Stubs (ee-baseline) & Symbol Partitioning
-To eliminate this trap without touching upstream, `oh-my-ragflow` establishes an affirmative **`ee-baseline` overlay**. This baseline provides community-equivalent `//go:build ee` fallback stubs across all 19 affected upstream packages.
-
-#### Symbol Partitioning Rule
-Go strictly prohibits duplicate symbol declarations within the same package. The `model-platform` extension injects custom logic into `internal/admin` and `internal/router`. To avoid `redeclared in this package` errors, symbols follow strict partitioning and precedence:
-1. **Non-Router Stubs in Baseline**: `ee-baseline` stubs pure packages and non-router fallback symbols in `internal/admin` and `internal/router` (such as `AppendServiceList`, `GetEEServicesStatus`, `ToggleChat`).
-2. **Router Registration Exclusively in Trampolines**: Route registration symbols (`RegisterEERouter`, `SetupEERouter`, `RegisterEEProtectedRouter`, `RegisterEENoAuthRouter`, `RegisterEEAuthRouter`) must **never be declared in `ee-baseline`**. They are uniquely declared in `overlay/trampolines/internal/admin/` and `overlay/trampolines/internal/router/`.
-3. **Overlay Application Precedence**: `apply-overlay.sh` synchronizes layers in order: `ee-baseline -> trampolines -> backend -> web`.
-
-The 19 Go source packages and 9 test packages partitioned across layers are:
-
-| # | Package Path | Community Source File | Exported Symbols / Structs | Partitioning Strategy |
-|---|---|---|---|---|
-| 1 | `cmd` | `root_stub.go` | `runWithSysParamsEE` | `ee-baseline` fallback |
-| 2 | `internal/admin` | `router_stub.go` | `AppendServiceList`, `GetEEServicesStatus`, `ToggleChat` | Non-router stubs in `ee-baseline`; `RegisterEERouter` reserved for trampoline |
-| 3 | `internal/cli` | `main_stub.go` | `executeEECommand`, `runAgentEE` | `ee-baseline` fallback |
-| 4 | `internal/common` | `auth_stub.go` | `AuthHookEE`, `ValidateTokenEE` | `ee-baseline` fallback |
-| 5 | `internal/dao` | `tenant_stub.go` | `applyTenantPolicyEE`, `initializeTenantDefaultRoleEE` | `ee-baseline` fallback |
-| 6 | `internal/deepdoc/parser/pdf/table` | `table_construct_vh_stub.go` | `TableConstructVHEE` | `ee-baseline` fallback |
-| 7 | `internal/engine/clickhouse` | `stub.go` | `ClickhouseEngineEE` | Isolated stub in `ee-baseline` |
-| 8 | `internal/entity` | `entity_stub.go` | `TenantMetadataEE` | `ee-baseline` fallback |
-| 9 | `internal/handler` | `handler_stub.go` | `RegisterEEHandlers` | `ee-baseline` fallback |
-| 10 | `internal/permission` | `permission_stub.go` | `EnforceTenantPermissionEE` | `ee-baseline` fallback |
-| 11 | `internal/permission/testsupport` | `test_stub.go` | `NewMockPermissionManagerEE` | `ee-baseline` fallback |
-| 12 | `internal/router` | `router_stub.go` | `registerCustomRoutesEE` | Router seam reserved for trampoline |
-| 13 | `internal/server/config` | `config_stub.go` | `EEConfig`, `LoadEEConfig` | `ee-baseline` fallback |
-| 14 | `internal/server/local` | `local_stub.go` | `InitLocalEE` | `ee-baseline` fallback |
-| 15 | `internal/server` | `server_stub.go` | `ServerHooksEE` | `ee-baseline` fallback |
-| 16 | `internal/service/billing` | `stub.go` | `BillingServiceEE` | Isolated stub in `ee-baseline` |
-| 17 | `internal/service/dataset` | `dataset_stub.go` | `DatasetPermissionEE` | `ee-baseline` fallback |
-| 18 | `internal/service/document` | `document_stub.go` | `ParseDocumentEE` | `ee-baseline` fallback |
-| 19 | `internal/service` | `service_stub.go` | `UserServiceEE`, `TenantServiceEE` | `ee-baseline` fallback |
-
-### 2.3 Thin Seam Trampolines
-Trampolines act as thin bridges redirecting upstream extension points to the `model-platform` package:
-1. **Admin Router Trampoline** (`overlay/trampolines/internal/admin/model_platform_trampoline_ee.go`):
-   ```go
-   //go:build ee
-
-   package admin
-
-   import (
-       "github.com/gin-gonic/gin"
-       mpAdmin "ragflow/extensions/model-platform/backend/admin"
-   )
-
-   func RegisterEERouter(protected *gin.RouterGroup, r *Router) {
-       mpAdmin.RegisterModelPlatformAdminRoutes(protected)
-   }
-   ```
-2. **Main Router Trampoline** (`overlay/trampolines/internal/router/model_platform_trampoline_ee.go`):
-   ```go
-   //go:build ee
-
-   package router
-
-   import (
-       "github.com/gin-gonic/gin"
-       "ragflow/extensions/model-platform/backend/guard"
-   )
-
-   func SetupEERouter(r *gin.Engine) {
-       r.Use(guard.ManagedProviderGuardMiddleware())
-       r.Use(guard.DatasetImmutabilityGuardMiddleware())
-   }
-   ```
-
-### 2.4 Frontend Web Overlay Seams & Enterprise Flag Defense
-In `upstream/ragflow/web/src/pages/admin/utils.tsx:80`, `IS_ENTERPRISE = import.meta.env.VITE_RAGFLOW_ENTERPRISE === 'RAGFLOW_ENTERPRISE'`.
-> [!WARNING]
-> Enabling `VITE_RAGFLOW_ENTERPRISE` blindly mounts un-stubbed upstream enterprise routes (such as Whitelist, Roles, Monitoring), triggering broken routes and unauthenticated 404/401 API crashes.
-
-The `model-platform` extension leaves `VITE_RAGFLOW_ENTERPRISE=false` disabled and injects its UI strictly through targeted frontend seams:
-- `overlay/web/src/ee/merge-routes.tsx`: Mounts `/admin/model-providers` and `/admin/model-usage-statistics`.
-- `overlay/web/src/ee/pages/admin/layouts/navigation-private.tsx`: Injects admin sidebar navigation items.
-- `overlay/web/src/ee/utils/api-private.ts`: Registers model platform backend API routes.
-
-### 2.5 Build-Time CI Guards
-The script `extensions/model-platform/scripts/audit-non-invasive.sh` enforces three automated CI gates:
-1. **Gate 1 (Clean Submodule)**: Asserts `git -C upstream/ragflow diff --quiet` and `status --porcelain` are 100% clean.
-2. **Gate 2 (Enterprise Flag Guard)**: Fails immediately if `VITE_RAGFLOW_ENTERPRISE` equals `RAGFLOW_ENTERPRISE`.
-3. **Gate 3 (19-Package EE Baseline Completeness Scan)**: Scans all upstream packages guarded by `//go:build !ee` to assert that all 19 packages have affirmative `//go:build ee` fallback stubs present in `overlay/ee-baseline/` and `overlay/trampolines/`.
-
-### 2.6 Workspace Overlay Pipeline (apply-overlay.sh)
-The script `extensions/model-platform/scripts/apply-overlay.sh` automates syncing:
-```bash
-bash extensions/model-platform/scripts/apply-overlay.sh
+```text
+extensions/model-platform/
+├── backend/
+│   ├── admin/       # 13 Admin HTTP handlers (health, models, publish tasks, tenants, rotate-key, usage, audit)
+│   ├── dao/         # Reconcile DAO & transaction-safe tenant creation hook
+│   ├── entity/      # 7 domain entities & ManagedModelSlots single source of truth
+│   ├── event/       # In-memory EventBus & post-commit PreFlightCheck
+│   ├── gateway/     # LiteLLM HTTP client (keys, models, spend logs, health)
+│   ├── guard/       # 3 App API middlewares (ManagedProvider, DatasetImmutability, DefaultModelPreference)
+│   ├── metering/    # SpendLogCollector, UsagePipeline, MeteringDaemon, AuditTenantSpendIsolation
+│   ├── migration/   # 6 idempotent GORM migrations + legacy catalog backfill
+│   ├── publisher/   # Catalog CRUD, rollout task/item fan-out, optimistic-locked worker
+│   ├── reconciler/  # TenantReconciler, two-tier SelfHealingController, StickyGuard, KeyRotator, lifecycles, cleanup
+│   ├── router/      # App API middleware registration entrypoints
+│   └── worker/      # Unified background worker lifecycle launched by ServerTypeAPI
+├── gateway/         # Production Docker Compose, litellm-config.yaml, validate-gateway-config.sh
+├── overlay/
+│   ├── ee-baseline/ # Affirmative //go:build ee fallback stubs across 19 upstream packages + runtime seams
+│   ├── trampolines/ # Thin admin & app router forwarding shims
+│   └── web/src/ee/  # Admin UI pages, locales, routes, client, ProviderInstanceCardWithPrivilege
+├── scripts/         # apply-overlay.sh, audit-non-invasive.sh, emergency-rotate-keys.sh
+└── tests/e2e/       # Dockerized LiteLLM + PostgreSQL E2E test cluster & suites
 ```
-It validates all three pre-flight assertions, prepares a clean upstream workspace (`rm -rf build/ragflow && mkdir -p build/ragflow`), extracts upstream baseline via `git archive`, and synchronizes layers in order (`ee-baseline`, `trampolines`, `backend`, and `overlay/web/src/ee/` into `build/ragflow/web/src/ee/`).
 
 ---
 
-## 3. Dimension 2: LiteLLM Gateway Selection & Credential Pipeline
+## 2. Build & Workspace Overlay Integration
 
-### 3.1 Gateway Infrastructure & Loopback Isolation (127.0.0.1:4000)
-LiteLLM Proxy (`ghcr.io/berriai/litellm:v1.110.0` - latest stable v1.110.0) backed by PostgreSQL (`postgres:16-alpine`) provides the gateway layer:
-- **Physical Loopback Isolation**: The container binds strictly to loopback `127.0.0.1:4000` (Docker ports mapping: `127.0.0.1:4000:4000`). Public internet exposure is strictly prohibited.
-- **Protocol Compatibility**: Native OpenAI-compatible `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models` match RAGFlow's `OpenAI-API-Compatible` driver directly.
+### 2.1 Go `ee` Global Build Tag Exclusion & Affirmative `ee-baseline` Stubs
 
-### 3.2 Root Provider Secret Physical Isolation
+Upstream `build.sh` appends `RAGFLOW_GO_TAGS` to `GO_BUILD_TAGS`. Passing `RAGFLOW_GO_TAGS=ee` globally excludes every upstream `//go:build !ee` community stub across 19 packages simultaneously. To compile cleanly without touching upstream, `overlay/ee-baseline/` supplies affirmative `//go:build ee` stubs across all 19 affected packages while reserving router registration symbols exclusively for `overlay/trampolines/`:
+
+| Layer | Responsibility | Key Files |
+| :--- | :--- | :--- |
+| **`overlay/ee-baseline/`** | Community-equivalent fallback stubs across all 19 `!ee` packages plus runtime hook wiring | `internal/dao/stub_ee.go` (migrations, `OnTenantCreateHook`, DB provider), `internal/server/stub_ee.go` (`StartServer`/`ShutdownServer` worker lifecycle), `internal/service/stub_ee.go` (`tenant.member.joined` default inheritance), `internal/permission/stub_ee.go` (community policy fallback), plus pure stubs for `cmd`, `internal/admin`, `internal/cli`, `internal/common`, `internal/deepdoc/parser/pdf/table`, `internal/engine/clickhouse`, `internal/entity`, `internal/handler`, `internal/permission/testsupport`, `internal/router`, `internal/server/config`, `internal/server/local`, `internal/service/billing`, `internal/service/dataset`, `internal/service/document` |
+| **`overlay/trampolines/`** | Exclusively declares `SetupEERouter`, `RegisterEERouter`, `RegisterEENoAuthRouter`, `RegisterEEProtectedRouter`, `RegisterEEAuthRouter` | `overlay/trampolines/internal/admin/model_platform_trampoline_ee.go`, `overlay/trampolines/internal/router/model_platform_trampoline_ee.go` |
+
+### 2.2 Thin Router Trampolines & Runtime Wiring
+
+- **Admin Router** (`overlay/trampolines/internal/admin/model_platform_trampoline_ee.go`): Forwards `RegisterEERouter(protected, r)` to `mpAdmin.RegisterModelPlatformAdminRoutes(protected)`, mounting all 13 endpoints under `/api/v1/admin/model-platform`.
+- **App Router** (`overlay/trampolines/internal/router/model_platform_trampoline_ee.go`): Forwards `RegisterEEProtectedRouter(protected, r)` to `mpRouter.RegisterModelPlatformProtectedRoutes(protected)`, attaching the three middlewares after `AuthMiddleware` populates `tenant_id` and `user_id`:
+  1. `guard.ManagedProviderGuardMiddleware()`
+  2. `guard.DatasetImmutabilityGuardMiddleware()`
+  3. `guard.DefaultModelPreferenceMiddleware()`
+- **Schema Migrations & Hooks** (`overlay/ee-baseline/internal/dao/stub_ee.go`):
+  - `migrateBillingSchemaEE` runs all 6 idempotent migrations (`001`–`005` + `006_backfill_catalog`).
+  - `initializeTenantDefaultRoleEE` invokes `mpdao.OnTenantCreateHook`.
+  - `init()` registers `mpworker.SetDBProvider(GetDB)`.
+- **Background Workers** (`overlay/ee-baseline/internal/server/stub_ee.go`): `StartServer` starts `mpworker.Start(ctx)` when `serverType == common.ServerTypeAPI` and `LITELLM_BASE_URL` + `LITELLM_MASTER_KEY` are set; `ShutdownServer` drains and stops all workers cleanly.
+- **Member Join Hook** (`overlay/ee-baseline/internal/service/stub_ee.go`): `recordTenantPermissionChangeEE` listens for `eventType == "tenant.member.joined"` and runs `DefaultsManager.InitializeMemberFromOwner`.
+
+### 2.3 Frontend Web Overlay Seams & Enterprise Flag Defense
+
+Upstream `web/src/pages/admin/utils.tsx` sets `IS_ENTERPRISE = import.meta.env.VITE_RAGFLOW_ENTERPRISE === 'RAGFLOW_ENTERPRISE'`. Keeping `VITE_RAGFLOW_ENTERPRISE` disabled prevents mounting un-stubbed upstream commercial admin routes (Whitelist, Roles, Monitoring). The extension injects only its own seams under `overlay/web/src/ee/`:
+
+- `private-routes.tsx` & `merge-routes.tsx`: Injects `/admin/model-providers`, `/admin/model-usage-statistics`, and `/admin/model-tenants` into the admin navigation layout.
+- `pages/admin/layouts/navigation-private.tsx`: Appends **Model Providers**, **Model Usage**, and **Tenant Credentials** to the admin sidebar.
+- `pages/admin/{model-providers,model-usage-statistics,model-tenants}.tsx`: Complete React Query admin governance pages.
+- `pages/user-setting/setting-model/provider-instance-card-with-privilege.tsx`: Wraps `ProviderInstanceCard`, detects `platform` / `is_managed` instances, renders the localized **`Platform Managed`** shield badge, and hides all instance/model mutation controls while preserving search, type filters, and connectivity checks.
+- `constants/model-types.ts`: Frontend mirror of `backend/entity/model_slots.go`.
+- `locales/{en,zh,zh-traditional}-private.ts` & `utils/{api-private,model-platform-client}.ts`: Localization bundles and typed Axios client.
+
+### 2.4 Workspace Assembly & Non-Invasive CI Gates
+
+- `scripts/apply-overlay.sh` extracts `upstream/ragflow` via `git archive` into `build/ragflow` and synchronizes layers in strict precedence order: `ee-baseline → trampolines → backend → web`.
+- `scripts/audit-non-invasive.sh` enforces three CI gates:
+  1. **Gate 1 (Submodule Cleanliness)**: `upstream/ragflow` matches the pinned gitlink with zero diff and clean status.
+  2. **Gate 2 (Enterprise Flag Safety)**: Fails if `VITE_RAGFLOW_ENTERPRISE=RAGFLOW_ENTERPRISE`.
+  3. **Gate 3 (19-Package EE Baseline Completeness)**: Verifies every upstream `//go:build !ee` package has affirmative `//go:build ee` stubs with no symbol collisions.
+
+---
+
+## 3. LiteLLM Gateway & Credential Pipeline
+
+### 3.1 Gateway Topology & Loopback Isolation
+
+`gateway/docker-compose.yml` runs pinned `ghcr.io/berriai/litellm:v1.110.0` backed by `postgres:16-alpine` on an isolated bridge network (`ragflow-model-platform-net`):
+
+- **Loopback Binding**: `127.0.0.1:4000:4000` only (`gateway/validate-gateway-config.sh` rejects public exposure and plaintext keys).
+- **Empty Default Catalog**: `litellm-config.yaml` ships `model_list: []` so private/air-gapped deployments are never polluted with unreachable routes.
+- **Security & Cache Controls**: `redact_user_api_key_info: true`, `drop_params: true`, `set_verbose: false`, `json_logs: true`, `store_model_in_db: true`, `disable_spend_logs: false`, and `user_api_key_cache_ttl: 5` (bounds key revocation propagation delay to 5s per worker).
+
+### 3.2 Key Identity, Scoped Virtual Keys & Revocation
+
+A tenant's keys are grouped by LiteLLM **team** (`team_id = tenant_id`), never by `key_alias`:
+
+- Individual keys are addressed by `key_hash` (the SHA-256 hex digest LiteLLM stores, accepts in `POST /key/delete`, and records as `api_key` in spend logs). The control plane stores only `key_hash` and `gateway_key_alias` on `platform_tenant_reconcile`.
+- `GET /key/list?team_id=<tenant>&return_full_object=true` enumerates a tenant's keys. `ConvergeTenantKeys` revokes all keys except `key_hash` (refusing to revoke anything if `key_hash` is absent from the gateway list), and `RevokeTenantKeys` revokes all.
+- `key_alias` (`tenant_<id>_<8 hex>`) is a human-readable label only; spend attribution uses `team_id`.
+- An empty active catalog issues a virtual key carrying `RevokedModelPlaceholder` rather than an empty list because LiteLLM treats an empty `models` list as unrestricted.
+
+### 3.3 Emergency Key Rotation
+
+`KeyRotator.Rotate` (`backend/reconciler/key_rotation.go`) replaces a `ready` tenant's virtual key with zero downtime while holding the provider-row whitelist lock and in-process mutex (serializing against catalog rollouts):
+
+1. CAS-mark `key_dirty_since` on `platform_tenant_reconcile` (incrementing `version`) before touching the gateway.
+2. Issue a replacement key with the whitelist rebuilt from the tenant's active/read-only managed models.
+3. In one DB transaction, update `tenant_model_instance.api_key` and record `key_hash`, `gateway_key_alias`, `key_rotated_at`, and `key_rotated_by`. On failure, re-read the record and revoke the newly issued key only if the read succeeds and still shows the prior key; on ambiguous failure, leave the dirty marker for the sweeper.
+4. Converge the tenant's gateway team on the new `key_hash` (revoking superseded keys) and clear `key_dirty_since`.
+
+The record stays `ready` throughout so `ReconcilePoller` never mistakes an interrupted rotation for abandoned provisioning. `worker.sweepDirtyKeys` runs every `1m` to converge records dirty for `> 2m`. Batch operations are driven by `scripts/emergency-rotate-keys.sh` with cursor pagination, concurrency/rate limits, and `--resume`.
+
+### 3.4 Tenant Decommissioning & Orphan Cleanup
+
+`TenantDecommissioner` (`backend/reconciler/tenant_cleanup.go`) revokes every gateway key in the tenant's team, marks `platform_tenant_reconcile.status = 'deleted'`, and scrubs local credentials. `worker.scanOrphanedTenants` runs every `1h` to detect and decommission any managed tenant whose upstream `tenant` row was removed.
+
+---
+
+## 4. Tenant Lifecycle, Self-Healing & Write Protection
+
+### 4.1 Transaction-Decoupled Hook & Pre-Flight Visibility
+
+`dao.OnTenantCreateHook` executes inside `initializeTenantDefaultRoleEE`:
+
+1. Inserts a local `platform_tenant_reconcile` row (`status = 'pending'`, `max_retries = 50`, `version = 1`) with `ON CONFLICT DO NOTHING`. Zero network calls occur inside the transaction.
+2. Spawns a goroutine using a root connection to run `event.PreFlightCheck` (3s timeout) until the committed tenant row is externally visible, then publishes `TenantCreatedEvent` to `event.GetDefaultBus()`.
+
+### 4.2 Two-Tier Self-Healing Controller
+
 ```mermaid
 flowchart TD
-    subgraph SecretBoundary [Physical Boundary: Gateway Container Environment]
-        EnvSecrets[Upstream Secrets: PLATFORM_UPSTREAM_OPENAI_KEY]
-        LiteLLMConfig[litellm-config.yaml]
+    CommitEvent["TenantCreatedEvent (Post-Commit)"] --> Tier1Queue["Tier 1: In-Memory Event Worker"]
+    subgraph Tier1 ["Tier 1: Transient Jitter Recovery"]
+        Tier1Queue --> TryReconcile{"Reconcile Gateway & DB"}
+        TryReconcile -->|"Success"| SetReady["status = ready"]
+        TryReconcile -->|"Failure (< 5 retries)"| Backoff1["Exponential Backoff (~31s total)"] --> TryReconcile
+        TryReconcile -->|"Exhausted"| SetDegraded["status = degraded"]
     end
-
-    subgraph LoopbackNetwork [Loopback Network: 127.0.0.1:4000]
-        LiteLLMProxy[LiteLLM Proxy Engine]
-        PostgresDB[(PostgreSQL: LiteLLM_VerificationToken)]
+    subgraph Tier2 ["Tier 2: Level-Triggered Poller"]
+        Poller["ReconcilePoller (every 30s)"] --> FindDue["Find pending/degraded due + stale provisioning (>2m)"]
+        FindDue --> TryHeal{"Gateway Available?"}
+        TryHeal -->|"Yes"| SetReady
+        TryHeal -->|"No"| Backoff2["Jittered Backoff (up to 10m, max 50 retries)"]
     end
-
-    subgraph ControlPlane [RAGFlow Engine & Reconciler]
-        Reconciler[Model Platform Reconciler]
-        TenantDB[(RAGFlow DB: user_tenant, tenant_model)]
-        ModelFactory[RAGFlow ModelFactory]
-    end
-
-    EnvSecrets --> LiteLLMProxy
-    LiteLLMConfig --> LiteLLMProxy
-    PostgresDB <--> LiteLLMProxy
-    Reconciler -->|Master Key via 127.0.0.1: /key/generate| LiteLLMProxy
-    LiteLLMProxy -->|Returns Virtual Key: sk-tenant-*| Reconciler
-    Reconciler -->|Stores Virtual Key| TenantDB
-    ModelFactory -->|Inference via 127.0.0.1:4000| LiteLLMProxy
-    LiteLLMProxy -->|Proxies with Root Secret| UpstreamProvider[Upstream Provider API]
-```
-
-### 3.3 Scoped Tenant Virtual Key Specification (sk-tenant-...)
-Virtual keys are provisioned via `POST /key/generate`:
-```json
-{
-  "models": ["gpt-4o-mini", "text-embedding-3-small"],
-  "team_id": "tenant-e2e-test",
-  "user_id": "user-e2e-test",
-  "key_alias": "tenant_tenant-e2e-test_1a2b3c4d",
-  "metadata": {"tenant_id": "tenant-e2e-test"}
-}
-```
-The client in `backend/gateway/client.go` dynamically loads `LITELLM_MASTER_KEY` and `LITELLM_BASE_URL` with 5-second HTTP timeouts and exponential retries.
-
-### 3.4 Gateway Permission Routing & Admin Endpoint Blocking
-LiteLLM enforces:
-- Admin endpoints (`/key/*`, `/model/*`, `/global/*`) require the Master Key. Requests using tenant virtual keys return HTTP 401 or 403.
-- Invocations to models outside the tenant's model whitelist return HTTP 403 Forbidden (`ModelNotAllowedError`).
-
-### 3.5 Tenant Decommissioning & Virtual Key Revocation
-When a tenant is deleted, `TenantDecommissioner` asynchronously revokes every virtual key of the tenant's gateway team (see [Key identity](#key-identity-and-revocation)) and then marks the record `deleted` and scrubs the local credential.
-
-#### Key identity and revocation
-A tenant's keys are identified by the gateway **team**, not by `key_alias`. The team id equals the tenant id and groups every key the platform issues for the tenant. A single key is addressed by its token, the sha256 hex digest of the key, which LiteLLM stores, accepts in `POST /key/delete`, and writes as `api_key` into spend logs. The reconcile record keeps that digest as `key_hash`, so the platform can revoke without storing raw tokens.
-
-- `GET /key/list?team_id=<tenant>&return_full_object=true` lists the keys of a tenant. `ConvergeTenantKeys` revokes all of them except the one named by `key_hash`, and `RevokeTenantKeys` revokes all. Both are idempotent, and revoking a key that is already gone is not an error. `ConvergeTenantKeys` refuses to revoke anything when the gateway does not list the key the record names, so a stale record can never leave a tenant without a credential.
-- `key_alias` is only a human readable label of the form `tenant_<id>_<8 hex>`. LiteLLM enforces alias uniqueness in application code only, so concurrent requests can create duplicates, and `POST /key/delete` with `key_aliases` removes every match.
-- Tenant attribution in spend logs uses the team id, never the alias.
-
-### 3.6 Emergency Key Rotation
-Administrators replace the gateway key of a tenant, for example after a leak. The tenant stays `ready` and new requests use the new key from the database commit on, so the tenant is not taken out of service. Requests that are still running on the old key fail once it is revoked:
-
-```
-POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key
-GET  /api/v1/admin/model-platform/tenants?status=ready&after=<tenant_id>&page_size=100
-```
-
-The list is read with a cursor on the tenant id (`after`) instead of a page number, so a tenant that leaves the ready set between two pages cannot make the walk skip another one. The walk is not a snapshot: a tenant that becomes ready behind the cursor is not part of it, so operators repeat the selection to include such tenants.
-
-`KeyRotator.Rotate` runs for a `ready` tenant under the instance whitelist lock (a row lock on the provider the instance belongs to, plus an in-process mutex), so it cannot interleave with a model going live or retiring. The row locked is the provider's, not the instance's, because the rotation itself writes the instance row (`api_key`) while the lock is held in a separate transaction:
-1. Mark the record dirty (`key_dirty_since`) with a compare-and-swap on `version`. The marker is written before anything changes at the gateway.
-2. Issue the new key with the whitelist rebuilt from the tenant's active models (never empty, so the rotation keeps what the tenant may call).
-3. In one transaction, point the managed `tenant_model_instance` at the new key and record `key_hash`, `gateway_key_alias`, `key_rotated_at` and `key_rotated_by`. If this fails, the record is read back. Only when that read succeeds and shows another key is the new key revoked by its hash and the old key kept. A failed read proves nothing (a dropped connection makes it likely, and the commit may have gone through), so the new key and the dirty marker stay and the sweeper converges on whatever the record names.
-4. Converge the tenant's gateway team on the new key, which revokes the old one, and clear the marker.
-
-The record stays `ready` during the rotation. A `provisioning` status would make the poller treat an interrupted rotation as an abandoned provisioning and issue another key.
-
-| HTTP | Meaning |
-|---|---|
-| 200 | New key in use, old key revoked |
-| 202 | New key in use, a superseded key may still be valid (`old_keys_revoked: false`). The key sweeper keeps revoking it. Calling the endpoint again does not resume that revocation, it rotates the tenant once more: a new key is issued, the key of the first call is replaced and revoked too, and every superseded key is revoked |
-| 400 / 404 | Tenant id cannot be a gateway team id / tenant not managed by the platform |
-| 409 | Tenant not ready, or its record changed during the rotation |
-| 502 | The gateway could not issue a key. The current key is kept and stays valid. The tenant stays marked dirty, and if the gateway created a key before the failure (for example when only the response was lost), the key sweeper revokes it |
-| 503 | Gateway or database not configured |
-
-The response carries a fingerprint (first 8 digits of the key hash), never the key. The operator is the authenticated administrator and each rotation is logged with the old and new key hashes.
-
-**Recovery.** `key_dirty_since` survives a crash at any step. A worker sweep (every minute, for tenants dirty for more than two minutes) converges the tenant on the key its record names, taking the same lock. The convergence is idempotent, so a failed sweep is simply retried.
-
-**Revocation latency.** LiteLLM workers cache keys for `user_api_key_cache_ttl` seconds (5 in the test and production configuration, 60 by default), so a revoked key can still authenticate on a worker for that long. Multiple gateway replicas need Redis for the revocation to be broadcast. `POST /key/block` is not faster.
-
-**Metering.** Spend rows carry the team id, so the calls of the old and the new key roll up into the same `(tenant_id, model_name, usage_date)` row. Calls with a revoked key are written as failures without a team and are not billed.
-
-**Batch rotation.** `scripts/emergency-rotate-keys.sh` calls the endpoint for one tenant (`--tenant`) or all ready tenants (`--all --force`), with `--concurrency`, `--rate-limit`, `--dry-run`, and `--resume` to skip tenants an earlier result file shows as rotated. It needs `curl`, `jq` and a superuser `ADMIN_TOKEN`, writes one JSON line per tenant, and exits non-zero while any tenant failed or still has a superseded key.
-
-`/key/regenerate` and automatic key rotation are LiteLLM enterprise features and are not used.
-
----
-
-## 4. Dimension 3: Tenant Lifecycle & Self-Healing Reconciler
-
-### 4.1 GORM Post-Commit Asynchronous Decoupling
-To avoid long-lived database locks and transaction rollbacks during network calls, hooks decouple via GORM:
-1. `RegisterPostCommitHook` attaches to transaction `AfterCommit` events.
-2. Events dispatch to an in-memory buffered channel on `event.EventBus`.
-3. `TenantHookPrecheck` verifies that tenant database rows are committed and externally visible before invoking the reconciler.
-
-### 4.2 Two-Tier Self-Healing Controller Architecture
-```mermaid
-flowchart TD
-    CommitEvent[Tenant Created Event] --> Tier1Queue[Tier 1: Fast In-Memory Queue]
-
-    subgraph Tier1 [Tier 1: Transient Jitter Recovery]
-        Tier1Queue --> Worker[Worker Process]
-        Worker --> TryReconcile{Reconcile Gateway & DB}
-        TryReconcile -->|Success| SetReady[State: ready]
-        TryReconcile -->|Failure < 5 Retries| Backoff1[Exponential Backoff: 1s, 2s, 4s, 8s, 16s] --> Worker
-        TryReconcile -->|Exhausted 5 Retries| SetDegraded[State: degraded]
-    end
-
-    subgraph Tier2 [Tier 2: Level-Triggered Poller]
-        Poller[ReconcilePoller: Scans Every 30s] --> FindDegraded[Find pending & degraded Records]
-        FindDegraded --> TryPoller{Gateway Available?}
-        TryPoller -->|Yes| Heal[Heal Tenant & Set ready]
-        TryPoller -->|No| Backoff2[Jittered Backoff: Up to 10m]
-    end
-
     SetDegraded --> Poller
 ```
 
-- **Tier 1 Fast In-Memory Queue**: New tenant events are processed immediately by the in-memory queue with 5 retries (1s, 2s, 4s, 8s, 16s with jitter, ~31s total).
-- **Tier 2 Level-Triggered Poller**: Scans every 30s for records in `pending` or `degraded` state whose `next_retry_at <= NOW()`. Handles extended outages (e.g., 45-second gateway restarts) using longer backoffs (1m, 2m, 5m, capped at 10m, up to 50 retries / 7 days).
-- **Provisioning Lease Timeout**: Reclaims abandoned `provisioning` records where `updated_at < NOW() - INTERVAL 5 MINUTE` (e.g., if a worker node crashes mid-flight), resetting them back to `pending`/`degraded` for safe recovery.
-- **Compensating Rollback**: If database persistence fails after generating a virtual key on LiteLLM, the worker immediately revokes that key by its own hash (`POST /key/delete`) to prevent orphaned credentials. Before it issues a key, the worker also revokes any key of the tenant's team that an earlier failed attempt left behind.
-- **Distributed Row Locking**: Concurrent pollers use `SELECT * FROM platform_tenant_reconcile WHERE status IN ('pending', 'degraded') AND next_retry_at <= NOW() LIMIT 50 FOR UPDATE SKIP LOCKED` (or optimistic version locking `SET status = 'provisioning', version = version + 1 WHERE tenant_id = ? AND version = ?`).
+- Concurrency across replicas is coordinated by optimistic version locking (`WHERE tenant_id = ? AND version = ?`) and lease reclamation for `provisioning` rows stale for `> 2m`.
 
-### 4.3 State Machine Model & Migration Schema (platform_tenant_reconcile)
-The table `platform_tenant_reconcile` manages lifecycle state:
+### 4.3 Reconcile State Machine & Schema (`platform_tenant_reconcile`)
+
+Managed by `migration/001_reconcile_schema.go` (compatible with MySQL, PostgreSQL, and SQLite):
+
 ```sql
 CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
     tenant_id VARCHAR(32) PRIMARY KEY,
-    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    status VARCHAR(32) NOT NULL DEFAULT 'pending', -- pending | provisioning | ready | degraded | failed | deleted
     retry_count INT NOT NULL DEFAULT 0,
     max_retries INT NOT NULL DEFAULT 50,
     next_retry_at DATETIME NULL,
     last_error TEXT NULL,
     gateway_key_alias VARCHAR(128) NULL,
     key_hash VARCHAR(128) NULL,
-    key_dirty_since DATETIME NULL, -- set while a rotation has not revoked the superseded keys yet
+    key_dirty_since DATETIME NULL,
     key_rotated_at DATETIME NULL,
     key_rotated_by VARCHAR(128) NULL,
     version BIGINT NOT NULL DEFAULT 1,
@@ -346,131 +222,109 @@ CREATE TABLE IF NOT EXISTS platform_tenant_reconcile (
 ```
 
 ### 4.4 Native Driver Resolution & Compensating Rollback
-- Records are stored as `ProviderName = "OpenAI-API-Compatible"` with `InstanceName = "platform"` and `is_managed = true`.
-- Upstream `ModelFactory.CreateModelDriver` matches `"openai-api-compatible"` directly.
-- **Compensating Rollback**: If database persistence fails after virtual key generation, `reconciler` immediately revokes the issued key by its hash (`POST /key/delete`) to clean up orphaned credentials.
 
-### 4.5 Backend Managed Model Protection (ManagedProviderGuardMiddleware)
-`ManagedProviderGuardMiddleware` intercepts write requests (`DELETE`, `PUT`, `PATCH`) to `/v1/user/setting/model/provider`, `/api/v1/user/setting/model/provider`, and `/api/v1/admin/model/provider`:
-- If target provider is `OpenAI-API-Compatible@platform` or `is_managed = true`, it returns HTTP 403 Forbidden with `"Platform-managed providers and models cannot be modified or deleted by tenants."`
+`TenantReconciler.Reconcile` provisions `ProviderName = "OpenAI-API-Compatible"`, `InstanceName = "platform"`, `extra = {"is_managed": true}`, active catalog `tenant_model` rows, and initial empty default slots. Before issuing a new key it cleans up any leftover team keys; if DB persistence fails after issuing a key, compensating rollback attempts a single `DeleteKeysByHash` revocation for the newly issued key (if that revocation fails, the leftover key remains until the gateway recovers and a subsequent reconcile sweeps it while the tenant is `pending`/`degraded` under the 50-retry limit, or until manual cleanup/escalation if the tenant reaches `failed`).
+
+### 4.5 Managed Provider Write Protection (`ManagedProviderGuardMiddleware`)
+
+Mounted on the App API `protected` group (`backend/guard/managed_provider_guard.go`):
+
+- Intercepts `PUT`/`PATCH`/`DELETE` on provider routes (`/api/v1/providers/*`, `/setting/model/provider/*`, `/admin/model/provider/*`, excluding `/dataset` and `/artifacts`) plus `POST` on `.../instances` and `.../models`.
+- Rejects mutations targeting managed providers/instances/models or attempting to create/rename an instance to reserved name `platform` (case-insensitive) with HTTP `403`.
+- Enforces body size limits (`MAX_JSON_CONTENT_LENGTH`, default `1 MiB` → `413`), rejects duplicate JSON `instances` keys (`400`), and caps batch drops at `100` targets (`400`).
 
 ---
 
-## 5. Dimension 4: Model Defaults & Dataset Vector Space Protection
+## 5. Managed Model Catalog, Defaults & Dataset Protection
 
-### 5.1 Atomic Conditional SQL for Default Initialization
-To eliminate concurrency races when assigning initial default models, LLM and Embedding models are updated with independent atomic conditional queries:
-```sql
--- Initialize default chat model (only if unset)
-UPDATE user_tenant
-SET llm_id = 'gpt-4o-mini@platform@OpenAI-API-Compatible',
-    tenant_llm_id = ?,
-    updated_at = NOW()
-WHERE user_id = ?
-  AND tenant_id = ?
-  AND (llm_id IS NULL OR llm_id = '');
+### 5.1 Managed Model Slots (7 Gateway-Routed Types)
 
--- Initialize default embedding model (only if unset)
-UPDATE user_tenant
-SET embd_id = 'text-embedding-3-small@platform@OpenAI-API-Compatible',
-    tenant_embd_id = ?,
-    updated_at = NOW()
-WHERE user_id = ?
-  AND tenant_id = ?
-  AND (embd_id IS NULL OR embd_id = '');
+`backend/entity/model_slots.go` is the single source of truth shared by publisher validation, reconciler defaults, `StickyGuard`, `DefaultModelPreferenceMiddleware`, usage queries, and frontend `constants/model-types.ts`:
+
+| `ModelType` Bit | Name | `user_tenant` ID Column | `user_tenant` Model ID Column | Nullable |
+| :---: | :--- | :--- | :--- | :---: |
+| `1` | `chat` | `llm_id` | `tenant_llm_id` | No |
+| `2` | `embedding` | `embd_id` | `tenant_embd_id` | No |
+| `4` | `asr` | `asr_id` | `tenant_asr_id` | No |
+| `8` | `vision` | `img2txt_id` | `tenant_img2txt_id` | No |
+| `16` | `rerank` | `rerank_id` | `tenant_rerank_id` | No |
+| `32` | `tts` | `tts_id` | `tenant_tts_id` | Yes |
+| `128` | `decision` | `decision_id` | `tenant_decision_id` | Yes |
+
+Local `ModelTypeOCR` (`64`) runs as a local CV/layout pipeline and is excluded.
+
+### 5.2 Catalog, Fan-Out Rollout & Lifecycle Convergence
+
+Managed by `migration/005_publish_schema.go` and `migration/006_backfill_catalog.go`:
+
+- `platform_managed_model` (`id`, unique `model_name`, `model_type`, `is_default`, `status` = `active` | `retired`): sole source of administrator intent.
+- `platform_model_publish_task` (`id`, `model_name`, `model_type`, `created_at`): task header whose status (`running` | `completed` | `partial_failed`) is derived live from its items.
+- `platform_model_publish_item` (PK `(task_id, tenant_id)`, `status`, `retry_count`, `next_retry_at`, `last_error`, `version`, `upgraded_count`, `preserved_count`): per-tenant convergence state claimed via optimistic locking (`version`), with 2-minute stale-lease recovery, 20-attempt backoff before `failed`, and manual retry via `POST /models/publish/tasks/:id/retry`.
+
+```mermaid
+flowchart LR
+    Admin["POST /models, /retire,<br/>/reactivate, PUT /default"] --> Tx["Single DB Transaction"]
+    Tx --> Cat["platform_managed_model<br/>(active/retired, is_default)"]
+    Tx --> Task["platform_model_publish_task"]
+    Tx --> Items["platform_model_publish_item"]
+    Sweep["Periodic Drift Sweep"] -->|"Ready tenants lagging catalog"| Items
+    Items --> Worker["Optimistic-Locked Publish Worker"]
+    Worker -->|"Reads latest catalog intent"| Cat
+    Worker --> GW["1. Rebuild Gateway Key Whitelist"]
+    GW --> DB["2. Update tenant_model Row"]
+    DB --> Def["3. If default/tombstoned:<br/>StickyGuard Default Convergence"]
 ```
 
-### 5.2 Explicit Preference Tracking & Sticky Guard
-The table `platform_user_default_preference` records user choice provenance:
+Per-tenant derived model states:
+
+| Catalog Intent | Model Type | Tenant KB References | `tenant_model` State | Gateway Whitelist |
+| :--- | :--- | :--- | :--- | :--- |
+| `active` | Any | Any | `active` | Included |
+| `retired` | `embedding` (`2`) | `> 0` | `active` + `extra.{deprecated,read_only}=true` | Retained (read-only) |
+| `retired` | `embedding` (`2`) | `0` | `disabled` + `extra.tombstoned=true` | Evicted |
+| `retired` | All other 6 types | Any | `disabled` + `extra.tombstoned=true` | Evicted |
+
+- **Gateway First, DB Second**: Always updates LiteLLM `/key/update` (rebuilding the full `models` list under the provider row lock + in-process mutex) before modifying `tenant_model`. On activation, this guarantees a newly visible model is already routable at the gateway; on retirement, it intentionally fails closed (revoking gateway access first, then disabling `tenant_model`), with publish-worker retries converging any transient DB failure after the gateway update.
+- **Defaults Never Changed by Onboarding**: Only `PUT /models/:id/default` promotes a default; retiring a model currently marked `is_default` is rejected with `400`. When a model is tombstoned in a tenant, users whose default pointed to it are moved to the current platform default (or cleared if none exists).
+
+### 5.3 Atomic Default Initialization, Inheritance & Sticky Provenance
+
+- **Atomic Initialization (`DefaultsManager`)**: Uses conditional SQL (`WHERE ... AND (col IS NULL OR col = '')`) across all 7 slots so concurrent provisioning never overwrites an existing choice.
+- **Member Join Inheritance**: `InitializeMemberFromOwner` copies the tenant owner's configured slots into empty slots of joining members.
+- **Explicit Preference Tracking (`migration/002_preference_schema.go`)**:
+
 ```sql
 CREATE TABLE IF NOT EXISTS platform_user_default_preference (
     id VARCHAR(32) PRIMARY KEY,
     tenant_id VARCHAR(32) NOT NULL,
     user_id VARCHAR(32) NOT NULL,
     model_type INT NOT NULL,
-    origin VARCHAR(32) NOT NULL DEFAULT 'platform_default', -- 'platform_default' | 'user_explicit'
+    origin VARCHAR(32) NOT NULL DEFAULT 'platform_default', -- platform_default | user_explicit
     current_model_id VARCHAR(128) NOT NULL,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     UNIQUE KEY idx_pref_tenant_user_type (tenant_id, user_id, model_type)
 );
 ```
-Platform upgrades to default models check `origin == 'platform_default'` and preserve explicit user selections (`origin == 'user_explicit'`).
 
-### 5.3 Three-Stage Embedding Lifecycle Protection
-```mermaid
-stateDiagram-v2
-    [*] --> Active: Admin publishes model
-    Active --> DeprecatedReadOnly: Admin disables model (Active KB references > 0)
-    Active --> Tombstoned: Admin disables model (Active KB references == 0)
+- **Observation Middleware (`DefaultModelPreferenceMiddleware`)**: Wraps `PATCH /api/v1/models`, `PATCH /api/v1/models/default`, and `PATCH /api/v1/users/me/models`, diffs `user_tenant` slots before and after the upstream handler, and calls `StickyGuard.RecordObservedUserChoice` under a row lock whenever a slot changes to a different non-empty model.
 
-    state DeprecatedReadOnly {
-        [*] --> PreservedInGateway: Retain LiteLLM virtual key whitelist
-        PreservedInGateway --> ActiveInDB: tenant_model.status stays "active"
-        ActiveInDB --> HiddenForNewKBs: Exclude from frontend & creation APIs
-    }
+### 5.4 Three-Stage Embedding Lifecycle & Dataset Immutability Guard
 
-    DeprecatedReadOnly --> Tombstoned: All KBs migrated or deleted (references == 0)
-
-    state Tombstoned {
-        [*] --> EvictFromGateway: LiteLLM POST /key/update evicts from whitelist
-        EvictFromGateway --> DisableInDB: tenant_model.status = "disabled"
-    }
-
-    Tombstoned --> [*]
-```
-
-1. `Active`: Available for new knowledge base creation and existing dataset vector search.
-2. `Deprecated/Read-Only`: Hidden from new dataset creation, but retained in gateway whitelists so existing knowledge bases continue vector search.
-3. `Tombstoned`: Physically revoked only when active dataset reference count drops to 0.
-
-### 5.4 Dataset Vector Space Immutability & Deprecated Model Guard (DatasetEmbeddingGuardMiddleware)
-`DatasetEmbeddingGuardMiddleware` (aliased as `DatasetImmutabilityGuardMiddleware`) intercepts both dataset creation (`POST /api/v1/datasets`) and mutation endpoints (`PUT/PATCH /api/v1/datasets/:id`):
-- **Creation Guard**: Blocks binding to retired/deprecated embedding models (either explicitly requested or resolved from tenant default). Returns HTTP 400 Bad Request.
-- **Empty Dataset Mutation Guard**: Blocks switching an empty dataset's embedding model to a retired/deprecated model. Returns HTTP 400 Bad Request.
-- **Non-Empty Immutability Guard**: If the dataset contains parsed documents or chunks (`chunk_num > 0 || doc_num > 0`) and the request mutates `embedding_model`, it aborts with HTTP 400 Bad Request.
-
-### 5.5 Managed Model Catalog, Fan-out and Lifecycle
-`platform_managed_model` is the single source of truth for what the platform offers. The catalog only records the administrator's intent (`active` or `retired`, plus at most one `is_default` per type). Everything a tenant has is derived from it by one level-triggered worker. An administrator onboards a model once with `POST /api/v1/admin/model-platform/models` (`model_name`, `model_type` as `ModelType` bit flags: chat, embedding or rerank). The model must already be routed by the gateway; onboarding verifies it with `GET /v1/models`, so upstream provider credentials never pass through RAGFlow.
-
-```mermaid
-flowchart LR
-    Admin["POST models<br>retire, reactivate, default"] --> Tx["One transaction"]
-    Tx --> Cat["platform_managed_model<br>active or retired, is_default"]
-    Tx --> Task["platform_model_publish_task"]
-    Tx --> Items["platform_model_publish_item<br>one per tenant that must change"]
-    Sweep["Worker sweep"] -->|"tenants that differ from the catalog"| Items
-    Items --> Worker["Convergence worker"]
-    Worker -->|"reads the catalog status now"| Cat
-    Worker --> GW["1. Rebuild virtual key whitelist"]
-    GW --> DB["2. Change tenant_model"]
-    DB --> Def["3. If the model is the default:<br>UpgradeDefaultModel"]
-```
-
-The state of a model in one tenant is derived from the catalog intent, never stored in the catalog:
-
-| Catalog intent | Model type | That tenant's references | `tenant_model` | Whitelist |
-| --- | --- | --- | --- | --- |
-| active | any | any | `active` | included |
-| retired | embedding | active knowledge bases > 0 | `active` + `deprecated`, `read_only` | kept |
-| retired | embedding | none | `disabled` + `tombstoned` | removed |
-| retired | chat, rerank, others | any | `disabled` + `tombstoned` | removed |
-
-- **Gateway first, database second**: if the worker stops between the two steps, the key allows a model the tenant cannot see yet. The reverse order would show a model that the gateway rejects. LiteLLM `/key/update` replaces the whole `models` list, so the whitelist is always rebuilt from the active `tenant_model` rows (`reconciler.IncludeModelInWhitelist`). A row lock on the `tenant_model_instance` row serializes the rebuild across replicas, on top of the in-process mutex shared with the embedding lifecycle.
-- **Retire and reactivate**: `POST /models/:id/retire` and `/reactivate` flip the catalog status and answer 202 with a task. The worker applies the status it reads when it processes an item, so an item queued by an outdated request follows the latest intent. Embedding models use `EmbeddingLifecycleManager` (deprecated while the tenant still has knowledge bases, then tombstoned by the sweep), other models use `NonEmbeddingLifecycleManager` (straight to tombstoned). The platform default of a type cannot be retired. Once a model is tombstoned in a tenant, the users of that tenant who default to it (including users who chose it explicitly) are moved to the platform default of the type and become `platform_default`, or have the default cleared when the platform has none, so a default never points at a model nobody can use. A deprecated embedding model is still readable, so its defaults stay until the sweep tombstones it. The retire response reports how many users who chose the model explicitly will be moved.
-- **Set default**: `PUT /models/:id/default` switches `is_default` in one transaction and creates an item for every Ready tenant. After the tenant has the model, `StickyGuard.UpgradeDefaultModel` moves `platform_default` users with the tenant's own `tenant_model` id and keeps `user_explicit` users (#49). Upgraded and preserved counts are stored per item and summed in the task progress.
-- **Cold start and new tenants**: `Reconcile` reads the active catalog for the key whitelist, the `tenant_model` rows and the initial user defaults. An empty catalog still creates the managed provider and instance and generates the key with the deny-all placeholder, because LiteLLM treats an empty `models` list as unrestricted. Deployments that predate the catalog are adopted once by `BackfillManagedCatalog`, which keeps the legacy `gpt-4o-mini` and `text-embedding-3-small` as the defaults of their type.
-- **Optimistic claim**: each item is claimed with `UPDATE ... WHERE version = ? AND status = 'pending'`, so several replicas can run the worker. A `running` item untouched for 2 minutes returns to `pending`. Failures retry with the Tier 2 backoff policy and become `failed` after 20 attempts until `POST .../publish/tasks/:id/retry`.
-- **Level-triggered sweep**: every tick adds items for Ready tenants that lack an active catalog model and for tenants that still hold a retired one, so tenants that become Ready later are covered. A row disabled by someone else (no retirement flag) is never resurrected.
-- **Progress and catalog view**: `GET .../publish/tasks/:id` counts items by status, derives the task status (`running`, `completed`, `partial_failed`) and lists failed tenants. `GET /models` lists the catalog with the number of tenants in each derived state and the knowledge bases and assistants that reference each model.
-- **Defaults are never changed by onboarding**: a model only becomes a default through `PUT /models/:id/default`.
+- `EmbeddingLifecycleManager` transitions retired embedding models to `deprecated`/`read_only` while referencing datasets exist, and the periodic sweep tombstones them once active references reach zero. `NonEmbeddingLifecycleManager` tombstones non-embedding types immediately.
+- `DatasetEmbeddingGuardMiddleware` (`backend/guard/dataset_immutability_guard.go`, aliased as `DatasetImmutabilityGuardMiddleware`) intercepts `POST /api/v1/datasets` and `PUT|PATCH /api/v1/datasets/:dataset_id`:
+  1. Rejects binding any retired/deprecated/read-only embedding on creation (explicit or resolved from user default) or update (`400`).
+  2. Rejects changing the embedding model on any dataset with `chunk_num > 0`, `doc_num > 0`, or active rows in `document` (`400`).
+  3. Permits unchanged re-submission and permits switching an empty dataset to an active model.
 
 ---
 
-## 6. Dimension 5: Metering & Authoritative Reconciliation Pipeline
+## 6. Metering, Reconciliation & Isolation Audit Pipeline
 
-### 6.1 Authoritative Gateway Spend Logs & Raw Staging Deduplication
-LiteLLM spend logs are staged into `platform_gateway_spend_log`:
+### 6.1 Raw Spend Log Staging & Deduplication
+
+Managed by `migration/003_spend_log_schema.go` (`platform_gateway_spend_log`):
+
 ```sql
 CREATE TABLE IF NOT EXISTS platform_gateway_spend_log (
     spend_id VARCHAR(128) PRIMARY KEY,
@@ -485,6 +339,7 @@ CREATE TABLE IF NOT EXISTS platform_gateway_spend_log (
     cached_tokens INT NOT NULL DEFAULT 0,
     cache_write_tokens INT NOT NULL DEFAULT 0,
     reasoning_tokens INT NOT NULL DEFAULT 0,
+    characters BIGINT NOT NULL DEFAULT 0,
     spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
     prompt_spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
     completion_spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
@@ -498,539 +353,75 @@ CREATE TABLE IF NOT EXISTS platform_gateway_spend_log (
     INDEX idx_spend_model (model_name)
 );
 ```
-Network retries insert with `INSERT IGNORE`, guaranteeing atomic deduplication on `spend_id`.
 
-### 6.2 48-Hour Rolling Lookback Replacement Upsert Pipeline
-Daily usage rolls up into `platform_tenant_usage_daily`:
-```sql
-CREATE TABLE IF NOT EXISTS platform_tenant_usage_daily (
-    tenant_id VARCHAR(64) NOT NULL,
-    model_name VARCHAR(128) NOT NULL,
-    usage_date VARCHAR(10) NOT NULL, -- Format: YYYY-MM-DD
-    call_count BIGINT NOT NULL DEFAULT 0,
-    prompt_tokens BIGINT NOT NULL DEFAULT 0,
-    completion_tokens BIGINT NOT NULL DEFAULT 0,
-    total_tokens BIGINT NOT NULL DEFAULT 0,
-    cached_tokens BIGINT NOT NULL DEFAULT 0,
-    cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-    reasoning_tokens BIGINT NOT NULL DEFAULT 0,
-    total_spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
-    prompt_spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
-    completion_spend DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
-    cache_savings DECIMAL(14, 6) NOT NULL DEFAULT 0.000000,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    PRIMARY KEY (tenant_id, model_name, usage_date)
-);
+`SpendLogCollector` inserts rows in `METERING_COLLECTOR_BATCH_SIZE` chunks with `ON CONFLICT DO NOTHING` on `spend_id`.
 
-INSERT INTO platform_tenant_usage_daily (
-    tenant_id, model_name, usage_date, call_count, prompt_tokens, completion_tokens, total_tokens,
-    cached_tokens, cache_write_tokens, reasoning_tokens, total_spend, prompt_spend, completion_spend, cache_savings, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-ON DUPLICATE KEY UPDATE
-    call_count = VALUES(call_count),
-    prompt_tokens = VALUES(prompt_tokens),
-    completion_tokens = VALUES(completion_tokens),
-    total_tokens = VALUES(total_tokens),
-    cached_tokens = VALUES(cached_tokens),
-    cache_write_tokens = VALUES(cache_write_tokens),
-    reasoning_tokens = VALUES(reasoning_tokens),
-    total_spend = VALUES(total_spend),
-    prompt_spend = VALUES(prompt_spend),
-    completion_spend = VALUES(completion_spend),
-    cache_savings = VALUES(cache_savings),
-    updated_at = NOW();
-```
-Overwriting instead of accumulating ensures mathematical idempotence across multiple reconciliation runs.
+### 6.2 Self-Healing Watermark Collector & Replacement Rollup
 
-`MeteringDaemon` coordinates Loop 1 (spend log ingestion) and Loop 2 (daily usage rollup) with three self-healing states:
-- **Cold Start (empty staging table)**: aligns the initial fetch boundary to `00:00:00` in `METERING_TIMEZONE` for the day `METERING_LOOKBACK_HOURS` (default `48`) earlier, matching Loop 2's full-day replacement boundaries.
-- **Online Operation (in-memory checkpoint active)**: advances `lastCheckedAt` after every successful poll (even when 0 logs arrive), keeping routine gateway queries strictly bounded to `[lastCheckedAt - METERING_FETCH_OVERLAP, Now]` (~10 minutes with defaults) and eliminating idle window dilation.
-- **Restart Recovery & Dynamic Catch-up (existing DB records)**: resumes from `MAX(request_time) - METERING_FETCH_OVERLAP` without any lookback truncation cap, streaming in `METERING_COLLECTOR_BATCH_SIZE` batches. Whenever a poll inserts new records whose earliest newly inserted `request_time` (`EarliestInsertedAt`) is earlier than `EndTime - METERING_LOOKBACK_HOURS`, Loop 1 immediately triggers `UsagePipeline.AggregateDailyUsage` over `[EarliestInsertedAt, EndTime]` (so re-scanning an old idle watermark without inserting historical rows never overwrites an already-purged historical day, while retaining pending catch-up retries in memory across cycles within the running process if aggregation or later collection pages fail transiently).
+Managed by `migration/004_usage_schema.go` (`platform_tenant_usage_daily`, PK `(tenant_id, model_name, usage_date)` storing `call_count`, token breakdown, `characters`, `total_spend`, `prompt_spend`, `completion_spend`, `cache_savings`).
 
 ```mermaid
 flowchart TD
-    LiteLLM[("LiteLLM Proxy Spend Logs")] -->|"Checkpoint (~10m) / Uncapped Restart Replay / Day-Aligned Cold Start"| Collector["Spend Log Collector"]
-
-    subgraph Tier1_Staging ["Tier 1: Raw Staging & Deduplication"]
-        Collector -->|"INSERT IGNORE INTO spend_id"| SpendLogTable[("platform_gateway_spend_log<br>Primary Key: spend_id")]
-    end
-
-    subgraph Tier2_Aggregation ["Tier 2: Deterministic Replacement Rollup & Dynamic Catch-up"]
-        SpendLogTable -->|"Routine Lookback + On-Demand Multi-Day Catch-up<br>GROUP BY tenant, model, usage_date"| RollupEngine["Rollup Engine"]
-        RollupEngine -->|"ON DUPLICATE KEY UPDATE<br>call_count = VALUES(call_count)"| DailyTable[("platform_tenant_usage_daily<br>Primary Key: tenant_id, model, date")]
-    end
+    LiteLLM[("LiteLLM /spend/logs/v2")] -->|"Online checkpoint (~10m) / Uncapped restart replay / Day-aligned cold start"| Collector["SpendLogCollector"]
+    Collector -->|"ON CONFLICT DO NOTHING (spend_id)"| Staging[("platform_gateway_spend_log")]
+    Staging -->|"Routine lookback + dynamic multi-day catch-up<br/>(METERING_TIMEZONE aligned)"| Pipeline["UsagePipeline"]
+    Pipeline -->|"Replacement Upsert (no +=)"| Daily[("platform_tenant_usage_daily")]
 ```
 
-### 6.2.1 Declarative Spend Log Retention Policy (Opt-In)
-Raw spend log tables (`LiteLLM_SpendLogs` on the gateway and `platform_gateway_spend_log` on the control plane) are retained indefinitely by default so no historical audit data is silently pruned. Operators can opt in independently at each layer without cross-database access or DDL partitioning:
+`MeteringDaemon` coordinates polling (`METERING_POLL_INTERVAL`, default `5m`), daily aggregation (`METERING_AGGREGATION_INTERVAL`, default `1h`), and optional retention purging (`24h`):
 
-- **Gateway layer (`extensions/model-platform/gateway/litellm-config.yaml`)**: uncomment `maximum_spend_logs_retention_period` (for example `"30d"`) under `general_settings`. LiteLLM autonomously purges `LiteLLM_SpendLogs` without affecting virtual key budget tracking (`token.spend`).
-- **Control plane layer (RAGFlow server environment)**: set `METERING_SPEND_LOG_RETENTION_DAYS` to enable bounded primary-key batch cleanup in `MeteringDaemon`. `platform_tenant_usage_daily` is never modified or deleted by the sweep, and the effective cutoff is clamped so it never intrudes into the active aggregation lookback window.
+- **Cold Start**: Aligns fetch boundary to `00:00:00` in `METERING_TIMEZONE` for the day `METERING_LOOKBACK_HOURS` (default `48`) earlier.
+- **Online Operation**: Advances an in-memory `lastCheckedAt` checkpoint after every successful poll (even with 0 logs), keeping queries bounded to `[lastCheckedAt - METERING_FETCH_OVERLAP, Now]`.
+- **Restart Recovery & Dynamic Catch-up**: Resumes uncapped from `MAX(request_time) - METERING_FETCH_OVERLAP` for logs still retained at the gateway. If any newly inserted row has `EarliestInsertedAt < EndTime - METERING_LOOKBACK_HOURS`, Loop 1 immediately triggers `UsagePipeline.AggregateDailyUsage` over `[EarliestInsertedAt, EndTime]`. On transient aggregation failure, `pendingCatchupStart` is retained in `MeteringDaemon` process memory and retried on subsequent polling cycles within the same process; it is not persisted across an API process restart, so if the process restarts after staging old rows but before catch-up aggregation succeeds, dates older than `METERING_LOOKBACK_HOURS` will not be automatically re-triggered (and retention purges in the new process will not know to preserve those unaggregated rows) unless `METERING_LOOKBACK_HOURS` covers them or a manual rollup is run. **Purge-safety warning**: Because `AggregateDailyUsage` uses replacement upserts and does not detect previously purged days, before widening `METERING_LOOKBACK_HOURS` or running a manual rollup over older dates, operators must verify that `platform_gateway_spend_log` still holds complete raw rows for every calendar day in the target range; otherwise re-aggregating a partially purged day will overwrite its stored daily total with a lower sum.
+- **Accepted Bounds & Operator Sizing**: Both online polling and restart replay query backward by `METERING_FETCH_OVERLAP` (default `5m`). Any gateway spend log written later than `METERING_FETCH_OVERLAP` after its `request_time` falls behind the lower bound and will not be picked up or recovered by dynamic catch-up; similarly, logs purged by gateway retention (`maximum_spend_logs_retention_period`) during an outage cannot be replayed. Operators should size `METERING_FETCH_OVERLAP` above expected gateway write latency and keep gateway retention longer than the maximum tolerated outage plus collection delay.
+- **Cross-Dialect SQL**: `resolveDateExpression` adapts calendar-day bucketing across PostgreSQL, MySQL, and SQLite. PostgreSQL applies per-row `AT TIME ZONE` rules for IANA zone names; MySQL and SQLite apply a single fixed offset computed at aggregation time, so historical backfills across a DST transition may assign rows to the adjacent calendar day.
 
-```dotenv
-# Optional: enable automated control-plane raw spend log purging (disabled by default: 0 = retain indefinitely).
-# Keep this longer than LiteLLM's maximum_spend_logs_retention_period when both layers are enabled.
-# METERING_SPEND_LOG_RETENTION_DAYS=90
-```
+### 6.3 Declarative Opt-In Spend Log Retention
 
-### 6.3 Physical Zero-Billing Isolation for Self-Owned Models
-Tenant self-owned models connect directly to third-party endpoints. They completely bypass the LiteLLM gateway, generating 0 gateway spend logs and strictly $0.00 platform spend.
+Raw spend log tables are retained indefinitely by default:
 
-```mermaid
-flowchart LR
-    subgraph TenantWorkloads ["Tenant Inbound Requests"]
-        ReqPlatform["Platform Model: gpt-4o-mini"]
-        ReqCustom["Tenant Model: Custom OpenAI / Ollama"]
-    end
+- **Gateway**: Uncomment `general_settings.maximum_spend_logs_retention_period` in `gateway/litellm-config.yaml` (does not affect virtual key `token.spend`).
+- **Control Plane**: Set `METERING_SPEND_LOG_RETENTION_DAYS > 0`. `MeteringDaemon` waits for the first startup poll to complete, acquires `pipelineMu` (serializing against in-flight aggregations), clamps the cutoff outside the active lookback window, and deletes raw staging rows in `DefaultPurgeBatchSize` (`1000`) batches without touching `platform_tenant_usage_daily`.
 
-    subgraph RAGFlowRuntime ["RAGFlow Runtime ModelFactory"]
-        ReqPlatform --> Dispatcher{"ModelFactory Dispatcher"}
-        ReqCustom --> Dispatcher
-    end
+### 6.4 Physical Zero-Billing BYOK Bypass & Live Isolation Audit
 
-    subgraph DirectCall ["Direct Route: Physical Gateway Bypass"]
-        Dispatcher -->|"Tenant Private Credentials & BaseURL"| ExternalTenantAPI["External Tenant API Endpoint"]
-    end
-
-    subgraph GatewayCall ["Platform Route: Full Metering Pipeline"]
-        Dispatcher -->|"sk-tenant-xxx via LiteLLM 127.0.0.1:4000"| LiteLLMProxy["LiteLLM Proxy Engine"]
-        LiteLLMProxy --> AuthoritativeLogs[("LiteLLM Spend Logs")]
-        LiteLLMProxy --> ProviderAPI["Upstream Provider API (OpenAI / DeepSeek)"]
-    end
-```
-
-### 6.4 Admin Usage Statistics & Streaming CSV Export API
-- **Paginated Daily Usage API**: `GET /admin/model-platform/usage/daily` (proxied as `/api/v1/admin/model-platform/usage/daily`)
-  - Supports filtering by `tenant_id`, `model_name`, `start_date`, and `end_date`.
-- **Usage Summary API**: `GET /admin/model-platform/usage/summary`
-  - Returns tenant-level and platform-level token and spend aggregation.
-- **Streaming CSV Export API**: `GET /admin/model-platform/usage/export`
-  - Streams CSV exports for millions of billing records with minimal memory footprint.
-- **Self-Owned Zero Billing Audit API**: `GET /admin/model-platform/usage/audit`
-  - Verifies zero gateway spend logs generated by tenant custom providers.
+Self-owned BYOK instances connect directly to external URLs, generating zero LiteLLM spend logs (`$0.00` platform spend). `AuditTenantSpendIsolation` (`backend/metering/isolation_audit.go`, exposed at `GET /api/v1/admin/model-platform/usage/audit`) streams `platform_gateway_spend_log` for a tenant and verifies via exact string match that every billed `model_name` belongs to the tenant's managed `OpenAI-API-Compatible` → `platform` models.
 
 ---
 
-## 7. 25-Task Engineering Breakdown (Phase 0 ~ Phase 5)
-
-### 7.1 Executive Task Matrix
-
-| Phase | Task ID | Core Objective | Key Deliverables & Target Files | Verification Method |
-| :--- | :--- | :--- | :--- | :--- |
-| **P0: Build Baseline** | **TASK-0.1** | Stub 19 EE Packages | Affirmative `//go:build ee` stubs (`overlay/ee-baseline/**/stub_ee.go`) | `RAGFLOW_GO_TAGS=ee go build` compiles cleanly |
-| | **TASK-0.2** | Overlay Sync Pipeline | Workspace overlay script & pre-flight assertions (`scripts/apply-overlay.sh`) | Script execution & zero upstream diff check |
-| | **TASK-0.3** | Thin Trampolines & 403 Guard | Router trampolines & managed provider guard (`managed_provider_guard.go`, `trampolines/**`) | Unit tests assert 403 on DELETE/PUT |
-| | **TASK-0.4** | Frontend Web Overlay Seams | Admin route & navigation injection (`merge-routes.tsx`, `navigation-private.tsx`) | `VITE_RAGFLOW_ENTERPRISE=false` build check |
-| **P1: Gateway Infra** | **TASK-1.1** | LiteLLM Baseline & Isolation | Loopback network isolation & Docker Compose (`gateway/docker-compose.yml`, `litellm-config.yaml`) | `validate-gateway-config.sh` & port checks |
-| | **TASK-1.2** | Root Secret Isolation | Upstream key injection & log masking (`litellm-config.yaml`, `validate-gateway-config.sh`) | Environment secret references, masking flags & plaintext key checks |
-| | **TASK-1.3** | Virtual Key Client & Timeouts | Go HTTP client & timeout controls (`backend/gateway/client.go`, `types.go`) | Client unit tests with timeout verification |
-| | **TASK-1.4** | Gateway Permission Routing | Model whitelist & management endpoint blocking (`permission_test.go`) | 401/403 tests on unauthorized endpoints |
-| **P2: Tenant Lifecycle** | **TASK-2.1** | Post-Commit Event Decoupling | GORM transaction post-commit dispatch (`backend/dao/tenant_hook.go`, `event/bus.go`) | Post-commit dispatch & precheck unit tests |
-| | **TASK-2.2** | Reconciler State Machine | Reconcile schema migration & optimistic lock (`entity/reconcile.go`, `dao/reconcile.go`) | State machine transition & lock conflict tests |
-| | **TASK-2.3** | Native Driver Resolution | `OpenAI-API-Compatible@platform` sync & rollback (`tenant_reconciler.go`) | Native driver match & rollback revocation test |
-| | **TASK-2.4** | Two-Tier Self-Healing Poller | Fast retry worker + level-triggered poller (`reconciler/poller.go`, `retry.go`) | Outage recovery test under 45s downtime |
-| | **TASK-2.5** | Tenant Decommissioning | Tenant deletion event capture & key cleanup (`tenant_cleanup.go`) | Decommissioning test & physical revocation |
-| **P3: Defaults Governance** | **TASK-3.1** | Atomic Conditional Defaults | Atomic conditional SQL default initializer (`defaults_manager.go`) | Concurrency race tests & atomic update checks |
-| | **TASK-3.2** | Explicit Intent Provenance | User preference tracking table (`entity/preference.go`, `sticky_guard.go`) | Upgrade test asserting preserved explicit choices |
-| | **TASK-3.3** | 3-Stage Embedding Lifecycle | `active` -> `deprecated` -> `tombstoned` transitions (`embedding_lifecycle.go`) | Read-only vector search & hidden creation tests |
-| | **TASK-3.4** | Dataset Immutability Guard | Guard blocking embedding model mutation on parsed datasets (`dataset_immutability_guard.go`) | Middleware test asserting HTTP 400 on mutation |
-| **P4: Metering & Rollup** | **TASK-4.1** | Spend Log Staging & Deduplication | Raw staging table & `INSERT IGNORE` (`entity/spend_log.go`, `collector.go`) | Deduplication tests with duplicate log inputs |
-| | **TASK-4.2** | 48-Hour Daily Usage Pipeline | Day-aligned rolling lookback replacement upsert (`entity/usage.go`, `pipeline.go`) | Multiple rollup runs asserting identical totals |
-| | **TASK-4.3** | Self-Owned Model Zero Billing | Verification of direct external provider bypass (`isolation_audit.go`) | Audit test asserting 0 gateway logs and $0 spend |
-| | **TASK-4.4** | Admin Usage & CSV Export API | Usage statistics query & streaming CSV export (`admin/usage_handler.go`) | HTTP handler unit tests & streaming CSV check |
-| **P5: E2E Integration QA** | **TASK-5.1** | Isolated Test Cluster Orchestration | PostgreSQL + LiteLLM test cluster (`tests/e2e/docker-compose.test.yml`, `setup_env.sh`) | Health check probes & network boundary tests |
-| | **TASK-5.2** | Native Driver E2E Integration | Go native driver Chat + Embedding live integration (`tests/e2e/e2e_core_test.go`) | Full E2E core test suite passes |
-| | **TASK-5.3** | Security, Resilience & Guards | 403 anti-deletion, 400 immutability, 45s outage tests (`tests/e2e/e2e_security_stability_test.go`) | Full security and stability E2E suite passes |
-| | **TASK-5.4** | Non-Invasive Audit & CI Gates | Audit script & GitHub Actions workflow (`audit-non-invasive.sh`, `ci.yml`) | CI gates pass with Exit Code 0 |
-
-### 7.2 Architecture Breakdown & Phase Evolution Diagram
-
-```mermaid
-flowchart TD
-    subgraph P0 ["Phase 0: Build & Overlay Foundation"]
-        T0_1["TASK-0.1 Stub 19 EE Packages"] --> T0_2["TASK-0.2 Workspace Overlay Script"]
-        T0_2 --> T0_3["TASK-0.3 Thin Trampolines & 403 Guard"]
-        T0_3 --> T0_4["TASK-0.4 Frontend Web Overlay Seams"]
-    end
-
-    subgraph P1 ["Phase 1: Gateway & Credential Isolation"]
-        T1_1["TASK-1.1 LiteLLM Baseline & Isolation"] --> T1_2["TASK-1.2 Root Secret Isolation"]
-        T1_2 --> T1_3["TASK-1.3 Virtual Key Client & Timeouts"]
-        T1_3 --> T1_4["TASK-1.4 Permission Routing & Endpoint Blocking"]
-    end
-
-    subgraph P2 ["Phase 2: Tenant Lifecycle & Reconciler"]
-        T2_1["TASK-2.1 Post-Commit Event Decoupling"] --> T2_2["TASK-2.2 Reconciler State Machine"]
-        T2_2 --> T2_3["TASK-2.3 Native Driver Resolution & Rollback"]
-        T2_3 --> T2_4["TASK-2.4 Two-Tier Self-Healing Poller"]
-        T2_4 --> T2_5["TASK-2.5 Tenant Decommissioning & Key Revocation"]
-    end
-
-    subgraph P3 ["Phase 3: Defaults & KB Protection"]
-        T3_1["TASK-3.1 Atomic Conditional Defaults SQL"] --> T3_2["TASK-3.2 Explicit Intent Provenance"]
-        T3_2 --> T3_3["TASK-3.3 3-Stage Embedding Lifecycle"]
-        T3_3 --> T3_4["TASK-3.4 Dataset Immutability Guard"]
-    end
-
-    subgraph P4 ["Phase 4: Usage Metering & Reconciliation"]
-        T4_1["TASK-4.1 Spend Log Staging & Deduplication"] --> T4_2["TASK-4.2 48-Hour Daily Usage Pipeline"]
-        T4_2 --> T4_3["TASK-4.3 Self-Owned Model Zero Billing Audit"]
-        T4_3 --> T4_4["TASK-4.4 Admin Usage & CSV Export API"]
-    end
-
-    subgraph P5 ["Phase 5: E2E Integration & QA"]
-        T5_1["TASK-5.1 Test Cluster Orchestration"] --> T5_2["TASK-5.2 Native Driver E2E Integration"]
-        T5_2 --> T5_3["TASK-5.3 Security, Resilience & Guard Tests"]
-        T5_3 --> T5_4["TASK-5.4 Non-Invasive Audit & CI Gates"]
-    end
-
-    P0 --> P1
-    P1 --> P2
-    P2 --> P3
-    P3 --> P4
-    P4 --> P5
-```
-
-### 7.3 Detailed Engineering Task Specifications
-
-#### Phase 0: Build & Overlay Foundation (Build & Overlay Foundation)
-
-##### TASK-0.1: Affirmative Baseline Stubs (ee-baseline) Architecture & 19 Package Definitions
-- **Description**: Provide community-equivalent fallback stubs for all 19 target packages excluded by global `ee` tags, excluding router symbols reserved for trampolines.
-- **Inputs & Outputs**: Input: list of packages excluded by `!ee`; Output: 21 Go stub files in `overlay/ee-baseline/`.
-- **Target Files**: `extensions/model-platform/overlay/ee-baseline/**/stub_ee.go`
-- **Verification**: Baseline stubs provide all required non-router symbols and type definitions; individual baseline packages compile cleanly under `//go:build ee` without `build constraints exclude all Go files`.
-
-##### TASK-0.2: Workspace Overlay Pipeline Script & Three Pre-Flight CI Assertions
-- **Description**: Implement `apply-overlay.sh` to synchronize `ee-baseline`, `trampolines`, `backend`, and `web` layers into build targets with automated pre-flight assertions.
-- **Inputs & Outputs**: Input: overlay directories; Output: `apply-overlay.sh` with exit code 0 on compliance.
-- **Target Files**: `extensions/model-platform/scripts/apply-overlay.sh`
-- **Verification**: Run `bash extensions/model-platform/scripts/apply-overlay.sh` and verify all assertions pass.
-
-##### TASK-0.3: Thin Seam Trampolines & Backend API-Level Anti-Deletion Guard
-- **Description**: Add thin trampolines in `internal/admin` and `internal/router` to inject routes and mount `ManagedProviderGuardMiddleware`.
-- **Inputs & Outputs**: Input: Gin router groups; Output: route mounting and HTTP 403 on managed provider deletion.
-- **Target Files**: `overlay/trampolines/**`, `backend/guard/managed_provider_guard.go`, `managed_provider_guard_test.go`
-- **Verification**: Unit tests verify DELETE/PUT requests targeting managed providers return HTTP 403 Forbidden; full repository verification `go vet -tags "cgo,static,sonic,ee" ./...` compiles cleanly with zero undefined symbol errors once trampolines are mounted.
-
-##### TASK-0.4: Frontend Web Overlay Seams & Enterprise Flag Defense
-- **Description**: Connect frontend admin routes and navigation via `merge-routes.tsx` while strictly enforcing `VITE_RAGFLOW_ENTERPRISE=false`.
-- **Inputs & Outputs**: Input: Web overlay seams; Output: model provider and usage statistics routes in admin panel.
-- **Target Files**: `overlay/web/src/ee/merge-routes.tsx`, `navigation-private.tsx`, `model-providers.tsx`, `model-usage-statistics.tsx`
-- **Verification**: `VITE_RAGFLOW_ENTERPRISE=false npm --prefix web run build` bundles cleanly without route crashes.
-
-#### Phase 1: Gateway Infrastructure & Credential Pipeline (Gateway & Credential Pipeline)
-
-##### TASK-1.1: LiteLLM Gateway Selection & Loopback Network Isolation
-- **Description**: Configure LiteLLM Proxy container pinned to latest stable `v1.110.0` (image `ghcr.io/berriai/litellm:v1.110.0`) backed by PostgreSQL, binding strictly to loopback `127.0.0.1:4000` (Docker ports mapping `127.0.0.1:4000:4000`).
-- **Inputs & Outputs**: Input: container definitions; Output: `gateway/docker-compose.yml`, `litellm-config.yaml`.
-- **Target Files**: `extensions/model-platform/gateway/docker-compose.yml`, `litellm-config.yaml`, `validate-gateway-config.sh`
-- **Verification**: `validate-gateway-config.sh` asserts loopback binding (`127.0.0.1`) and required configurations.
-
-##### TASK-1.2: Root Provider Secret Physical Isolation & Log Masking
-- **Description**: Isolate upstream API keys via `${PLATFORM_UPSTREAM_OPENAI_KEY}` and configure credential masking in LiteLLM logs.
-- **Inputs & Outputs**: Input: environment variables; Output: masked logs and secret isolation test.
-- **Target Files**: `gateway/litellm-config.yaml`, `gateway/validate-gateway-config.sh`
-- **Verification**: Run `validate-gateway-config.sh` to assert that credential masking configuration flags are active, root provider secrets strictly use environment references, and no plaintext keys are present in gateway configuration files (excluding Markdown and example files).
-
-##### TASK-1.3: Tenant Virtual Key Client & Timeout Controls
-- **Description**: Implement Go client for `/key/generate`, `/key/delete`, and `/global/spend/logs` with 5-second HTTP timeouts and exponential retries.
-- **Inputs & Outputs**: Input: gateway API specs; Output: `backend/gateway/client.go`, `types.go`, `client_test.go`.
-- **Target Files**: `extensions/model-platform/backend/gateway/client.go`, `types.go`, `client_test.go`
-- **Verification**: Unit tests assert virtual key generation, deletion, and timeout enforcement.
-
-##### TASK-1.4: Gateway Permission Routing & Admin Endpoint Blocking (Mock Contract Verification)
-- **Description**: Verify gateway permission routing, management endpoint blocking, model whitelisting, and quota/expiry enforcement via an in-process mock.
-- **Inputs & Outputs**: Input: virtual key calls; Output: HTTP 401/403 blockages.
-- **Target Files**: `backend/gateway/permission_test.go`
-- **Verification**: In-process contract tests assert expected 401/403 responses on unauthorized endpoint access.
-
-#### Phase 2: Tenant Lifecycle & Reconciler (Tenant Lifecycle & Reconciler)
-
-##### TASK-2.1: GORM Post-Commit Event Decoupling & Pre-Flight Checks
-- **Description**: Decouple gateway network calls from upstream transactions using GORM `AfterCommit` events and pre-flight checks.
-- **Inputs & Outputs**: Input: transaction commit events; Output: asynchronous dispatch on `event.EventBus`.
-- **Target Files**: `backend/dao/tenant_hook.go`, `backend/event/bus.go`, `tx_hook.go`, `precheck.go`
-- **Verification**: Unit tests assert events dispatch only after transaction commits successfully.
-
-##### TASK-2.2: Reconciler State Machine, Optimistic Locking & Schema Migration
-- **Description**: Create `platform_tenant_reconcile` table and implement state machine with optimistic concurrency locking.
-- **Inputs & Outputs**: Input: state transition requests; Output: database schema migration and DAO methods.
-- **Target Files**: `backend/entity/reconcile.go`, `backend/dao/reconcile.go`, `migration/001_reconcile_schema.go`
-- **Verification**: Unit tests assert valid state transitions (`pending -> provisioning -> ready`) and lock conflict handling.
-
-##### TASK-2.3: Native Driver Resolution & Compensating Rollback
-- **Description**: Provision `OpenAI-API-Compatible@platform` records and implement compensating rollback (`POST /key/delete`) on DB failure.
-- **Inputs & Outputs**: Input: tenant provisioning events; Output: native driver records and rollback cleanup.
-- **Target Files**: `backend/reconciler/tenant_reconciler.go`, `tenant_reconciler_test.go`
-- **Verification**: Tests assert native driver loading and immediate virtual key revocation if DB write fails.
-
-##### TASK-2.4: Two-Tier Self-Healing Controller & Background Poller
-- **Description**: Implement Tier 1 fast in-memory retry (5 attempts) and Tier 2 level-triggered background poller (`ReconcilePoller`).
-- **Inputs & Outputs**: Input: degraded tenant records; Output: automated recovery to `ready` upon gateway return.
-- **Target Files**: `backend/reconciler/poller.go`, `retry.go`, `poller_test.go`
-- **Verification**: Tests simulate 45s gateway outage and assert poller restores all degraded tenants to `ready`.
-
-##### TASK-2.5: Tenant Decommissioning Lifecycle Cleanup & Key Revocation
-- **Description**: Capture tenant deletion events and invoke LiteLLM `POST /key/delete` to clean up virtual keys.
-- **Inputs & Outputs**: Input: tenant deletion events; Output: physical key revocation from LiteLLM PostgreSQL.
-- **Target Files**: `backend/reconciler/tenant_cleanup.go`, `tenant_cleanup_test.go`
-- **Verification**: Tests assert virtual key is revoked and record is marked `deleted` upon tenant decommissioning.
-
-#### Phase 3: Defaults & KB Vector Space Protection (Defaults & KB Protection)
-
-##### TASK-3.1: Atomic Conditional SQL for Default Model Initializer
-- **Description**: Initialize tenant default models using atomic conditional SQL (`WHERE (llm_id IS NULL OR llm_id = '')`).
-- **Inputs & Outputs**: Input: default model assignments; Output: race-free user tenant updates.
-- **Target Files**: `backend/reconciler/defaults_manager.go`, `defaults_manager_test.go`
-- **Verification**: Concurrency tests assert parallel initializations never overwrite existing values.
-
-##### TASK-3.2: Explicit Intent Provenance Tracking & Sticky Guard
-- **Description**: Track explicit user choices in `platform_user_default_preference` to prevent platform upgrades from overwriting custom choices.
-- **Inputs & Outputs**: Input: user model selections; Output: preference schema and sticky guard.
-- **Target Files**: `backend/entity/preference.go`, `migration/002_preference_schema.go`, `reconciler/sticky_guard.go`
-- **Verification**: Tests assert platform default upgrades preserve explicit user choices.
-
-##### TASK-3.3: Three-Stage Embedding Lifecycle Protection
-- **Description**: Implement 3-tier lifecycle (`active -> deprecated -> tombstoned`) for embedding models.
-- **Inputs & Outputs**: Input: model deprecation requests; Output: read-only whitelist retention for existing KBs.
-- **Target Files**: `backend/reconciler/embedding_lifecycle.go`, `embedding_lifecycle_test.go`
-- **Verification**: Tests assert deprecated models remain searchable for existing KBs but hidden from new KB creation.
-
-##### TASK-3.4: Dataset Vector Space Immutability Guard
-- **Description**: Implement `DatasetImmutabilityGuardMiddleware` blocking embedding model mutation on parsed datasets with chunks.
-- **Inputs & Outputs**: Input: dataset update requests; Output: HTTP 400 Bad Request on embedding mutation.
-- **Target Files**: `backend/guard/dataset_immutability_guard.go`, `dataset_immutability_guard_test.go`
-- **Verification**: Tests assert mutating embedding model on datasets with chunks returns HTTP 400.
-
-#### Phase 4: Usage Metering & Reconciliation Pipeline (Usage Metering & Reconciliation)
-
-##### TASK-4.1: Gateway Spend Log Staging & Deduplication
-- **Description**: Collect atomic spend logs into `platform_gateway_spend_log` using `INSERT IGNORE` on `spend_id`.
-- **Inputs & Outputs**: Input: LiteLLM spend logs; Output: deduplicated database records.
-- **Target Files**: `backend/entity/spend_log.go`, `migration/003_spend_log_schema.go`, `metering/collector.go`
-- **Verification**: Tests assert duplicate spend log inputs produce zero duplicate rows.
-
-##### TASK-4.2: 48-Hour Daily Usage Pipeline with Replacement Upsert
-- **Description**: Aggregate daily usage into `platform_tenant_usage_daily` over a day-aligned 48h rolling window using replacement upsert.
-- **Inputs & Outputs**: Input: staged spend logs; Output: idempotent daily usage records.
-- **Target Files**: `backend/entity/usage.go`, `migration/004_usage_schema.go`, `metering/pipeline.go`
-- **Verification**: Running pipeline multiple times over the same window produces identical usage totals.
-
-##### TASK-4.3: Self-Owned Model Zero Billing Physical Isolation Audit
-- **Description**: Verify that tenant self-owned models bypass the gateway completely and generate zero platform billing.
-- **Inputs & Outputs**: Input: self-owned model calls; Output: 0 gateway spend logs and $0.00 platform spend.
-- **Target Files**: `backend/metering/isolation_audit.go`, `isolation_audit_test.go`
-- **Verification**: Audit tests verify zero gateway spend logs generated during direct provider calls.
-
-##### TASK-4.4: Admin Usage Statistics & Streaming CSV Export API
-- **Description**: Implement paginated daily usage query and streaming CSV export endpoints for administrators.
-- **Inputs & Outputs**: Input: admin query parameters; Output: paginated JSON usage summaries and CSV file streams.
-- **Target Files**: `backend/admin/usage_handler.go`, `usage_handler_test.go`
-- **Verification**: Unit tests verify JSON response formatting and streaming CSV row serialization.
-
-#### Phase 5: End-to-End Integration & Verification QA (E2E Integration & Verification QA)
-
-##### TASK-5.1: Isolated Test Cluster Orchestration & Network Isolation
-- **Description**: Orchestrate PostgreSQL and LiteLLM test containers with healthcheck probes and isolated network bridges.
-- **Inputs & Outputs**: Input: test compose configuration; Output: running test cluster on `127.0.0.1:4000`.
-- **Target Files**: `tests/e2e/docker-compose.test.yml`, `tests/e2e/setup_env.sh`
-- **Verification**: Run `setup_env.sh` and verify containers reach healthy state on `127.0.0.1:4000`.
-
-##### TASK-5.2: Native Driver End-to-End Integration Tests
-- **Description**: Implement end-to-end integration tests validating Chat, Embedding, defaults, and spend log rollups against the live cluster.
-- **Inputs & Outputs**: Input: live gateway and database; Output: verified end-to-end integration test suite.
-- **Target Files**: `tests/e2e/e2e_core_test.go`
-- **Verification**: `go test -v -tags "ee" ./extensions/model-platform/tests/e2e -run "TestE2E"` passes 100%.
-
-##### TASK-5.3: Security, Stability & Guard End-to-End Test Suite
-- **Description**: Implement E2E security tests verifying 403 provider deletion guard, 400 dataset immutability, and 45s outage recovery.
-- **Inputs & Outputs**: Input: security attack simulations; Output: verified protection and resilience.
-- **Target Files**: `tests/e2e/e2e_security_stability_test.go`
-- **Verification**: `go test -v -tags "ee" ./extensions/model-platform/tests/e2e -run "TestSecurityStability"` passes 100%.
-
-##### TASK-5.4: Non-Invasive Audit & Automated CI Gates
-- **Description**: Implement `audit-non-invasive.sh` and GitHub Actions CI workflow running all gates and tests automatically.
-- **Inputs & Outputs**: Input: CI environment; Output: automated gates and PR verification workflow.
-- **Target Files**: `scripts/audit-non-invasive.sh`, `.github/workflows/ci.yml`
-- **Verification**: `bash extensions/model-platform/scripts/audit-non-invasive.sh` passes all 3 gates with Exit Code 0.
-
----
-
-## 8. End-to-End Integration & Verification Guide (Phase 0~5 Core MVP)
-
-### 8.1 Target & Scope Definition (Core Capability MVP)
-The initial delivery target (tracked within the test suite harness as `tests/e2e`) establishes a minimal, robust, end-to-end verifiable multi-tenant model hosting capability:
-- **Models**: Chat (`gpt-4o-mini`) and Embedding (`text-embedding-3-small`) resolved via native `OpenAI-API-Compatible` driver.
-- **Boundary Proofs**: Zero changes to `upstream/ragflow`, enterprise UI flag disabled, 19 packages stubbed.
-- **Lifecycle & Metering**: Automated tenant provisioning, two-tier self-healing, atomic defaults, dataset immutability guard, spend log deduplication, 48h idempotent rollup, and zero-spend self-owned model bypass.
-
-### 8.2 End-to-End Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Platform Admin
-    actor User as Tenant User
-    participant Web as Web Overlay
-    participant Core as RAGFlow Core
-    participant DB as RAGFlow DB
-    participant Reconciler as Model Reconciler
-    participant Gateway as LiteLLM Proxy (127.0.0.1:4000)
-    participant Provider as External Provider
-
-    Note over Admin,Provider: Step 1: Gateway Initialization & Model Configuration
-    Admin->>Gateway: Deploy proxy with ${PLATFORM_UPSTREAM_OPENAI_KEY}
-    Gateway-->>Admin: Pinned healthcheck liveliness OK (HTTP 200)
-
-    Note over User,Provider: Step 2: Tenant Registration & Event Decoupling
-    User->>Core: Register new tenant
-    Core->>DB: Begin transaction & insert user_tenant
-    DB-->>Core: Transaction committed successfully
-    Core->>Reconciler: Dispatch TenantCreatedEvent via GORM AfterCommit
-    Reconciler->>Gateway: POST /key/generate with Master Key
-    Gateway-->>Reconciler: Issue scoped virtual key (sk-tenant-xxx)
-    Reconciler->>DB: Persist managed records (OpenAI-API-Compatible@platform)
-    Reconciler->>DB: Atomic SQL default init & set status='ready'
-
-    Note over User,Provider: Step 3: Native Driver Inference
-    User->>Core: Chat completion request
-    Core->>Gateway: Forward inference via 127.0.0.1:4000 with sk-tenant-xxx
-    Gateway->>Provider: Proxy to upstream provider with root secret
-    Provider-->>Gateway: Stream tokens
-    Gateway-->>Core: Return completion
-    Core-->>User: Present response
-
-    Note over Admin,Provider: Step 4: Metering & Idempotent Reconciliation
-    Gateway->>Gateway: Write atomic Spend Log to PostgreSQL
-    Reconciler->>Gateway: GET /global/spend/logs
-    Gateway-->>Reconciler: Return spend records
-    Reconciler->>DB: INSERT IGNORE into platform_gateway_spend_log
-    Reconciler->>DB: 48h calendar-aligned replacement upsert into usage_daily
-    Admin->>Core: GET /api/v1/admin/model-platform/usage/export
-    Core-->>Admin: Stream reconciled billing CSV
-```
-
-### 8.3 Failure Modes & Fault Tolerance Matrix
-
-| Failure Scenario | Impact Scope | Defense & Recovery Strategy |
-|---|---|---|
-| Gateway down during tenant registration | Delayed model provisioning | Tenant registration commits locally without blocking. Event enqueues for retry; Tier 1 retries 5 times, then transitions to `degraded`. Tier 2 background poller auto-heals tenant to `ready` once gateway returns. |
-| Database failure after virtual key issued | Orphaned gateway credentials | Compensating rollback revokes the issued virtual key by its hash immediately, preventing orphaned tokens. |
-| Tenant account deleted or decommissioned | Residual token usage | Decommissioning listener triggers `TenantDecommissioner`, which revokes every key of the tenant's gateway team physically. |
-| Tenant key leaked | Unauthorized spend until the key is replaced | An administrator calls `POST /api/v1/admin/model-platform/tenants/:tenant_id/rotate-key` (or the batch script). The tenant switches to a new key at the database commit, without taking it out of service, and the old key is revoked, so requests still running on the old key fail. See section 3.6. |
-| Upstream provider 5xx or network timeout | Active inference fails | LiteLLM performs transparent retry or returns standard error codes. RAGFlow driver handles errors gracefully; gateway charges only for actual tokens consumed. |
-| Administrator deprecates embedding model | Existing KB vector search | 3-stage lifecycle keeps model in `Deprecated/Read-Only` status. Gateway whitelist retains model, ensuring vector search continues uninterrupted while hiding it from new KBs. |
-| Network delay causes 48h rollup replay | Billing aggregates | Raw staging table uses `spend_id` unique key (`INSERT IGNORE`). Rollup performs replacement upsert (`call_count = VALUES(call_count)`), guaranteeing mathematical idempotence. |
-| Tenant attempts to delete managed provider | Service corruption | `ManagedProviderGuardMiddleware` intercepts request and returns HTTP 403 Forbidden. |
-
-### 8.4 Step-by-Step Execution & Verification Commands
-
-#### Step 1: Workspace Overlay Sync & Clean Build
-```bash
-# 1. Prepare clean build target
-rm -rf build/ragflow && mkdir -p build/ragflow
-git -C upstream/ragflow archive HEAD | tar -x -C build/ragflow
-
-# 2. Apply non-invasive overlay and baseline stubs
-bash extensions/model-platform/scripts/apply-overlay.sh
-
-# 3. Verify upstream submodule remains 100% clean
-git -C upstream/ragflow status --porcelain
-
-# 4. Compile Go backend with EE build tags
-cd build/ragflow
-RAGFLOW_GO_TAGS=ee bash build.sh --go
-
-# 5. Bundle frontend under disabled enterprise flag
-cd web
-VITE_RAGFLOW_ENTERPRISE=false npm run build
-cd ../../..
-```
-
-#### Step 2: Start Test Cluster & Check Isolation
-```bash
-# Start PostgreSQL and LiteLLM test cluster (loopback bound to 127.0.0.1:4000)
-docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml up -d
-
-# Verify gateway liveliness probe
-curl -s -f http://127.0.0.1:4000/health/liveliness || exit 1
-```
-
-#### Step 3: Issue Scoped Tenant Virtual Key
-```bash
-TENANT_KEY_JSON=$(curl -s -X POST "http://127.0.0.1:4000/key/generate" \
-  -H "Authorization: Bearer sk-master-e2e-platform-test-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "models": ["gpt-4o-mini", "text-embedding-3-small"],
-    "team_id": "tenant-e2e-core",
-    "user_id": "user-e2e-core",
-    "key_alias": "tenant_tenant-e2e-core_1a2b3c4d",
-    "metadata": {"tenant_id": "tenant-e2e-core"}
-  }')
-
-echo "Generated Key Response: $TENANT_KEY_JSON"
-TENANT_VIRTUAL_KEY=$(echo "$TENANT_KEY_JSON" | jq -r .key)
-echo "Tenant Virtual Key: $TENANT_VIRTUAL_KEY"
-```
-
-#### Step 4: Security, Permission & Guard Verification
-```bash
-# 1. Verify managed provider anti-deletion guard (Expect 403 Forbidden)
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-  "http://localhost:8080/v1/user/setting/model/provider?name=OpenAI-API-Compatible" \
-  -H "Authorization: Bearer <tenant_user_token>")
-echo "Managed Provider Anti-Deletion Guard (Expect 403): $STATUS_CODE"
-
-# 2. Verify management endpoint blocking with tenant key (Expect 401 or 403)
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "http://127.0.0.1:4000/key/generate" \
-  -H "Authorization: Bearer $TENANT_VIRTUAL_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"models": ["gpt-4o"]}')
-echo "Admin Endpoint Block Check (Expect 401 or 403): $STATUS_CODE"
-
-# 3. Verify unauthorized model blocking (Expect 403 Forbidden)
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "http://127.0.0.1:4000/v1/chat/completions" \
-  -H "Authorization: Bearer $TENANT_VIRTUAL_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "unauthorized-model", "messages": [{"role":"user","content":"hi"}]}')
-echo "Unauthorized Model Block Check (Expect 403): $STATUS_CODE"
-
-# 4. Verify dataset vector space immutability guard (Expect 400 Bad Request)
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-  "http://localhost:8080/v1/dataset/ds-e2e-test" \
-  -H "Authorization: Bearer <tenant_user_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"embedding_model": "modified-model"}')
-echo "Dataset Immutability Guard (Expect 400): $STATUS_CODE"
-```
-
-#### Step 5: Spend Log Staging & Idempotent Rollup
-```bash
-# 1. Query LiteLLM authoritative spend logs
-curl -s -X GET "http://127.0.0.1:4000/global/spend/logs" \
-  -H "Authorization: Bearer sk-master-e2e-platform-test-key" | jq .
-
-# 2. Query aggregated daily usage via Admin API
-curl -s -X GET "http://localhost:8080/api/v1/admin/model-platform/usage?tenant_id=tenant-e2e-core" \
-  -H "Authorization: Bearer <admin_token>" | jq .
-```
-
-#### Step 6: Native Driver Go E2E Integration Test Suite
-```bash
-# Run core E2E integration suite (Native driver, live cluster, defaults, lifecycle, rollup, zero-spend audit)
-go test -v -tags "ee" ./extensions/model-platform/tests/e2e -run "TestE2E"
-
-# Run security, resilience, and middleware guard test suite
-go test -v -tags "ee" ./extensions/model-platform/tests/e2e -run "TestSecurityStability"
-```
-
-#### Step 7: Automated Non-Invasive Audit & CI Gates
-```bash
-# Execute automated non-invasive compliance audit
+## 7. Fault Tolerance Matrix & Verification Suite
+
+### 7.1 Failure Modes & Recovery Matrix
+
+| Failure Scenario | Impact Scope | Defense & Recovery Mechanism |
+| :--- | :--- | :--- |
+| Gateway down during tenant creation | Provisioning delayed | `OnTenantCreateHook` commits local SQL only; Tier-1 retries, then Tier-2 `ReconcilePoller` heals `pending`/`degraded` tenants to `ready` on recovery while `retry_count < 50`. Once a tenant reaches the 50-retry limit, it transitions to `failed`, is no longer selected by `ReconcilePoller`, and requires manual recovery. |
+| DB failure after virtual key generated | Orphaned gateway key | Compensating rollback attempts a single `DeleteKeysByHash` for the new key; if revocation also fails, leftover team keys remain until the gateway recovers and a subsequent reconcile runs (`issueFreshKey` sweeps leftover team keys while the tenant is still `pending`/`degraded` under the 50-retry limit; tenants that reach `failed` require manual cleanup/escalation). |
+| Worker crash during provisioning or rollout | Stuck `provisioning` / `running` item | Lease timeout reclaims stale `provisioning` and publish `running` items after `2m`. |
+| Tenant deleted upstream | Residual active key | `scanOrphanedTenants` (`1h`) + `TenantDecommissioner` revoke all team keys and mark `deleted`. |
+| Tenant virtual key leaked | Unauthorized spend until rotated | `POST /tenants/:tenant_id/rotate-key` (or `emergency-rotate-keys.sh`) swaps keys atomically with zero downtime; `sweepDirtyKeys` (`1m`) retries old-key revocation, which stays pending while the gateway is unreachable. |
+| Embedding model retired with active KBs | Existing KB vector search | 3-stage lifecycle preserves read-only gateway whitelist until KB count drops to 0; `DatasetImmutabilityGuard` blocks new/empty bindings. |
+| Prolonged API or gateway outage | Metering gap across days | Uncapped DB-watermark replay + dynamic multi-day catch-up with replacement upserts (zero double-counting), subject to Section 6.2 bounds: logs expired under gateway retention (`maximum_spend_logs_retention_period`) cannot be replayed, and pending catch-up state is in-memory only (if the API process restarts before catch-up succeeds, operators must confirm raw log completeness in `platform_gateway_spend_log` before widening `METERING_LOOKBACK_HOURS` or running a manual rollup). |
+| Tenant attempts to modify/delete `platform` | Tampering / metering corruption | UI hides mutation controls (`ProviderInstanceCardWithPrivilege`); backend returns HTTP `403` (`ManagedProviderGuardMiddleware`). |
+
+### 7.2 End-to-End Verification & CI Commands
+
+```sh
+# 1. Non-invasive compliance audit (3 CI gates: clean submodule, enterprise flag, 19-package stubs)
 bash extensions/model-platform/scripts/audit-non-invasive.sh
+
+# 2. Gateway configuration security validation
+bash extensions/model-platform/gateway/validate-gateway-config.sh
+
+# 3. Assemble isolated build workspace and compile Go (ee) + Web (enterprise flag off)
+bash extensions/model-platform/scripts/apply-overlay.sh
+(cd build/ragflow && RAGFLOW_GO_TAGS=ee bash build.sh --go)
+(cd build/ragflow/web && npm ci && VITE_RAGFLOW_ENTERPRISE=false npm run build)
+
+# 4. Run Go unit tests across all model-platform backend packages
+(cd build/ragflow && go test -tags "cgo,static,sonic,ee" ./extensions/model-platform/backend/...)
+
+# 5. Run live Dockerized E2E suites (core, security/stability, admin integration, dynamic catalog, key rotation)
+docker compose -f extensions/model-platform/tests/e2e/docker-compose.test.yml up -d --wait
+(cd build/ragflow && REQUIRE_LIVE_GATEWAY=true go test -count=1 -v -tags "cgo,static,sonic,ee" ./extensions/model-platform/tests/e2e/...)
 ```

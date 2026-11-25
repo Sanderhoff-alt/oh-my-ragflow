@@ -31,7 +31,7 @@
 | 计费与权限 | [`internal/service/billing/stub.go`](../upstream/ragflow/internal/service/billing/stub.go)、[`internal/permission/stub.go`](../upstream/ragflow/internal/permission/stub.go) | 计费服务和权限策略接缝 |
 | 其他包 | [`cmd`](../upstream/ragflow/cmd)、[`internal`](../upstream/ragflow/internal) | 其他带标签文件和定义；本表并不穷尽全部入口 |
 
-例如，租户 DAO 在事务中、插入租户记录之前调用创建钩子。这个钩子本身不能证明具备安全的事务提交后生命周期，也不能据此认定可安全执行远程副作用。模型平台的具体待验证问题见其[架构文档](../extensions/model-platform/architecture.zh-CN.md)。
+例如，租户 DAO 在事务中、插入租户记录之前调用创建钩子。这个钩子本身不能证明具备安全的事务提交后生命周期，也不能据此认定可安全执行远程副作用；`model-platform` 如何通过本地暂存与提交后可见性预检解耦异步协调，见其[架构设计](../extensions/model-platform/architecture.zh-CN.md)与[工程设计参考](../extensions/model-platform/implementation-plan.zh-CN.md)。
 
 上游构建脚本还会按需加载 `build_ee.sh`，并提供受条件保护的企业版原生集成测试钩子。它们是构建集成接缝，不能证明存在任意所需的运行时钩子；使用前须核对具体行为。
 
