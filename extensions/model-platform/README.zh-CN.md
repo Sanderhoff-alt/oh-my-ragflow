@@ -53,6 +53,6 @@
 | **平台运维与超级管理员** | [管理员与运维指南](docs/admin-guide.zh-CN.md) | [Admin & Operator Guide](docs/admin-guide.md) | 网络隔离拓扑、Docker 生产部署、环境变量参考、Admin 控制台界面操作手册、批量密钥轮换与故障恢复手册 |
 | **租户 Owner、管理员与普通用户** | [租户与用户指南](docs/user-guide.zh-CN.md) | [Tenant & User Guide](docs/user-guide.md) | 租户角色权限（`owner` / `admin` / `normal`）、平台模型与 BYOK 对比、Web 界面操作指南、粘性默认模型、知识库向量不可变规则与 FAQ |
 | **集成开发与自动化脚本作者** | [API 参考文档](docs/api-reference.zh-CN.md) | [API Reference](docs/api-reference.md) | 全部 13 个 Admin 新增接口的完整字段契约，以及 App API 侧 3 个守卫中间件的行为规则与错误码 |
-| **架构师与项目贡献者** | [架构设计](architecture.zh-CN.md) | [Architecture Design](architecture.md) | 系统拓扑边界、核心不变式与架构决策记录（ADR 1–6） |
-| **项目贡献者** | [工程实施计划](implementation-plan.zh-CN.md) | [Implementation Plan](implementation-plan.md) | Phase 0–5 工程路线图、数据库迁移与端到端验证方案 |
+| **架构师与项目贡献者** | [架构设计](architecture.zh-CN.md) | [Architecture Design](architecture.md) | 系统拓扑边界、核心不变式与架构决策记录（ADR 1–8） |
+| **项目贡献者** | [工程设计参考](implementation-plan.zh-CN.md) | [Engineering Design Reference](implementation-plan.md) | 子系统内部机制、覆盖接缝、数据库表结构、容错矩阵与端到端验证命令 |
 | **仓库贡献者** | [RAGFlow 扩展点与集成规则](../../docs/extension-points.zh-CN.md) | [RAGFlow Extension Points](../../docs/extension-points.md) | 非侵入式集成约定与上游扩展接缝 |
