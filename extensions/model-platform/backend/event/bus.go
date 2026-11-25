@@ -232,6 +232,30 @@ func (b *EventBus) Stop() {
 	})
 }
 
+// HasSubscribers reports whether at least one handler is registered for
+// eventType (or the wildcard "*") and the bus has not been stopped.
+func (b *EventBus) HasSubscribers(eventType EventType) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return false
+	}
+	return len(b.subscribers[eventType]) > 0 || len(b.subscribers["*"]) > 0
+}
+
+// Context returns a context that is canceled when the EventBus is stopped.
+func (b *EventBus) Context() context.Context {
+	if b == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	return b.ctx
+}
+
 // PendingCount returns the number of unconsumed events currently in the buffer.
 func (b *EventBus) PendingCount() int {
 	return len(b.ch)

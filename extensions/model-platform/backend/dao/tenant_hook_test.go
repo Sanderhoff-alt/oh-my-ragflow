@@ -319,3 +319,110 @@ func TestOnTenantCreateHook_ConcurrentRegistrations(t *testing.T) {
 		t.Errorf("expected %d events, got %d", concurrentUsers, receivedCount)
 	}
 }
+
+func TestIsUnsharedSQLiteMemoryDSN(t *testing.T) {
+	cases := []struct {
+		dsn  string
+		want bool
+	}{
+		{"", true},
+		{":memory:", true},
+		{" :MEMORY: ", true},
+		{"file::memory:", true},
+		{"file:test?mode=memory", true},
+		{"file:test?mode=memory&cache=private", true},
+		{"file::memory:?cache=shared", false},
+		{"file:test_123?mode=memory&cache=shared", false},
+		{"/tmp/ragflow.db", false},
+	}
+	for _, tc := range cases {
+		if got := isUnsharedSQLiteMemoryDSN(tc.dsn); got != tc.want {
+			t.Errorf("isUnsharedSQLiteMemoryDSN(%q) = %v, want %v", tc.dsn, got, tc.want)
+		}
+	}
+}
+
+func TestOnTenantCreateHook_UnsharedSQLiteMemoryPoolNoRace(t *testing.T) {
+	runScenario := func(t *testing.T, withSubscriber bool) {
+		t.Helper()
+		origBus := event.GetDefaultBus()
+		bus := event.NewEventBus(256)
+		event.SetDefaultBus(bus)
+		ctx, cancel := context.WithCancel(context.Background())
+		bus.Start(ctx)
+		t.Cleanup(func() {
+			cancel()
+			bus.Stop()
+			event.SetDefaultBus(origBus)
+		})
+
+		var received atomic.Int32
+		if withSubscriber {
+			unsub := bus.Subscribe(event.TenantCreated, func(c context.Context, evt event.TenantLifecycleEvent) error {
+				received.Add(1)
+				return nil
+			})
+			defer unsub()
+		}
+
+		// Intentionally match upstream setupTenantDAOTestDB:
+		// plain sqlite.Open(":memory:") with no cache=shared and no SetMaxOpenConns(1).
+		for i := 0; i < 100; i++ {
+			db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+			if err != nil {
+				t.Fatalf("iter %d: failed to open sqlite: %v", i, err)
+			}
+			sqlDB, err := db.DB()
+			if err != nil {
+				t.Fatalf("iter %d: failed to get sql.DB: %v", i, err)
+			}
+
+			if err := db.AutoMigrate(&entity.TenantReconcileRecord{}); err != nil {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: failed to migrate reconcile record: %v", i, err)
+			}
+			if err := db.Exec("CREATE TABLE tenant (id VARCHAR(32) PRIMARY KEY, status VARCHAR(1));").Error; err != nil {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: failed to create tenant table: %v", i, err)
+			}
+
+			tenantID := fmt.Sprintf("tenant-update-%d", i)
+			if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				if err := OnTenantCreateHook(ctx, tx, tenantID); err != nil {
+					return err
+				}
+				return tx.Exec("INSERT INTO tenant (id, status) VALUES (?, '1')", tenantID).Error
+			}); err != nil {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: create transaction failed: %v", i, err)
+			}
+
+			if err := db.WithContext(ctx).Table("tenant").Where("id = ?", tenantID).Update("status", "0").Error; err != nil {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: immediate update failed: %v", i, err)
+			}
+
+			var status string
+			if err := db.WithContext(ctx).Table("tenant").Select("status").Where("id = ?", tenantID).Take(&status).Error; err != nil {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: reload tenant failed: %v", i, err)
+			}
+			if status != "0" {
+				_ = sqlDB.Close()
+				t.Fatalf("iter %d: status = %q, want 0", i, status)
+			}
+			_ = sqlDB.Close()
+		}
+
+		if !withSubscriber && received.Load() != 0 {
+			t.Fatalf("expected 0 events without subscriber, got %d", received.Load())
+		}
+	}
+
+	t.Run("without_subscriber", func(t *testing.T) {
+		runScenario(t, false)
+	})
+	t.Run("with_subscriber", func(t *testing.T) {
+		runScenario(t, true)
+	})
+}
