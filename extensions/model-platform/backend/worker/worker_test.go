@@ -12,6 +12,7 @@ import (
 
 	"ragflow/extensions/model-platform/backend/dao"
 	"ragflow/extensions/model-platform/backend/entity"
+	"ragflow/extensions/model-platform/backend/event"
 	rentity "ragflow/internal/entity"
 
 	"github.com/glebarez/sqlite"
@@ -45,7 +46,7 @@ func setupDB(t *testing.T) *gorm.DB {
 		t.Fatalf("failed to migrate model platform tables: %v", err)
 	}
 	db.Exec("CREATE TABLE tenant (id VARCHAR(32) PRIMARY KEY, status VARCHAR(1));")
-	db.Exec("CREATE TABLE user_tenant (id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32));")
+	db.Exec("CREATE TABLE user_tenant (id VARCHAR(32) PRIMARY KEY, user_id VARCHAR(32), tenant_id VARCHAR(32), role VARCHAR(32), status VARCHAR(1));")
 	return db
 }
 
@@ -120,7 +121,7 @@ func TestStart_TenantCreationReachesGateway(t *testing.T) {
 		t.Fatalf("tenant creation transaction failed: %v", err)
 	}
 
-	// The 30s poller cannot explain a hit this early: only the event path can.
+	// The 15s poller cannot explain a hit this early: only the event path can.
 	deadline := time.Now().Add(3 * time.Second)
 	for generateCalls.Load() == 0 {
 		if time.Now().After(deadline) {
@@ -222,5 +223,128 @@ func TestStart_DecommissionsOrphanedTenant(t *testing.T) {
 	}
 	if got := statusOf("tenant-active"); got != entity.StatusReady {
 		t.Fatalf("active tenant must stay ready, got %s", got)
+	}
+}
+
+func TestStartAdminTier1_GatewayNotConfigured(t *testing.T) {
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_MASTER_KEY", "")
+
+	if _, err := StartAdminTier1(context.Background()); !errors.Is(err, ErrGatewayNotConfigured) {
+		t.Fatalf("expected ErrGatewayNotConfigured, got %v", err)
+	}
+}
+
+func TestStartAdminTier1_TenantCreationImmediateWithoutBackgroundDaemons(t *testing.T) {
+	var generateCalls atomic.Int32
+	var spendLogCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/key/generate":
+			generateCalls.Add(1)
+			_, _ = w.Write([]byte(`{"key":"sk-admin-tenant-key"}`))
+		case "/spend/logs/v2":
+			spendLogCalls.Add(1)
+			_, _ = w.Write([]byte(`[]`))
+		case "/key/delete":
+			deleteCalls.Add(1)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer gw.Close()
+
+	db := setupDB(t)
+	// Seed an orphaned tenant to confirm StartAdminTier1 does NOT start orphan cleanup
+	now := time.Now()
+	if err := db.Create(&entity.TenantReconcileRecord{
+		TenantID:   "tenant-orphan-admin",
+		Status:     entity.StatusReady,
+		MaxRetries: 50,
+		Version:    1,
+		CreatedAt:  now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("failed to seed orphan record: %v", err)
+	}
+
+	configureGateway(t, gw.URL)
+	SetDBProvider(func() *gorm.DB { return db })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workers, err := StartAdminTier1(ctx)
+	if err != nil {
+		t.Fatalf("StartAdminTier1 failed: %v", err)
+	}
+	if !event.GetDefaultBus().HasSubscribers(event.TenantCreated) {
+		workers.Stop()
+		t.Fatal("expected StartAdminTier1 to register TenantCreated subscriber on default bus")
+	}
+
+	// Simulate admin CreateUser -> TenantDAO.Create -> OnTenantCreateHook
+	const tenantID = "tenant-admin-created-1"
+	err = db.Transaction(func(outer *gorm.DB) error {
+		if err := outer.Transaction(func(inner *gorm.DB) error {
+			if err := dao.OnTenantCreateHook(ctx, inner, tenantID); err != nil {
+				return err
+			}
+			return inner.Exec("INSERT INTO tenant (id, status) VALUES (?, '1')", tenantID).Error
+		}); err != nil {
+			return err
+		}
+		return outer.Exec(
+			"INSERT INTO user_tenant (id, user_id, tenant_id, role, status) VALUES (?, ?, ?, 'owner', '1')",
+			"ut-"+tenantID, tenantID, tenantID,
+		).Error
+	})
+	if err != nil {
+		workers.Stop()
+		t.Fatalf("admin tenant creation transaction failed: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var rec entity.TenantReconcileRecord
+		if err := db.Where("tenant_id = ?", tenantID).First(&rec).Error; err == nil && rec.Status == entity.StatusReady {
+			break
+		}
+		if time.Now().After(deadline) {
+			workers.Stop()
+			t.Fatalf("admin-created tenant never reached ready via Admin Tier-1 listener (generateCalls=%d)", generateCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := generateCalls.Load(); got != 1 {
+		workers.Stop()
+		t.Fatalf("expected exactly 1 /key/generate call, got %d", got)
+	}
+
+	// Wait briefly to confirm metering/orphan daemons never fired
+	time.Sleep(100 * time.Millisecond)
+	if got := spendLogCalls.Load(); got != 0 {
+		workers.Stop()
+		t.Fatalf("StartAdminTier1 must not poll spend logs, got %d calls", got)
+	}
+	if got := deleteCalls.Load(); got != 0 {
+		workers.Stop()
+		t.Fatalf("StartAdminTier1 must not run orphan/key sweeps, got %d delete calls", got)
+	}
+	var orphan entity.TenantReconcileRecord
+	if err := db.Where("tenant_id = ?", "tenant-orphan-admin").First(&orphan).Error; err != nil {
+		workers.Stop()
+		t.Fatalf("failed to reload orphan record: %v", err)
+	}
+	if orphan.Status != entity.StatusReady {
+		workers.Stop()
+		t.Fatalf("StartAdminTier1 must not decommission orphan tenants, got status %s", orphan.Status)
+	}
+
+	// Graceful stop unsubscribes cleanly
+	workers.Stop()
+	if event.GetDefaultBus().HasSubscribers(event.TenantCreated) {
+		t.Fatal("expected Stop to unsubscribe TenantCreated handler from default bus")
 	}
 }

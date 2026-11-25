@@ -48,23 +48,32 @@ type Workers struct {
 	wg         sync.WaitGroup
 }
 
-// Start launches the background workers. Without a configured gateway nothing is started,
-// pending tenants stay pending, and ErrGatewayNotConfigured is returned.
-func Start(ctx context.Context) (*Workers, error) {
+func resolveRuntimeDeps() (*gorm.DB, gateway.Client, string, error) {
 	baseURL := os.Getenv("LITELLM_BASE_URL")
 	masterKey := os.Getenv("LITELLM_MASTER_KEY")
 	if baseURL == "" || masterKey == "" {
-		return nil, ErrGatewayNotConfigured
+		return nil, nil, "", ErrGatewayNotConfigured
 	}
 	if dbProvider == nil {
-		return nil, ErrNoDatabase
+		return nil, nil, "", ErrNoDatabase
 	}
 	db := dbProvider()
 	if db == nil {
-		return nil, ErrNoDatabase
+		return nil, nil, "", ErrNoDatabase
+	}
+	client := gateway.NewClient(gateway.GatewayConfig{BaseURL: baseURL, MasterKey: masterKey})
+	return db, client, baseURL, nil
+}
+
+// Start launches the full model platform background workers for the API server process.
+// Without a configured gateway nothing is started, pending tenants stay pending, and
+// ErrGatewayNotConfigured is returned.
+func Start(ctx context.Context) (*Workers, error) {
+	db, client, baseURL, err := resolveRuntimeDeps()
+	if err != nil {
+		return nil, err
 	}
 
-	client := gateway.NewClient(gateway.GatewayConfig{BaseURL: baseURL, MasterKey: masterKey})
 	tenantReconciler := reconciler.NewTenantReconciler(client, baseURL, nil)
 	controller := reconciler.NewSelfHealingController(db, event.GetDefaultBus(), tenantReconciler)
 	controller.Start(ctx)
@@ -84,6 +93,30 @@ func Start(ctx context.Context) (*Workers, error) {
 	go w.sweepDirtyKeys(scanCtx, db, reconciler.NewKeyRotator(client, nil))
 
 	return w, nil
+}
+
+// StartAdminTier1 launches only the lightweight Tier-1 TenantCreated event listener
+// for the Admin server process. It performs a single immediate provisioning attempt
+// when admin routes (such as POST /api/v1/admin/users or --init-superuser) create a
+// tenant, while keeping Tier-2 polling, metering, catalog publishing, orphan cleanup,
+// and dirty key sweeps single-homed in the API server.
+func StartAdminTier1(ctx context.Context) (*Workers, error) {
+	db, client, baseURL, err := resolveRuntimeDeps()
+	if err != nil {
+		return nil, err
+	}
+
+	tenantReconciler := reconciler.NewTenantReconciler(client, baseURL, nil)
+	controller := reconciler.NewSelfHealingController(
+		db,
+		event.GetDefaultBus(),
+		tenantReconciler,
+		reconciler.WithDisablePoller(),
+	)
+	runCtx, cancel := context.WithCancel(ctx)
+	controller.Start(runCtx)
+
+	return &Workers{controller: controller, cancel: cancel}, nil
 }
 
 // sweepDirtyKeys finishes key rotations that were interrupted or could not revoke the superseded keys.
@@ -121,9 +154,17 @@ func (w *Workers) scanOrphanedTenants(ctx context.Context, db *gorm.DB, decommis
 
 // Stop terminates the background workers and waits for in-flight work to finish.
 func (w *Workers) Stop() {
-	w.cancel()
+	if w.cancel != nil {
+		w.cancel()
+	}
 	w.wg.Wait()
-	w.publisher.Stop()
-	w.daemon.Stop()
-	w.controller.Stop()
+	if w.publisher != nil {
+		w.publisher.Stop()
+	}
+	if w.daemon != nil {
+		w.daemon.Stop()
+	}
+	if w.controller != nil {
+		w.controller.Stop()
+	}
 }

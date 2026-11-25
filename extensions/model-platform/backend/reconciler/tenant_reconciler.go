@@ -93,6 +93,7 @@ type TenantReconciler struct {
 	gatewayClient   GatewayKeyClient
 	reconcileDAO    *dao.ReconcileDAO
 	defaultsManager *DefaultsManager
+	backoffPolicy   BackoffPolicy
 	baseURL         string
 	allowedModels   []string
 }
@@ -107,6 +108,7 @@ func NewTenantReconciler(client GatewayKeyClient, baseURL string, allowedModels 
 		gatewayClient:   client,
 		reconcileDAO:    dao.NewReconcileDAO(),
 		defaultsManager: NewDefaultsManager(),
+		backoffPolicy:   DefaultBackoffPolicy,
 		baseURL:         baseURL,
 		allowedModels:   allowedModels,
 	}
@@ -117,6 +119,7 @@ type ReconcileOption func(*reconcileOptions)
 
 type reconcileOptions struct {
 	enforceDeadline bool
+	backoffPolicy   *BackoffPolicy
 }
 
 // WithEnforceDeadline requires that a degraded record's next_retry_at is due (<= now)
@@ -127,6 +130,15 @@ func WithEnforceDeadline() ReconcileOption {
 	}
 }
 
+// WithReconcileBackoffPolicy overrides the BackoffPolicy used when computing next_retry_at
+// for degraded records during this Reconcile call.
+func WithReconcileBackoffPolicy(policy BackoffPolicy) ReconcileOption {
+	return func(o *reconcileOptions) {
+		p := policy
+		o.backoffPolicy = &p
+	}
+}
+
 // Reconcile provisions or updates a tenant's model platform access idempotently.
 // If virtual key generation succeeds but database persistence fails, it executes
 // a compensating rollback to revoke the key and prevent orphaned credentials.
@@ -134,6 +146,11 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 	var optCfg reconcileOptions
 	for _, opt := range opts {
 		opt(&optCfg)
+	}
+
+	policy := r.backoffPolicy
+	if optCfg.backoffPolicy != nil {
+		policy = *optCfg.backoffPolicy
 	}
 
 	if db == nil {
@@ -217,7 +234,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		// Transient failure: mark degraded using bounded recovery context in case ctx timed out
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		nextRetry := time.Now().Add(r.calculateBackoff(rec.RetryCount))
+		nextRetry := time.Now().Add(policy.CalculateBackoff(rec.RetryCount))
 		var markErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			_, markErr = r.reconcileDAO.MarkDegraded(recoveryCtx, silentDB, tenantID, rec.Version, err.Error(), nextRetry)
@@ -237,7 +254,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err := errors.New("gateway returned empty virtual key")
-		nextRetry := time.Now().Add(r.calculateBackoff(rec.RetryCount))
+		nextRetry := time.Now().Add(policy.CalculateBackoff(rec.RetryCount))
 		_, _ = r.reconcileDAO.MarkDegraded(recoveryCtx, silentDB, tenantID, rec.Version, err.Error(), nextRetry)
 		return err
 	}
@@ -383,7 +400,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, db *gorm.DB, tenantID 
 		if delErr != nil {
 			errMsg = fmt.Sprintf("%s; compensating rollback warning: %v", errMsg, delErr)
 		}
-		nextRetry := time.Now().Add(r.calculateBackoff(rec.RetryCount))
+		nextRetry := time.Now().Add(policy.CalculateBackoff(rec.RetryCount))
 		_, _ = r.reconcileDAO.MarkDegraded(rollbackCtx, silentDB, tenantID, rec.Version, errMsg, nextRetry)
 
 		if delErr != nil {
@@ -402,20 +419,6 @@ func isModelPermitted(model string, allowed []string) bool {
 		}
 	}
 	return false
-}
-
-func (r *TenantReconciler) calculateBackoff(retries int) time.Duration {
-	intervals := []time.Duration{
-		1 * time.Second,
-		2 * time.Second,
-		4 * time.Second,
-		8 * time.Second,
-		16 * time.Second,
-	}
-	if retries < len(intervals) {
-		return intervals[retries]
-	}
-	return 30 * time.Second
 }
 
 // issueFreshKey leaves the tenant's gateway team with exactly one key: it revokes any key a failed earlier

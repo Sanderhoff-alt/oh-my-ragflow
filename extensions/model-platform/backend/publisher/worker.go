@@ -317,7 +317,7 @@ func (w *Worker) process(ctx context.Context, db *gorm.DB, item entity.ModelPubl
 		updates["next_retry_at"] = nil
 	} else {
 		updates["status"] = entity.PublishItemPending
-		updates["next_retry_at"] = time.Now().Add(w.policy.CalculateTier2Backoff(retries - 1))
+		updates["next_retry_at"] = time.Now().Add(w.policy.CalculateBackoff(retries - 1))
 	}
 	_ = finish.Updates(updates).Error
 }

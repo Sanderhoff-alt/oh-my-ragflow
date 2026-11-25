@@ -32,8 +32,8 @@ flowchart LR
 1. **仅环回地址监听**：`gateway/docker-compose.yml` 强制将 LiteLLM 绑定到 `127.0.0.1:4000:4000`。严禁暴露 `0.0.0.0:4000` 或将公网流量直接路由至 LiteLLM，`gateway/validate-gateway-config.sh` 会在部署前强制校验该规则。
 2. **根密钥零泄漏**：上游供应商根密钥仅存在于 LiteLLM 容器环境变量中。每个租户仅获得带动态模型白名单约束的虚拟密钥（`sk-tenant-*`），并写入租户名下的托管实例 `OpenAI-API-Compatible` → `platform`。
 3. **日志脱敏与吊销延迟收敛**：`litellm-config.yaml` 默认启用 `redact_user_api_key_info: true`、`drop_params: true`、`set_verbose: false`、`json_logs: true`，并通过 `user_api_key_cache_ttl: 5` 将网关工作进程内存缓存的密钥吊销延迟控制在 5 秒以内。
-4. **后台 Worker 自动托管**：当 RAGFlow API 服务（`ServerTypeAPI`）在配置了 `LITELLM_BASE_URL` 与 `LITELLM_MASTER_KEY` 的环境下启动时，会自动拉起 5 个后台协同任务（`backend/worker/worker.go`）：
-   - **自愈租户协调器（Self-Healing Tenant Reconciler）**：两级重试机制，确保新建或降级租户完成虚拟密钥与默认模型初始化。
+4. **后台 Worker 自动托管**：在配置了 `LITELLM_BASE_URL` 与 `LITELLM_MASTER_KEY` 的环境下，RAGFlow API 服务（`ServerTypeAPI`）自动拉起全部 5 个后台协同任务（`backend/worker/worker.go`），RAGFlow Admin 服务（`ServerTypeAdmin`）仅挂载轻量的 Tier-1 `TenantCreated` 事件监听器，使管理员创建的租户（如 `POST /api/v1/admin/users`）同样获得亚秒级预配且不重复运行周期巡检任务：
+   - **自愈租户协调器（Self-Healing Tenant Reconciler）**：API 与 Admin 服务共同提供单次即时 Tier-1 快路径，延迟重试统一由 API 服务的数据库驱动 Tier-2 Poller（每 `15s` 巡检，`5s → 15s → 30s → 1m → 2m` 封顶退避）收敛。
    - **模型下发 Worker（Publish Rollout Worker）**：在上架、退役、重新启用、设为默认时异步向所有租户收敛。
    - **计量守护进程（Metering Daemon）**：基于水位线的增量账单采集、按日汇总与可选原始日志保留清理。
    - **滞留旧密钥清扫器（`sweepDirtyKeys`）**：每 `1m` 扫描一次超过 `2m` 仍未完成旧密钥吊销的租户并自动重试。
@@ -289,10 +289,10 @@ ADMIN_TOKEN="<superuser-token>" \
 flowchart TD
     Create["新建租户"] --> Hook["数据库事务钩子：写入 platform_tenant_reconcile (status=pending)"]
     Hook --> PreFlight["事务提交后 PreFlightCheck -> EventBus"]
-    PreFlight --> Tier1["一级协调：内存快速指数退避重试"]
+    PreFlight --> Tier1["一级快路径：API 与 Admin 事件单次即时预配"]
     Tier1 -->|"成功"| Ready["status = ready"]
     Tier1 -->|"网关不可达"| Degraded["status = degraded（写入 next_retry_at）"]
-    Degraded --> Tier2["二级协调：后台 Poller 定时自愈巡检"]
+    Degraded --> Tier2["二级协调：API 后台 Poller（每 15s，5s..2m 退避）"]
     Tier2 -->|"网关恢复"| Ready
 ```
 

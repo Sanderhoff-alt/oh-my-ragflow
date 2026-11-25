@@ -105,7 +105,7 @@ Upstream `build.sh` appends `RAGFLOW_GO_TAGS` to `GO_BUILD_TAGS`. Passing `RAGFL
   - `migrateBillingSchemaEE` runs all 6 idempotent migrations (`001`–`005` + `006_backfill_catalog`).
   - `initializeTenantDefaultRoleEE` invokes `mpdao.OnTenantCreateHook`.
   - `init()` registers `mpworker.SetDBProvider(GetDB)`.
-- **Background Workers** (`overlay/ee-baseline/internal/server/stub_ee.go`): `StartServer` starts `mpworker.Start(ctx)` when `serverType == common.ServerTypeAPI` and `LITELLM_BASE_URL` + `LITELLM_MASTER_KEY` are set; `ShutdownServer` drains and stops all workers cleanly.
+- **Background Workers** (`overlay/ee-baseline/internal/server/stub_ee.go`): When `LITELLM_BASE_URL` + `LITELLM_MASTER_KEY` are set, `StartServer` starts `mpworker.Start(ctx)` on `common.ServerTypeAPI` (full worker set) and `mpworker.StartAdminTier1(ctx)` on `common.ServerTypeAdmin` (Tier-1 `TenantCreated` event listener only, keeping periodic loops single-homed in the API server); `ShutdownServer` drains and stops all workers cleanly.
 - **Member Join Hook** (`overlay/ee-baseline/internal/service/stub_ee.go`): `recordTenantPermissionChangeEE` listens for `eventType == "tenant.member.joined"` and runs `DefaultsManager.InitializeMemberFromOwner`.
 
 ### 2.3 Frontend Web Overlay Seams & Enterprise Flag Defense
@@ -178,23 +178,22 @@ The record stays `ready` throughout so `ReconcilePoller` never mistakes an inter
 
 ```mermaid
 flowchart TD
-    CommitEvent["TenantCreatedEvent (Post-Commit)"] --> Tier1Queue["Tier 1: In-Memory Event Worker"]
-    subgraph Tier1 ["Tier 1: Transient Jitter Recovery"]
-        Tier1Queue --> TryReconcile{"Reconcile Gateway & DB"}
+    CommitEvent["TenantCreatedEvent (Post-Commit, API & Admin)"] --> Tier1Queue["Tier 1: Single-Attempt Event Fast Path"]
+    subgraph Tier1 ["Tier 1: Immediate Provisioning (API + Admin)"]
+        Tier1Queue --> TryReconcile{"Reconcile Gateway & DB (1 attempt)"}
         TryReconcile -->|"Success"| SetReady["status = ready"]
-        TryReconcile -->|"Failure (< 5 retries)"| Backoff1["Exponential Backoff (~31s total)"] --> TryReconcile
-        TryReconcile -->|"Exhausted"| SetDegraded["status = degraded"]
+        TryReconcile -->|"Transient Failure"| SetDegraded["status = degraded + next_retry_at"]
     end
-    subgraph Tier2 ["Tier 2: Level-Triggered Poller"]
-        Poller["ReconcilePoller (every 30s)"] --> FindDue["Find pending/degraded due + stale provisioning (>2m)"]
+    subgraph Tier2 ["Tier 2: Level-Triggered Poller (API Server Only)"]
+        Poller["ReconcilePoller (every 15s)"] --> FindDue["Find pending/degraded due + stale provisioning (>2m)"]
         FindDue --> TryHeal{"Gateway Available?"}
         TryHeal -->|"Yes"| SetReady
-        TryHeal -->|"No"| Backoff2["Jittered Backoff (up to 10m, max 50 retries)"]
+        TryHeal -->|"No"| Backoff2["Unified DB Backoff (5s -> 15s -> 30s -> 1m -> 2m cap, max 50 retries)"]
     end
     SetDegraded --> Poller
 ```
 
-- Concurrency across replicas is coordinated by optimistic version locking (`WHERE tenant_id = ? AND version = ?`) and lease reclamation for `provisioning` rows stale for `> 2m`.
+- Concurrency across API replicas and Admin Tier-1 is coordinated by optimistic version locking (`WHERE tenant_id = ? AND version = ?`) and lease reclamation for `provisioning` rows stale for `> 2m`. All retry timing comes from a single DB-driven `BackoffPolicy` keyed by `retry_count`, eliminating split in-memory retry schedulers.
 
 ### 4.3 Reconcile State Machine & Schema (`platform_tenant_reconcile`)
 
@@ -395,7 +394,7 @@ Self-owned BYOK instances connect directly to external URLs, generating zero Lit
 
 | Failure Scenario | Impact Scope | Defense & Recovery Mechanism |
 | :--- | :--- | :--- |
-| Gateway down during tenant creation | Provisioning delayed | `OnTenantCreateHook` commits local SQL only; Tier-1 retries, then Tier-2 `ReconcilePoller` heals `pending`/`degraded` tenants to `ready` on recovery while `retry_count < 50`. Once a tenant reaches the 50-retry limit, it transitions to `failed`, is no longer selected by `ReconcilePoller`, and requires manual recovery. |
+| Gateway down during tenant creation | Provisioning delayed | `OnTenantCreateHook` commits local SQL only; Tier-1 runs a single immediate attempt and hands off to `degraded`, then the API server's Tier-2 `ReconcilePoller` (every 15s, unified `5s → 15s → 30s → 1m → 2m` backoff) heals `pending`/`degraded` tenants to `ready` on recovery while `retry_count < 50`. Once a tenant reaches the 50-retry limit, it transitions to `failed`, is no longer selected by `ReconcilePoller`, and requires manual recovery. |
 | DB failure after virtual key generated | Orphaned gateway key | Compensating rollback attempts a single `DeleteKeysByHash` for the new key; if revocation also fails, leftover team keys remain until the gateway recovers and a subsequent reconcile runs (`issueFreshKey` sweeps leftover team keys while the tenant is still `pending`/`degraded` under the 50-retry limit; tenants that reach `failed` require manual cleanup/escalation). |
 | Worker crash during provisioning or rollout | Stuck `provisioning` / `running` item | Lease timeout reclaims stale `provisioning` and publish `running` items after `2m`. |
 | Tenant deleted upstream | Residual active key | `scanOrphanedTenants` (`1h`) + `TenantDecommissioner` revoke all team keys and mark `deleted`. |

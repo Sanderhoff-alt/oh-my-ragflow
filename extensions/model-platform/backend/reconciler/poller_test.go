@@ -70,7 +70,7 @@ func TestSelfHealing_Tier1ImmediateSuccess(t *testing.T) {
 	}
 }
 
-func TestSelfHealing_Tier1ExhaustionToDegraded(t *testing.T) {
+func TestSelfHealing_Tier1SingleAttemptHandsOffToTier2(t *testing.T) {
 	db := setupTestDB(t)
 	bus := event.NewEventBus(100)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,19 +86,19 @@ func TestSelfHealing_Tier1ExhaustionToDegraded(t *testing.T) {
 
 	ctrl := NewSelfHealingController(
 		db, bus, rec,
-		WithBackoffPolicy(FastTestBackoffPolicy),
-		WithPollerInterval(500*time.Millisecond),
+		WithBackoffPolicy(DefaultBackoffPolicy),
+		WithPollerInterval(10*time.Second),
 	)
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	tenantID := "tenant-tier1-exhaust"
+	tenantID := "tenant-tier1-single-attempt"
 	createTestTenantInDB(db, tenantID)
 
 	// Emit event
 	bus.Publish(event.NewTenantCreatedEvent(tenantID))
 
-	// Wait for Tier 1 exhaustion
+	// Wait for single Tier 1 attempt to fail and hand off
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctrl.Tier1FailureCount() == 1 {
@@ -117,17 +117,21 @@ func TestSelfHealing_Tier1ExhaustionToDegraded(t *testing.T) {
 		t.Fatalf("failed to fetch state: %v", err)
 	}
 	if state.Status != entity.StatusDegraded {
-		t.Errorf("expected status degraded after tier 1 exhaustion, got %s", state.Status)
+		t.Errorf("expected status degraded after tier 1 failure, got %s", state.Status)
 	}
-	if state.RetryCount != len(FastTestBackoffPolicy.Tier1Intervals) {
-		t.Errorf("expected retry_count to be exactly %d after fast retries, got %d", len(FastTestBackoffPolicy.Tier1Intervals), state.RetryCount)
+	if state.RetryCount != 1 {
+		t.Errorf("expected retry_count to be 1 after single Tier-1 attempt, got %d", state.RetryCount)
 	}
 	if state.NextRetryAt == nil {
-		t.Error("expected next_retry_at to be populated for Tier 2 healing")
+		t.Fatal("expected next_retry_at to be populated for Tier 2 healing")
+	}
+	delay := time.Until(*state.NextRetryAt)
+	if delay < 3*time.Second || delay > 7*time.Second {
+		t.Errorf("expected first retry delay around DefaultBackoffPolicy.Intervals[0] (~5s), got %v", delay)
 	}
 }
 
-func TestSelfHealing_45SecondOutageAndTier2SelfHealing(t *testing.T) {
+func TestSelfHealing_OutageAndTier2SelfHealing(t *testing.T) {
 	db := setupTestDB(t)
 	bus := event.NewEventBus(100)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +140,7 @@ func TestSelfHealing_45SecondOutageAndTier2SelfHealing(t *testing.T) {
 	defer bus.Stop()
 
 	mockClient := newMockGatewayClient()
-	// 1. Gateway initially failing (simulating 45s maintenance window)
+	// 1. Gateway initially failing (simulating outage window)
 	mockClient.generateErr = errors.New("gateway unavailable: 502 Bad Gateway")
 
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
@@ -155,7 +159,7 @@ func TestSelfHealing_45SecondOutageAndTier2SelfHealing(t *testing.T) {
 	// Emit event
 	bus.Publish(event.NewTenantCreatedEvent(tenantID))
 
-	// Wait for Tier 1 to exhaust and enter Degraded
+	// Wait for Tier 1 single attempt to fail and enter Degraded
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctrl.Tier1FailureCount() == 1 {
@@ -342,7 +346,7 @@ func TestSelfHealing_MultiReplicaConcurrency(t *testing.T) {
 	}
 }
 
-func TestSelfHealing_Tier1Exhaustion_PreservesActiveProvisioningClaim(t *testing.T) {
+func TestSelfHealing_DisablePoller_RunsTier1Only(t *testing.T) {
 	db := setupTestDB(t)
 	bus := event.NewEventBus(100)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -351,19 +355,95 @@ func TestSelfHealing_Tier1Exhaustion_PreservesActiveProvisioningClaim(t *testing
 	defer bus.Stop()
 
 	mockClient := newMockGatewayClient()
-	mockClient.generateErr = errors.New("gateway unavailable")
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
 
+	// Simulate Admin server: Tier-1 enabled, Tier-2 poller disabled
 	ctrl := NewSelfHealingController(
 		db, bus, rec,
 		WithBackoffPolicy(FastTestBackoffPolicy),
+		WithPollerInterval(20*time.Millisecond),
+		WithDisablePoller(),
 	)
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	tenantID := "tenant-provisioning-preserve"
-	createTestTenantInDB(db, tenantID)
+	// Pre-seed a pending record that did NOT emit an event on this bus:
+	// with poller disabled, it must remain pending and never be polled.
+	unpolledID := "tenant-unpolled-pending"
+	createTestTenantInDB(db, unpolledID)
+	db.Create(&entity.TenantReconcileRecord{
+		TenantID:   unpolledID,
+		Status:     entity.StatusPending,
+		RetryCount: 0,
+		MaxRetries: 50,
+		Version:    1,
+	})
 
+	// Emit event for a freshly created tenant: Tier-1 must provision it immediately.
+	eventID := "tenant-admin-tier1"
+	createTestTenantInDB(db, eventID)
+	bus.Publish(event.NewTenantCreatedEvent(eventID))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctrl.Tier1SuccessCount() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.Tier1SuccessCount() != 1 {
+		t.Fatalf("expected Tier1SuccessCount=1 in Tier-1-only mode, got %d", ctrl.Tier1SuccessCount())
+	}
+
+	// Wait longer than several pollerInterval ticks to prove no background poller ran.
+	time.Sleep(120 * time.Millisecond)
+
+	rdao := dao.NewReconcileDAO()
+	eventState, err := rdao.GetByTenantID(ctx, db, eventID)
+	if err != nil || eventState.Status != entity.StatusReady {
+		t.Fatalf("expected event tenant ready, got state=%+v err=%v", eventState, err)
+	}
+
+	unpolledState, err := rdao.GetByTenantID(ctx, db, unpolledID)
+	if err != nil || unpolledState.Status != entity.StatusPending {
+		t.Fatalf("expected unpolled tenant to stay pending when poller is disabled, got state=%+v err=%v", unpolledState, err)
+	}
+	if ctrl.Tier2HealedCount() != 0 {
+		t.Fatalf("expected Tier2HealedCount=0 when poller is disabled, got %d", ctrl.Tier2HealedCount())
+	}
+}
+
+func TestSelfHealing_AdminTier1AndAPITier2ConcurrentRaceProducesOneKey(t *testing.T) {
+	db := setupTestDB(t)
+	adminBus := event.NewEventBus(100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adminBus.Start(ctx)
+	defer adminBus.Stop()
+
+	mockClient := newMockGatewayClient()
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+
+	// Admin controller: Tier-1 only
+	adminCtrl := NewSelfHealingController(
+		db, adminBus, rec,
+		WithBackoffPolicy(FastTestBackoffPolicy),
+		WithDisablePoller(),
+	)
+	adminCtrl.Start(ctx)
+	defer adminCtrl.Stop()
+
+	// API controller: Tier-2 poller (no local bus event from admin process)
+	apiCtrl := NewSelfHealingController(
+		db, nil, rec,
+		WithBackoffPolicy(FastTestBackoffPolicy),
+		WithPollerInterval(10*time.Second),
+	)
+	apiCtrl.Start(ctx)
+	defer apiCtrl.Stop()
+
+	const tenantID = "tenant-cross-proc-race"
+	createTestTenantInDB(db, tenantID)
 	db.Create(&entity.TenantReconcileRecord{
 		TenantID:   tenantID,
 		Status:     entity.StatusPending,
@@ -372,49 +452,158 @@ func TestSelfHealing_Tier1Exhaustion_PreservesActiveProvisioningClaim(t *testing
 		Version:    1,
 	})
 
-	bus.Publish(event.NewTenantCreatedEvent(tenantID))
-
-	// Simulate concurrent worker transitioning to StatusProvisioning before Tier 1 finishes
-	time.Sleep(10 * time.Millisecond)
-	_ = db.Model(&entity.TenantReconcileRecord{}).
-		Where("tenant_id = ?", tenantID).
-		Update("status", entity.StatusProvisioning).Error
-
-	// Wait for Tier 1 to exhaust
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if ctrl.Tier1FailureCount() == 1 {
-			break
+	// Barrier before gorm:begin_transaction so both Admin Tier-1 and API Tier-2
+	// have already read the exact same claimable pending version (v=1) without
+	// holding the single SQLite pool connection, and then race on the claim UPDATE.
+	const callbackName = "test:sync_admin_api_claim"
+	var arrived atomic.Int32
+	bothArrived := make(chan struct{})
+	release := make(chan struct{})
+	var closeArrivedOnce sync.Once
+	var closeReleaseOnce sync.Once
+	releaseAll := func() { closeReleaseOnce.Do(func() { close(release) }) }
+	if err := db.Callback().Update().Before("gorm:begin_transaction").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil {
+			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		table := tx.Statement.Table
+		if table == "" && tx.Statement.Schema != nil {
+			table = tx.Statement.Schema.Table
+		}
+		if table != "platform_tenant_reconcile" {
+			return
+		}
+		n := arrived.Add(1)
+		if n <= 2 {
+			if n == 2 {
+				closeArrivedOnce.Do(func() { close(bothArrived) })
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+	}); err != nil {
+		t.Fatalf("failed to register claim barrier callback: %v", err)
+	}
+	defer func() {
+		releaseAll()
+		adminCtrl.Stop()
+		apiCtrl.Stop()
+		_ = db.Callback().Update().Remove(callbackName)
+	}()
+
+	adminBus.Publish(event.NewTenantCreatedEvent(tenantID))
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		apiCtrl.PollAndHeal(ctx)
+	}()
+
+	select {
+	case <-bothArrived:
+		releaseAll()
+	case <-time.After(3 * time.Second):
+		releaseAll()
+		pollWG.Wait()
+		t.Fatalf("timed out waiting for both Admin Tier-1 and API Tier-2 to reach the claim barrier (arrived=%d)", arrived.Load())
+	}
+	pollWG.Wait()
+	// Drain the Admin Tier-1 handler goroutine so both callers have fully completed before asserting.
+	adminCtrl.Stop()
+
+	rdao := dao.NewReconcileDAO()
+	state, err := rdao.GetByTenantID(ctx, db, tenantID)
+	if err != nil {
+		t.Fatalf("failed to fetch tenant state: %v", err)
+	}
+	if state.Status != entity.StatusReady {
+		t.Fatalf("expected tenant ready, got %s", state.Status)
 	}
 
+	// Optimistic locking ensures exactly one caller won the claim and issued one key.
+	if got := atomic.LoadInt32(&mockClient.keyCounter); got != 1 {
+		t.Fatalf("expected exactly 1 gateway key issued across competing Admin Tier-1 and API Tier-2 claims, got %d", got)
+	}
+	if totalSuccess := adminCtrl.Tier1SuccessCount() + apiCtrl.Tier2HealedCount(); totalSuccess < 1 {
+		t.Fatalf("expected at least 1 controller to record completion, got admin=%d api=%d", adminCtrl.Tier1SuccessCount(), apiCtrl.Tier2HealedCount())
+	}
+}
+
+func TestSelfHealing_Tier1RespectsFutureDegradedDeadline(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	mockClient := newMockGatewayClient()
+	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
+
+	ctrl := NewSelfHealingController(
+		db, nil, rec,
+		WithBackoffPolicy(DefaultBackoffPolicy),
+		WithDisablePoller(),
+	)
+
+	tenantID := "tenant-tier1-future-deadline"
+	createTestTenantInDB(db, tenantID)
+
+	future := time.Now().Add(5 * time.Minute)
+	// Simulate API Tier-2 already having attempted and backed off the tenant before a delayed Admin event runs.
+	db.Create(&entity.TenantReconcileRecord{
+		TenantID:    tenantID,
+		Status:      entity.StatusDegraded,
+		RetryCount:  1,
+		MaxRetries:  50,
+		NextRetryAt: &future,
+		Version:     2,
+	})
+
+	ctrl.handleTier1Event(ctx, tenantID)
+
+	if calls := atomic.LoadInt32(&mockClient.keyCounter); calls != 0 {
+		t.Fatalf("expected delayed Tier-1 event to respect future next_retry_at (0 gateway calls), got %d", calls)
+	}
 	rdao := dao.NewReconcileDAO()
 	state, err := rdao.GetByTenantID(ctx, db, tenantID)
 	if err != nil {
 		t.Fatalf("failed to fetch state: %v", err)
 	}
-	if state.Status != entity.StatusProvisioning {
-		t.Errorf("expected status to remain provisioning, got %s", state.Status)
+	if state.Status != entity.StatusDegraded || state.Version != 2 {
+		t.Fatalf("expected degraded v2 untouched, got status=%s version=%d", state.Status, state.Version)
 	}
 }
 
-func TestBackoffPolicy_ProductionTier2Schedule(t *testing.T) {
-	if len(DefaultBackoffPolicy.Tier2Intervals) == 0 {
-		t.Fatal("expected non-empty Tier2Intervals")
+func TestBackoffPolicy_ProductionScheduleAndCap(t *testing.T) {
+	want := []time.Duration{
+		5 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+		1 * time.Minute,
+		2 * time.Minute,
 	}
-	firstInterval := DefaultBackoffPolicy.Tier2Intervals[0]
-	if firstInterval != 15*time.Second {
-		t.Errorf("expected first Tier 2 interval to be 15s to meet 45s recovery target, got %v", firstInterval)
+	if len(DefaultBackoffPolicy.Intervals) != len(want) {
+		t.Fatalf("expected %d intervals, got %d", len(want), len(DefaultBackoffPolicy.Intervals))
 	}
-}
+	for i, w := range want {
+		if DefaultBackoffPolicy.Intervals[i] != w {
+			t.Errorf("interval[%d]: expected %v, got %v", i, w, DefaultBackoffPolicy.Intervals[i])
+		}
+	}
 
-func TestBackoffPolicy_Tier2CapAfterJitter(t *testing.T) {
-	for attempt := 4; attempt < 10; attempt++ {
+	// Verify jitter stays within [base, min(base + base/10, 2m)] per slot, with the final slot capped at 2m.
+	for attempt := 0; attempt < 10; attempt++ {
+		expectedBase := want[len(want)-1]
+		if attempt < len(want) {
+			expectedBase = want[attempt]
+		}
+		maxDelay := expectedBase + expectedBase/10
+		if maxDelay > 2*time.Minute {
+			maxDelay = 2 * time.Minute
+		}
 		for i := 0; i < 50; i++ {
-			delay := DefaultBackoffPolicy.CalculateTier2Backoff(attempt)
-			if delay > 10*time.Minute {
-				t.Fatalf("expected delay <= 10m, got %v for attempt %d", delay, attempt)
+			delay := DefaultBackoffPolicy.CalculateBackoff(attempt)
+			if delay < expectedBase || delay > maxDelay {
+				t.Fatalf("attempt %d: expected delay in [%v, %v], got %v", attempt, expectedBase, maxDelay, delay)
 			}
 		}
 	}
@@ -548,7 +737,7 @@ func TestReconcile_WithEnforceDeadline_RejectsRescheduledFutureRecord(t *testing
 	}
 }
 
-func TestReconcile_WithoutEnforceDeadline_AllowsTier1Retries(t *testing.T) {
+func TestReconcile_WithoutEnforceDeadline_AllowsImmediateReconcile(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -569,7 +758,7 @@ func TestReconcile_WithoutEnforceDeadline_AllowsTier1Retries(t *testing.T) {
 		Version:     1,
 	})
 
-	// Default Reconcile (without WithEnforceDeadline) is used by Tier-1 and must succeed
+	// Default Reconcile (without WithEnforceDeadline) bypasses next_retry_at and must succeed
 	err := rec.Reconcile(ctx, db, tenantID)
 	if err != nil {
 		t.Fatalf("expected nil from Reconcile, got %v", err)
@@ -621,7 +810,7 @@ func TestSelfHealing_Tier1NoOpStatusProvisioning_DoesNotIncrementSuccessCount(t 
 	}
 }
 
-func TestPollAndHeal_CalculatesTier2ScheduleRelativeTier2Attempt(t *testing.T) {
+func TestPollAndHeal_UnifiedBackoffAdvancesByDBRetryCount(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -629,92 +818,16 @@ func TestPollAndHeal_CalculatesTier2ScheduleRelativeTier2Attempt(t *testing.T) {
 	mockClient.generateErr = errors.New("gateway unavailable")
 	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
 
-	policy := BackoffPolicy{
-		Tier1Intervals: []time.Duration{10 * time.Millisecond},
-		Tier2Intervals: []time.Duration{
-			15 * time.Second,
-			1 * time.Minute,
-			2 * time.Minute,
-			5 * time.Minute,
-			10 * time.Minute,
-		},
-	}
-
 	ctrl := NewSelfHealingController(
 		db, nil, rec,
-		WithBackoffPolicy(policy),
+		WithBackoffPolicy(DefaultBackoffPolicy),
 		WithPollerInterval(30*time.Millisecond),
 	)
 
-	tenantID := "tenant-tier2-schedule-offset"
+	tenantID := "tenant-unified-backoff"
 	createTestTenantInDB(db, tenantID)
 
-	past := time.Now().Add(-1 * time.Minute)
-	// Seed tenant having completed Tier 1 (retry_count = 1 = len(Tier1Intervals))
-	db.Create(&entity.TenantReconcileRecord{
-		TenantID:    tenantID,
-		Status:      entity.StatusDegraded,
-		RetryCount:  1,
-		MaxRetries:  50,
-		NextRetryAt: &past,
-		Version:     1,
-	})
-
-	ctrl.PollAndHeal(ctx)
-
-	rdao := dao.NewReconcileDAO()
-	state, err := rdao.GetByTenantID(ctx, db, tenantID)
-	if err != nil {
-		t.Fatalf("failed to fetch state: %v", err)
-	}
-	if state.Status != entity.StatusDegraded {
-		t.Fatalf("expected status degraded, got %s", state.Status)
-	}
-	// retry_count is now 2. maxTier1Retries = 1.
-	// tier2Attempt = 2 - 1 = 1.
-	// Expected delay should be roughly around Tier2Intervals[1] (1 minute, plus <= 10% jitter),
-	// and NOT Tier2Intervals[4] (10 minutes).
-	if state.NextRetryAt == nil {
-		t.Fatal("expected next_retry_at to be set")
-	}
-	delay := time.Until(*state.NextRetryAt)
-	if delay > 2*time.Minute {
-		t.Fatalf("expected delay to use Tier2Intervals[1] (~1m), but got %v", delay)
-	}
-	if delay < 40*time.Second {
-		t.Fatalf("expected delay >= 40s (around 1m), got %v", delay)
-	}
-}
-
-func TestPollAndHeal_PendingRecordDirectToTier2_AdvancesSchedule(t *testing.T) {
-	db := setupTestDB(t)
-	ctx := context.Background()
-
-	mockClient := newMockGatewayClient()
-	mockClient.generateErr = errors.New("gateway unavailable")
-	rec := NewTenantReconciler(mockClient, "http://127.0.0.1:4000", nil)
-
-	policy := BackoffPolicy{
-		Tier1Intervals: []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond, 160 * time.Millisecond},
-		Tier2Intervals: []time.Duration{
-			15 * time.Second,
-			1 * time.Minute,
-			2 * time.Minute,
-			5 * time.Minute,
-			10 * time.Minute,
-		},
-	}
-
-	ctrl := NewSelfHealingController(
-		db, nil, rec,
-		WithBackoffPolicy(policy),
-		WithPollerInterval(30*time.Millisecond),
-	)
-
-	tenantID := "tenant-pending-to-tier2"
-	createTestTenantInDB(db, tenantID)
-
-	// Record enters Tier-2 directly as 'pending' with 0 retries
+	// Record enters as 'pending' with retry_count = 0
 	db.Create(&entity.TenantReconcileRecord{
 		TenantID:   tenantID,
 		Status:     entity.StatusPending,
@@ -723,75 +836,61 @@ func TestPollAndHeal_PendingRecordDirectToTier2_AdvancesSchedule(t *testing.T) {
 		Version:    1,
 	})
 
-	// 1st attempt in Tier-2: fails -> should schedule Tier2Intervals[0] (~15s)
-	ctrl.PollAndHeal(ctx)
+	// Verify 7 consecutive failures advance strictly by DB retry_count across
+	// 5s -> 15s -> 30s -> 1m -> 2m (capped at 2m) with no in-memory attempt map.
+	expectedBases := []time.Duration{
+		5 * time.Second,  // retry 1 -> Intervals[0]
+		15 * time.Second, // retry 2 -> Intervals[1]
+		30 * time.Second, // retry 3 -> Intervals[2]
+		1 * time.Minute,  // retry 4 -> Intervals[3]
+		2 * time.Minute,  // retry 5 -> Intervals[4] (cap)
+		2 * time.Minute,  // retry 6 -> cap
+		2 * time.Minute,  // retry 7 -> cap
+	}
 
 	rdao := dao.NewReconcileDAO()
-	state1, err := rdao.GetByTenantID(ctx, db, tenantID)
-	if err != nil {
-		t.Fatalf("failed to fetch state1: %v", err)
-	}
-	if state1.Status != entity.StatusDegraded {
-		t.Fatalf("expected status degraded after first failure, got %s", state1.Status)
-	}
-	if state1.NextRetryAt == nil {
-		t.Fatal("expected next_retry_at to be set on state1")
-	}
-	delay1 := time.Until(*state1.NextRetryAt)
-	if delay1 > 30*time.Second {
-		t.Fatalf("expected delay1 <= 30s (~15s), got %v", delay1)
-	}
+	for i, base := range expectedBases {
+		if i > 0 {
+			db.Model(&entity.TenantReconcileRecord{}).
+				Where("tenant_id = ?", tenantID).
+				Update("next_retry_at", time.Now().Add(-1*time.Second))
+		}
 
-	// Advance clock to simulate due retry for 2nd attempt
-	past := time.Now().Add(-1 * time.Minute)
-	db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{
-		"next_retry_at": past,
-		"version":       state1.Version,
-	})
+		// Use a fresh controller instance on odd iterations to prove backoff
+		// progression depends solely on DB retry_count (survives restarts / multi-replica).
+		activeCtrl := ctrl
+		if i%2 == 1 {
+			activeCtrl = NewSelfHealingController(
+				db, nil, rec,
+				WithBackoffPolicy(DefaultBackoffPolicy),
+			)
+		}
+		before := time.Now()
+		activeCtrl.PollAndHeal(ctx)
+		after := time.Now()
 
-	// 2nd attempt in Tier-2: fails -> should schedule Tier2Intervals[1] (~1m)
-	ctrl.PollAndHeal(ctx)
-
-	state2, err := rdao.GetByTenantID(ctx, db, tenantID)
-	if err != nil {
-		t.Fatalf("failed to fetch state2: %v", err)
-	}
-	delay2 := time.Until(*state2.NextRetryAt)
-	if delay2 < 40*time.Second || delay2 > 2*time.Minute {
-		t.Fatalf("expected delay2 to advance to ~1m, got %v", delay2)
-	}
-
-	// 3rd through 7th attempts: simulate subsequent failures to verify schedule continues to advance
-	// and remains capped at 10m past the 5th failure without resetting.
-	lastState := state2
-	for attempt := 3; attempt <= 7; attempt++ {
-		db.Model(&entity.TenantReconcileRecord{}).Where("tenant_id = ?", tenantID).Updates(map[string]interface{}{
-			"next_retry_at": time.Now().Add(-1 * time.Minute),
-			"version":       lastState.Version,
-		})
-		ctrl.PollAndHeal(ctx)
-
-		currentState, err := rdao.GetByTenantID(ctx, db, tenantID)
+		state, err := rdao.GetByTenantID(ctx, db, tenantID)
 		if err != nil {
-			t.Fatalf("failed to fetch state at attempt %d: %v", attempt, err)
+			t.Fatalf("attempt %d: failed to fetch state: %v", i+1, err)
 		}
-		delay := time.Until(*currentState.NextRetryAt)
-
-		switch attempt {
-		case 3: // ~2m
-			if delay < 1*time.Minute || delay > 3*time.Minute {
-				t.Fatalf("attempt 3: expected ~2m, got %v", delay)
-			}
-		case 4: // ~5m
-			if delay < 3*time.Minute || delay > 6*time.Minute {
-				t.Fatalf("attempt 4: expected ~5m, got %v", delay)
-			}
-		case 5, 6, 7: // ~10m capped
-			if delay < 8*time.Minute || delay > 11*time.Minute {
-				t.Fatalf("attempt %d: expected ~10m capped (no reset), got %v", attempt, delay)
-			}
+		if state.Status != entity.StatusDegraded {
+			t.Fatalf("attempt %d: expected status degraded, got %s", i+1, state.Status)
 		}
-		lastState = currentState
+		if state.RetryCount != i+1 {
+			t.Fatalf("attempt %d: expected retry_count=%d, got %d", i+1, i+1, state.RetryCount)
+		}
+		if state.NextRetryAt == nil {
+			t.Fatalf("attempt %d: expected next_retry_at to be set", i+1)
+		}
+		maxStep := base + base/10
+		if maxStep > 2*time.Minute {
+			maxStep = 2 * time.Minute
+		}
+		minDeadline := before.Add(base)
+		maxDeadline := after.Add(maxStep)
+		if state.NextRetryAt.Before(minDeadline) || state.NextRetryAt.After(maxDeadline) {
+			t.Fatalf("attempt %d: expected NextRetryAt in [%v, %v], got %v", i+1, minDeadline, maxDeadline, *state.NextRetryAt)
+		}
 	}
 }
 
