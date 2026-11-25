@@ -10,9 +10,9 @@ if (revision.status !== 0 || revision.stdout.trim() !== manifest.upstreamCommit)
   throw new Error('Upstream revision differs from the web test exclusions; review the list before updating it.');
 }
 const seen = new Set();
-const patterns = ['/node_modules/', '/dist/'];
+const patterns = ['/node_modules/', '/dist/', '/src/ee/'];
 for (const entry of manifest.excludedTests) {
-  if (!/^src\/[\w./-]+\.test\.(ts|tsx|js|jsx)$/.test(entry.path) || entry.path.includes('..') || !entry.reason || seen.has(entry.path)) {
+  if (!/^src\/[\w./-]+\.test\.(ts|tsx|js|jsx)$/.test(entry.path) || entry.path.startsWith('src/ee/') || entry.path.includes('..') || !entry.reason || seen.has(entry.path)) {
     throw new Error(`Invalid or duplicate excluded test: ${entry.path}`);
   }
   if (!fs.existsSync(path.join(web, entry.path))) {

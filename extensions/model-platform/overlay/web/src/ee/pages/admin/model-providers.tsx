@@ -519,10 +519,10 @@ export default function ModelProvidersPage() {
   }, [health, isHealthError, t]);
 
   const gatewayErrorMessage =
-    health?.status === 'degraded'
-      ? health.error
-      : isHealthError && healthError instanceof Error
-        ? healthError.message
+    isHealthError && healthError instanceof Error
+      ? healthError.message
+      : health?.status === 'degraded'
+        ? health.error
         : undefined;
 
   return (

@@ -50,6 +50,8 @@ The goal is complete coverage on free standard GitHub-hosted runners. Test jobs 
 
 The upstream web test baseline excludes the known failing files listed in [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json). CI reports each exclusion and requires all other discovered tests to pass. The list is pinned to the upstream commit and must be reviewed when it changes. These exclusions do not apply to extension tests; a passing baseline does not mean the excluded upstream tests passed.
 
+Substantive backend and frontend changes should add or update behavioral tests in the same PR—covering user-facing behavior, state transitions, access/safety boundaries, API contracts, and bug regressions—rather than fragile snapshots, styling assertions, or trivial static declarations. Extension tests run in dedicated CI steps with zero exclusions and are isolated from upstream test exclusion lists.
+
 ## Layout
 
 ```text
