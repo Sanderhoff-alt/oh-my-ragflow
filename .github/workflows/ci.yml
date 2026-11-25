@@ -171,13 +171,15 @@ jobs:
             ./node_modules/.bin/oxlint --max-warnings 0 "${files[@]}"
             ./node_modules/.bin/oxfmt --check "${files[@]}"
           fi
+      - name: Type-check and test model-platform frontend overlay
+        run: node ci/run-extension-web-tests.cjs
       - name: Build frontend
         working-directory: build/ragflow/web
         env:
           VITE_MINIFY: esbuild
           VITE_BUILD_SOURCEMAP: 'false'
         run: npm run build
-      - name: Run frontend tests
+      - name: Run upstream frontend tests
         run: node ci/run-upstream-web-tests.cjs
 
   model-platform:

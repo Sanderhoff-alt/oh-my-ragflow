@@ -1,7 +1,7 @@
 import { lazy, Suspense, type ComponentType } from 'react';
 import { createBrowserRouter, type RouteObject } from 'react-router';
 import { routers } from '@/routes';
-import { privateRoutes } from '@/ee/private-routes';
+import { privateRoutes, type PrivateRoute } from '@/ee/private-routes';
 
 const defaultRouteFallback = (
   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-[1px]">
@@ -23,7 +23,10 @@ const withLazyRoute = (
 /**
  * Injects model-platform private routes into the admin navigation layout.
  */
-function injectPrivateRoutes(routes: RouteObject[]): void {
+export function injectPrivateRoutes(
+  routes: RouteObject[],
+  routesToInject: readonly PrivateRoute[] = privateRoutes,
+): boolean {
   for (const route of routes) {
     if (route.path === '/admin' && route.children) {
       for (const authChild of route.children) {
@@ -31,7 +34,7 @@ function injectPrivateRoutes(routes: RouteObject[]): void {
           for (const subChild of authChild.children) {
             // navigation-layout has children with /admin/services
             if (subChild.children?.some((c) => c.path === '/admin/services')) {
-              for (const pr of privateRoutes) {
+              for (const pr of routesToInject) {
                 if (
                   pr.path &&
                   pr.Component &&
@@ -44,16 +47,17 @@ function injectPrivateRoutes(routes: RouteObject[]): void {
                   });
                 }
               }
-              return;
+              return true;
             }
           }
         }
       }
     }
-    if (route.children) {
-      injectPrivateRoutes(route.children);
+    if (route.children && injectPrivateRoutes(route.children, routesToInject)) {
+      return true;
     }
   }
+  return false;
 }
 
 let mergedRouter = routers;
