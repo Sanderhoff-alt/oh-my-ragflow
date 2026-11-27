@@ -31,26 +31,49 @@ git submodule update --init
 
 ## 贡献
 
-请使用英文撰写 Issue 和 Pull Request 的标题与描述。
+请使用英文撰写 Issue 标题、Pull Request 标题与描述以及 Git 提交信息。
+
+### Git 提交信息规范
+
+- 使用简洁的 Conventional Commits 标题行（`type(scope): summary`，全仓库范围变更可使用 `type: summary`），并与正文之间保留一个空行。
+- 正文须内容详细，说明问题或背景以及关键变更；实质性变更不应只有标题行。
+- 每行（含标题行与正文）长度不超过 **80 个字符**。仅在换行会破坏完整性的极少数场景（如长 URL 或原始命令/日志）可豁免，常规叙述与列表行必须严格控制在 80 字符以内。
+
+### Pull Request 描述规范
+
+- 参照 [`.github/pull_request_template.md`](.github/pull_request_template.md) 按设计文档风格撰写：讲清楚背景与问题、设计思路、关键决策与取舍，以及验证方式。
+- 优先使用图表展示（Mermaid 架构图/流程图/时序图、对比表格、必要的公式等）以清晰表达系统行为，避免大段纯文字堆砌。
+- 提交评审前检查所有 Markdown、Mermaid 图表、表格和 LaTeX 数学公式在 GitHub 页面的实际渲染效果。
 
 ## CI 原则
 
-计划中的 CI 流水线先构建增强后的 RAGFlow，再针对增强版运行上游 RAGFlow 测试（不包含 Infinity 专项覆盖）和我们的扩展测试。仅测试未增强的上游基线，不能替代对增强版的测试。
+CI 流水线在免费的 GitHub 标准托管 runner 上并行运行三个相互独立的任务（`go-build-and-unit`、`web` 和 `model-platform`），任务间没有 `needs` 依赖——每个任务各自通过 `apply-overlay.sh` 组装 `build/ragflow` 工作区，单个任务失败不会阻塞其余任务运行。
 
 ```mermaid
 flowchart LR
-    A[检出项目和上游源码] --> B[构建增强版 RAGFlow]
-    B --> C[运行上游测试]
-    B --> D[运行扩展测试]
-    C --> E[汇总结果]
-    D --> E
+    Trigger["Push / Pull Request"]
+
+    subgraph GoJob["go-build-and-unit"]
+        G1["apply-overlay.sh"] --> G2["构建企业版 Go 服务 (ee)"] --> G3["上游 Go 单元测试 (ee)"]
+    end
+
+    subgraph WebJob["web"]
+        W1["apply-overlay.sh"] --> W2["Overlay lint、类型检查与扩展测试"] --> W3["构建前端"] --> W4["上游前端部分测试"]
+    end
+
+    subgraph MPJob["model-platform"]
+        M1["非侵入合规审计"] --> M2["apply-overlay.sh 并启动真实网关"] --> M3["扩展后端单元与 E2E 测试 (ee)"]
+    end
+
+    Trigger --> G1
+    Trigger --> W1
+    Trigger --> M1
 ```
 
-目标是在免费的 GitHub 标准托管 runner 上完整覆盖测试。可以拆分测试任务以适应资源限制；无法运行或被跳过的检查必须明确披露，不能计为通过。CI 流水线构建并测试由 `apply-overlay.sh` 组装并启用 `RAGFLOW_GO_TAGS=ee` 的企业级扩展分发版本。目前覆盖企业版 Go 构建与单元测试、前端构建与测试，以及 `model-platform` 非侵入合规审计和连接真实网关的后端单元与 E2E 集成测试；上游集成、API、SDK 和模型测试仍待加入。
-
-上游前端测试基线会排除 [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json) 中记录的已知失败文件。CI 会逐项报告排除内容，并要求其余发现的测试全部通过。清单绑定上游提交，升级时必须重新核查。这些排除项不适用于扩展自身的测试；基线通过不代表被排除的上游测试通过。
-
-实质性的前后端变更应在同一 PR 中同步新增或更新行为测试，覆盖用户可见行为、状态流转、权限与安全边界、API 契约及缺陷回归，避免脆弱的快照、样式断言或对纯静态声明的无效测试。扩展测试在独立的 CI 步骤中以零排除运行，与上游已知失败排除清单相互隔离。
+- **当前覆盖范围**：企业版 Go 构建与单元测试、前端构建与测试（含扩展前端独立类型检查与零排除单测）、`model-platform` 非侵入合规审计（验证上游 submodule 保持纯净）以及连接真实网关的后端单元与 E2E 集成测试。上游集成、API、SDK 和模型测试尚未纳入。
+- **诚实披露覆盖边界**：可以拆分任务以适应 runner 资源限制；无法运行或被跳过的检查必须显式报告，不能计为通过。
+- **扩展测试与上游排除相互隔离**：上游前端测试仅排除 [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json) 中绑定固定提交的已知失败文件，CI 会逐项报告排除项并要求其余测试全部通过；扩展测试在独立步骤中零排除运行，绝不使用该排除清单。
+- **行为测试要求**：实质性的前后端变更应在同一 PR 中同步新增或更新行为测试，覆盖用户可见行为、状态流转、权限与安全边界、API 契约及缺陷回归，避免脆弱的快照、样式断言或无意义的静态声明测试。
 
 ## 目录结构
 
