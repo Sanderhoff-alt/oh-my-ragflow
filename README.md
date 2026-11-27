@@ -31,26 +31,37 @@ See [RAGFlow extension points](docs/extension-points.md) for the shared integrat
 
 ## Contributing
 
-Please write issue and pull request titles and descriptions in English.
+Please write issue titles, pull request titles and descriptions, and Git commit messages in English.
+
+### Commit messages
+
+- Use a concise Conventional Commits subject line (`type(scope): summary`, or `type: summary` when repo-wide), separated from the body by a blank line.
+- Write a detailed commit body explaining the problem or context and the key changes. A subject-only commit is not sufficient for substantive changes.
+- Wrap every line (subject and body) at **80 characters** maximum. Exempt unbreakable tokens such as URLs or raw command/log lines only when wrapping would break them; keep standard prose and bullet lines strictly within 80 characters.
+
+### Pull request descriptions
+
+- Write PR descriptions in the style of a concise design document using [`.github/pull_request_template.md`](.github/pull_request_template.md): clearly explain the background and problem statement, design approach, key decisions and trade-offs, and verification.
+- Prefer visual presentation—architecture/flow/sequence diagrams (Mermaid), comparison tables, and structured formulas where they clarify behavior—over walls of prose.
+- Verify that all Markdown, Mermaid diagrams, tables, and LaTeX math expressions render cleanly on GitHub before requesting review.
 
 ## CI principles
 
-The intended CI pipeline builds the enhanced RAGFlow distribution first, then runs the upstream RAGFlow tests, except Infinity-specific coverage, and our extension tests against it. The upstream baseline on its own is not a substitute for testing the enhanced build.
+The CI pipeline runs on free standard GitHub-hosted runners. It first assembles the enhanced RAGFlow distribution (`RAGFLOW_GO_TAGS=ee`) with `apply-overlay.sh`, then runs a subset of the upstream RAGFlow tests alongside our extension tests and compliance checks against it.
 
 ```mermaid
 flowchart LR
-    A[Check out project and upstream] --> B[Build enhanced RAGFlow]
-    B --> C[Run upstream tests]
-    B --> D[Run extension tests]
+    A[Check out project and upstream] --> B[Assemble and build enhanced RAGFlow]
+    B --> C[Upstream test subset]
+    B --> D[Extension tests and compliance audit]
     C --> E[Report results]
     D --> E
 ```
 
-The goal is complete coverage on free standard GitHub-hosted runners. Test jobs may be split to fit their resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing. The CI workflow builds and tests the enterprise distribution assembled by `apply-overlay.sh` with `RAGFLOW_GO_TAGS=ee`. It currently covers the enterprise Go build and unit tier, the web build and tests, and the `model-platform` non-invasive audit plus live-gateway backend unit and E2E integration tests; upstream integration, API, SDK and model-backed tests remain to be added.
-
-The upstream web test baseline excludes the known failing files listed in [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json). CI reports each exclusion and requires all other discovered tests to pass. The list is pinned to the upstream commit and must be reviewed when it changes. These exclusions do not apply to extension tests; a passing baseline does not mean the excluded upstream tests passed.
-
-Substantive backend and frontend changes should add or update behavioral tests in the same PR—covering user-facing behavior, state transitions, access/safety boundaries, API contracts, and bug regressions—rather than fragile snapshots, styling assertions, or trivial static declarations. Extension tests run in dedicated CI steps with zero exclusions and are isolated from upstream test exclusion lists.
+- **Current coverage:** Enterprise Go build and unit tests, frontend build and tests (including isolated extension type-checking and zero-exclusion unit tests), the `model-platform` non-invasive compliance audit (verifying the upstream submodule remains pristine), and live-gateway backend unit and E2E integration tests. Upstream integration, API, SDK, and model-backed tests are not yet included.
+- **Explicit coverage boundaries:** Test jobs may be split to fit runner resource limits; unavailable or skipped checks must be reported explicitly, not counted as passing.
+- **Isolation from upstream exclusions:** Upstream web tests exclude only the commit-pinned known failures listed in [`ci/upstream-web-known-failures.json`](ci/upstream-web-known-failures.json). CI reports each exclusion and requires all other discovered tests to pass; extension tests run in dedicated steps with zero exclusions and never share this list.
+- **Behavioral test expectations:** Substantive backend and frontend changes should add or update behavioral tests in the same PR—covering user-facing behavior, state transitions, access/safety boundaries, API contracts, and bug regressions—rather than fragile snapshots, styling assertions, or trivial static declarations.
 
 ## Layout
 
