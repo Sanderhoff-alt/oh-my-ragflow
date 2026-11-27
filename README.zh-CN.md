@@ -47,15 +47,27 @@ git submodule update --init
 
 ## CI 原则
 
-CI 流水线在免费的 GitHub 标准托管 runner 上先通过 `apply-overlay.sh` 组装增强版 RAGFlow（`RAGFLOW_GO_TAGS=ee`），再对增强版运行上游部分测试和我们的扩展测试与合规检查。
+CI 流水线在免费的 GitHub 标准托管 runner 上并行运行三个相互独立的任务（`go-build-and-unit`、`web` 和 `model-platform`），任务间没有 `needs` 依赖——每个任务各自通过 `apply-overlay.sh` 组装 `build/ragflow` 工作区，单个任务失败不会阻塞其余任务运行。
 
 ```mermaid
 flowchart LR
-    A[检出项目与上游] --> B[组装并构建增强版 RAGFlow]
-    B --> C[上游部分测试]
-    B --> D[扩展测试与合规审计]
-    C --> E[汇总结果]
-    D --> E
+    Trigger["Push / Pull Request"]
+
+    subgraph GoJob["go-build-and-unit"]
+        G1["apply-overlay.sh"] --> G2["构建企业版 Go 服务 (ee)"] --> G3["上游 Go 单元测试 (ee)"]
+    end
+
+    subgraph WebJob["web"]
+        W1["apply-overlay.sh"] --> W2["Overlay lint、类型检查与扩展测试"] --> W3["构建前端"] --> W4["上游前端部分测试"]
+    end
+
+    subgraph MPJob["model-platform"]
+        M1["非侵入合规审计"] --> M2["apply-overlay.sh 并启动真实网关"] --> M3["扩展后端单元与 E2E 测试 (ee)"]
+    end
+
+    Trigger --> G1
+    Trigger --> W1
+    Trigger --> M1
 ```
 
 - **当前覆盖范围**：企业版 Go 构建与单元测试、前端构建与测试（含扩展前端独立类型检查与零排除单测）、`model-platform` 非侵入合规审计（验证上游 submodule 保持纯净）以及连接真实网关的后端单元与 E2E 集成测试。上游集成、API、SDK 和模型测试尚未纳入。

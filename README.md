@@ -47,15 +47,27 @@ Please write issue titles, pull request titles and descriptions, and Git commit 
 
 ## CI principles
 
-The CI pipeline runs on free standard GitHub-hosted runners. It first assembles the enhanced RAGFlow distribution (`RAGFLOW_GO_TAGS=ee`) with `apply-overlay.sh`, then runs a subset of the upstream RAGFlow tests alongside our extension tests and compliance checks against it.
+The CI pipeline runs three independent jobs in parallel on free standard GitHub-hosted runners (`go-build-and-unit`, `web`, and `model-platform`), with no `needs` dependencies between them—each job assembles its own `build/ragflow` workspace via `apply-overlay.sh`, and a failure in one job does not block the others from running.
 
 ```mermaid
 flowchart LR
-    A[Check out project and upstream] --> B[Assemble and build enhanced RAGFlow]
-    B --> C[Upstream test subset]
-    B --> D[Extension tests and compliance audit]
-    C --> E[Report results]
-    D --> E
+    Trigger["Push / Pull Request"]
+
+    subgraph GoJob["go-build-and-unit"]
+        G1["apply-overlay.sh"] --> G2["Build Go server (ee)"] --> G3["Upstream Go unit tests (ee)"]
+    end
+
+    subgraph WebJob["web"]
+        W1["apply-overlay.sh"] --> W2["Overlay lint, type-check & extension tests"] --> W3["Build frontend"] --> W4["Upstream web test subset"]
+    end
+
+    subgraph MPJob["model-platform"]
+        M1["Non-invasive compliance audit"] --> M2["apply-overlay.sh & start live gateway"] --> M3["Extension backend unit & E2E tests (ee)"]
+    end
+
+    Trigger --> G1
+    Trigger --> W1
+    Trigger --> M1
 ```
 
 - **Current coverage:** Enterprise Go build and unit tests, frontend build and tests (including isolated extension type-checking and zero-exclusion unit tests), the `model-platform` non-invasive compliance audit (verifying the upstream submodule remains pristine), and live-gateway backend unit and E2E integration tests. Upstream integration, API, SDK, and model-backed tests are not yet included.
