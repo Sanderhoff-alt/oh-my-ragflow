@@ -94,8 +94,26 @@ fi
 if [[ "${DOCKER_AVAILABLE}" == "true" ]]; then
     echo "[INFO] Docker daemon is active and responsive."
     if [[ "${1:-}" == "--up" || "${1:-}" == "--start" ]]; then
+        echo "Pulling E2E container images..."
+        pulled=false
+        for attempt in 1 2 3 4 5; do
+            if docker compose -f "${COMPOSE_TEST}" pull --policy missing; then
+                pulled=true
+                break
+            fi
+            if [[ "${attempt}" -lt 5 ]]; then
+                delay=$((attempt * 5))
+                echo "[WARN] Image pull failed (attempt ${attempt}/5), retrying in ${delay}s..." >&2
+                sleep "${delay}"
+            fi
+        done
+        if [[ "${pulled}" != "true" ]]; then
+            echo "FAIL: Failed to pull E2E container images after 5 attempts!" >&2
+            exit 1
+        fi
+
         echo "Starting E2E containers..."
-        docker compose -f "${COMPOSE_TEST}" up -d
+        docker compose -f "${COMPOSE_TEST}" up -d --pull never
         echo "Waiting for services to become healthy..."
         HEALTHY=false
         for i in {1..45}; do
