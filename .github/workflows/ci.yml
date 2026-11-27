@@ -186,6 +186,9 @@ jobs:
     name: Model Platform Audit & Extension Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
     env:
       GOPROXY: https://proxy.golang.org,direct
       GOPRIVATE: github.com/infiniflow/onnxruntime_go
@@ -218,6 +221,26 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-go-build-${{ steps.go.outputs.go-version }}-${{ steps.upstream.outputs.sha }}-
       - name: "Gate Check: Non-invasive compliance audit"
         run: bash extensions/model-platform/scripts/audit-non-invasive.sh
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          logged_in=false
+          for attempt in 1 2 3; do
+            if printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin; then
+              logged_in=true
+              break
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              delay=$((attempt * 5))
+              echo "docker login ghcr.io failed (attempt $attempt/3), retrying in ${delay}s..." >&2
+              sleep "$delay"
+            fi
+          done
+          if [[ "$logged_in" != "true" ]]; then
+            echo "::warning::Failed to log in to ghcr.io after 3 attempts; falling back to anonymous pull."
+          fi
       - name: Start LiteLLM and PostgreSQL live test cluster
         run: bash extensions/model-platform/tests/e2e/setup_env.sh --start
       - name: Run model-platform backend unit and integration tests
